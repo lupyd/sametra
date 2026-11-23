@@ -12,6 +12,7 @@ export const TOOLS = {
   feed: ['FeedRequest', 'Items'],
   thread: ['IdRequest', 'ThreadResponse'],
   event: ['IdRequest', 'EventResponse'],
+  chain: ['ChainRequest', 'ChainResponse'],
   search: ['SearchRequest', 'Items'],
   find_communities: ['FindCommunitiesRequest', 'CommunitiesResponse'],
   post: ['PostRequest', 'Ack'],

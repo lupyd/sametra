@@ -25,6 +25,7 @@ macro_rules! tools {
             feed: FeedRequest => Items, false;
             thread: IdRequest => ThreadResponse, false;
             event: IdRequest => EventResponse, false;
+            chain: ChainRequest => ChainResponse, false;
             search: SearchRequest => Items, false;
             find_communities: FindCommunitiesRequest => CommunitiesResponse, false;
             post: PostRequest => Ack, true;

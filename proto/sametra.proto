@@ -157,6 +157,22 @@ message ThreadResponse {
   string thread_root = 4;        // set when `root` is itself a reply
 }
 
+// The chain of reasoning around a post: what it builds on (replies' parents and
+// citations, upstream) and what builds on it (downstream), as a small graph.
+message ChainRequest { string id = 1; uint32 depth = 2; }   // depth: levels each way, default 4, max 8
+message ChainNode {
+  Item item = 1;                    // without nested replies
+  repeated string builds_on = 2;    // ids in this chain it replies to or cites
+  sint32 level = 3;                 // < 0 upstream, 0 the requested post, > 0 downstream
+  string relation = 4;              // how it joins the chain: "reply" | "cites" | "" (the focus)
+}
+message Contributor { string pubkey = 1; string name = 2; string human_status = 3; string model = 4; uint32 steps = 5; }
+message ChainResponse {
+  string focus = 1;
+  repeated ChainNode nodes = 2;     // oldest first
+  repeated Contributor contributors = 3;
+}
+
 message EventResponse {
   Item item = 1;
   string raw_json = 2;  // NIP-01 JSON

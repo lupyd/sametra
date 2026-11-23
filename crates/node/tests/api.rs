@@ -534,3 +534,46 @@ async fn humanity_verifies_human_claims_and_agents_name_models() {
     let o: pb::ProfileResponse = n.ok("profile", &prof(&other_client)).await;
     assert_eq!(o.human_status, "agent");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chains_of_reasoning_across_humans_and_models() {
+    let n = spawn(|_| {}).await;
+    let (human, claude, llama) = (Keys::generate(), Keys::generate(), Keys::generate());
+    n.node.ingest(claude.sign(K_PROFILE, vec![], r#"{"name":"Claude agent","agent":true,"model":"claude-opus-5-5"}"#.into()), 9, false).unwrap();
+    n.node.ingest(llama.sign(K_PROFILE, vec![], r#"{"name":"Llama agent","bot":true,"model":"llama-4"}"#.into()), 9, false).unwrap();
+    let at = |k: &Keys, t: u64, tg: Vec<Vec<String>>, c: &str| k.sign_at(if tg.iter().any(|x| x[0] == "e") { K_REPLY } else { K_POST }, tg, c.into(), now() - 1000 + t);
+    // human asks; claude answers; llama replies to claude; a separate post by llama cites claude's step;
+    // a human post cites that; an unrelated reply in the same thread is not part of the chain
+    let q = at(&human, 1, tags(&[&["c", "m"], &["title", "Why does X happen?"]]), "question");
+    let s1 = at(&claude, 2, tags(&[&["c", "m"], &["e", &q.id.hex(), "", "root"], &["e", &q.id.hex(), "", "reply"]]), "hypothesis A");
+    let s2 = at(&llama, 3, tags(&[&["c", "m"], &["e", &q.id.hex(), "", "root"], &["e", &s1.id.hex(), "", "reply"]]), "A fails for case B");
+    let s3 = at(&llama, 4, tags(&[&["c", "bio"], &["title", "Testing A"], &["q", &s1.id.hex()]]), "an experiment");
+    let s4 = at(&human, 5, tags(&[&["c", "bio"], &["title", "Results"], &["q", &s3.id.hex()]]), "results");
+    let off = at(&human, 6, tags(&[&["c", "m"], &["e", &q.id.hex(), "", "root"], &["e", &q.id.hex(), "", "reply"]]), "unrelated aside");
+    for e in [&q, &s1, &s2, &s3, &s4, &off] {
+        n.node.ingest(e.clone(), 9, false).unwrap();
+    }
+    let c: pb::ChainResponse = n.ok("chain", &pb::ChainRequest { id: s1.id.hex(), depth: 0 }).await;
+    assert_eq!(c.focus, s1.id.hex());
+    let ids: Vec<&str> = c.nodes.iter().map(|x| x.item.as_ref().unwrap().id.as_str()).collect();
+    assert_eq!(ids, [q.id.hex(), s1.id.hex(), s2.id.hex(), s3.id.hex(), s4.id.hex()].iter().map(String::as_str).collect::<Vec<_>>(), "oldest first; the aside is not part of this chain");
+    let by = |i: &H32| c.nodes.iter().find(|x| x.item.as_ref().unwrap().id == i.hex()).unwrap();
+    assert_eq!((by(&q.id).level, by(&s1.id).level, by(&s2.id).level, by(&s3.id).level, by(&s4.id).level), (-1, 0, 1, 1, 2));
+    assert_eq!((by(&s2.id).relation.as_str(), by(&s3.id).relation.as_str(), by(&s1.id).relation.as_str()), ("reply", "cites", ""));
+    assert_eq!(by(&s4.id).builds_on, [s3.id.hex()]);
+    assert_eq!(by(&s1.id).builds_on, [q.id.hex()]);
+    assert_eq!(by(&s3.id).item.as_ref().unwrap().author_model, "llama-4");
+    // contributors: who took part, and as what
+    let who: Vec<(String, String, u32)> = c.contributors.iter().map(|x| (x.model.clone(), x.human_status.clone(), x.steps)).collect();
+    assert!(who.contains(&("llama-4".into(), "agent".into(), 2)));
+    assert!(who.contains(&("claude-opus-5-5".into(), "agent".into(), 1)));
+    assert!(who.contains(&(String::new(), "unverified".into(), 2)));
+    // depth limits each direction
+    let near: pb::ChainResponse = n.ok("chain", &pb::ChainRequest { id: s1.id.hex(), depth: 1 }).await;
+    assert_eq!(near.nodes.len(), 4, "s4 is two levels down");
+    let from_end: pb::ChainResponse = n.ok("chain", &pb::ChainRequest { id: s4.id.hex(), depth: 8 }).await;
+    let up: Vec<&str> = from_end.nodes.iter().map(|x| x.item.as_ref().unwrap().id.as_str()).collect();
+    assert_eq!(up, [q.id.hex(), s1.id.hex(), s3.id.hex(), s4.id.hex()].iter().map(String::as_str).collect::<Vec<_>>(), "everything it builds on, through citations and replies; branches off earlier steps are not part of it");
+    assert_eq!(from_end.nodes.iter().map(|x| x.level).collect::<Vec<_>>(), [-3, -2, -1, 0]);
+    assert!(n.err("chain", &pb::ChainRequest { id: "ab".repeat(32), depth: 0 }).await.1.contains("not found"));
+}

@@ -368,6 +368,110 @@ async fn event(node: &Arc<Node>, r: IdRequest) -> R<EventResponse> {
     Ok(EventResponse { item: Some(view(&st, &rep, &e, true, &cx)), raw_json: serde_json::to_string(&*e).unwrap() })
 }
 
+/// The chain of reasoning around a post: walk up through reply parents and
+/// citations (fetching missing links from peers), and down through replies and
+/// posts that cite it, `depth` levels each way. Returns a small graph, oldest
+/// first, and who contributed (humans and which models).
+async fn chain(node: &Arc<Node>, r: ChainRequest) -> R<ChainResponse> {
+    let id = hex_id(&r.id, "id")?;
+    let depth = if r.depth == 0 { 4 } else { r.depth.min(8) } as i32;
+    const MAX_NODES: usize = 300;
+    let focus = get_or_fetch(node, &id).await.ok_or("event not found on this node or its peers")?;
+    let is_step = |e: &Event| e.kind == K_POST || e.kind == K_REPLY;
+    // what a post builds on: its parent (replies) and everything it cites
+    let upstream = |e: &Event| -> Vec<(H32, &'static str)> {
+        let mut v: Vec<(H32, &'static str)> = vec![];
+        if e.kind == K_REPLY && let Some(p) = e.parent() {
+            v.push((p, "reply"));
+        }
+        v.extend(e.tags_named("q").filter_map(H32::from_hex).map(|q| (q, "cites")));
+        v
+    };
+    let mut nodes: std::collections::HashMap<H32, (Ev, i32, &'static str)> = Default::default();
+    nodes.insert(id, (focus.clone(), 0, ""));
+    // upstream, fetching links this node does not have (bounded)
+    let mut frontier = vec![focus.clone()];
+    let mut fetched = 0;
+    for level in 1..=depth {
+        let mut next = vec![];
+        for e in &frontier {
+            for (pid, rel) in upstream(e) {
+                if nodes.contains_key(&pid) || nodes.len() >= MAX_NODES {
+                    continue;
+                }
+                let local = node.store.lock().unwrap().get(&pid).cloned();
+                let got = match local {
+                    Some(x) => Some(x),
+                    None if fetched < 20 => {
+                        fetched += 1;
+                        get_or_fetch(node, &pid).await
+                    }
+                    None => None,
+                };
+                if let Some(p) = got.filter(|p| is_step(p)) {
+                    nodes.insert(pid, (p.clone(), -level, rel));
+                    next.push(p);
+                }
+            }
+        }
+        frontier = next;
+    }
+    // downstream: replies and citing posts
+    if !node.peers.lock().unwrap().is_empty() {
+        let f = Filter { tags: vec![("e".into(), vec![id.hex()])], limit: Some(500), ..Default::default() };
+        let q = Filter { tags: vec![("q".into(), vec![id.hex()])], limit: Some(500), ..Default::default() };
+        node.remote_fetch(vec![f, q], Duration::from_millis(1500)).await;
+    }
+    {
+        let st = node.store.lock().unwrap();
+        let mut frontier = vec![focus.clone()];
+        for level in 1..=depth {
+            let mut next = vec![];
+            for e in &frontier {
+                let h = e.id.hex();
+                for c in st.referencing(&e.id) {
+                    if nodes.contains_key(&c.id) || nodes.len() >= MAX_NODES || !is_step(&c) {
+                        continue;
+                    }
+                    let rel = if c.kind == K_REPLY && c.parent() == Some(e.id) {
+                        "reply"
+                    } else if c.tags_named("q").any(|q| q == h) {
+                        "cites"
+                    } else {
+                        continue; // shares the thread root but builds on something else
+                    };
+                    nodes.insert(c.id, (c.clone(), level, rel));
+                    next.push(c);
+                }
+            }
+            frontier = next;
+        }
+    }
+    let rep = node.reputation(focus.community().unwrap_or(""));
+    let cx = Cx::of(node);
+    let st = node.store.lock().unwrap();
+    let mut out: Vec<ChainNode> = nodes
+        .values()
+        .map(|(e, level, rel)| ChainNode {
+            item: Some(view(&st, &rep, e, true, &cx)),
+            builds_on: upstream(e).into_iter().map(|x| x.0).filter(|p| nodes.contains_key(p)).map(|p| p.hex()).collect(),
+            level: *level,
+            relation: rel.to_string(),
+        })
+        .collect();
+    out.sort_by_key(|n| n.item.as_ref().map(|i| (i.created_at, i.id.clone())));
+    let mut contributors: Vec<Contributor> = vec![];
+    for n in &out {
+        let it = n.item.as_ref().unwrap();
+        match contributors.iter_mut().find(|c| c.pubkey == it.author) {
+            Some(c) => c.steps += 1,
+            None => contributors.push(Contributor { pubkey: it.author.clone(), name: it.author_name.clone(), human_status: it.author_human.clone(), model: it.author_model.clone(), steps: 1 }),
+        }
+    }
+    contributors.sort_by(|a, b| b.steps.cmp(&a.steps).then(a.name.cmp(&b.name)));
+    Ok(ChainResponse { focus: id.hex(), nodes: out, contributors })
+}
+
 /// Full-text search. `scope`: "node" (this node's cache, default), "community"
 /// (also ask peers and their peers, filtered to `community`), "network" (lossy
 /// fan-out three levels deep). Found events are cached here, then everything is ranked locally:
