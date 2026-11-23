@@ -1,0 +1,380 @@
+//! Every API tool end to end: protobuf over HTTP against an in-process node.
+mod common;
+use common::*;
+use sametra_node::event::*;
+use sametra_node::pb;
+
+const E: pb::Empty = pb::Empty {};
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn info_and_peers() {
+    let n = spawn(|c| {
+        c.public_addr = Some("ws://me.example:7447".into());
+        c.join = vec!["math".into()];
+    })
+    .await;
+    let i: pb::InfoResponse = n.ok("info", &E).await;
+    assert_eq!(i.pubkey, n.node.keys.pubkey.hex());
+    assert_eq!(i.npub, n.node.keys.npub());
+    assert!(i.name.starts_with("npub1"));
+    assert_eq!((i.events_cached, i.pinned, i.peers), (0, 0, 0));
+    assert_eq!(i.joined, ["math"]);
+    assert!(i.relay_all);
+    assert_eq!(i.public_addr, "ws://me.example:7447");
+    let p: pb::PeersResponse = n.ok("peers", &E).await;
+    assert!(p.peers.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn communities_create_join_leave() {
+    let n = spawn(|_| {}).await;
+    let a: pb::Ack = n.ok("create_community", &pb::CreateCommunityRequest { slug: " Cancer-Research ".into(), name: "Cancer research".into(), about: "tumours".into() }).await;
+    assert!(a.ok && a.community == "cancer-research" && a.id.len() == 64);
+    let (code, msg) = n.err("create_community", &pb::CreateCommunityRequest { slug: "bad slug!".into(), ..Default::default() }).await;
+    assert_eq!(code, 400);
+    assert!(msg.contains("slug"));
+
+    // a community defined by someone else, with posts but not joined
+    let other = Keys::generate();
+    n.node.ingest(other.sign(K_COMMUNITY, tags(&[&["d", "math"], &["name", "Mathematics"]]), "proofs".into()), 9, false).unwrap();
+    for i in 0..3 {
+        n.node.ingest(other.sign(K_POST, tags(&[&["c", "math"]]), format!("p{i}")), 9, false).unwrap();
+    }
+    let cs: pb::CommunitiesResponse = n.ok("communities", &E).await;
+    let slugs: Vec<&str> = cs.communities.iter().map(|c| c.slug.as_str()).collect();
+    assert_eq!(slugs, ["cancer-research", "math"], "joined first");
+    let cr = &cs.communities[0];
+    assert!(cr.joined && cr.name == "Cancer research" && cr.about == "tumours" && cr.creator == n.node.keys.pubkey.hex());
+    let m = &cs.communities[1];
+    assert!(!m.joined && m.events == 3 && m.name == "Mathematics");
+
+    let j: pb::Ack = n.ok("join", &pb::CommunityRequest { community: "math".into() }).await;
+    assert_eq!((j.community.as_str(), j.count), ("math", 0));
+    let i: pb::InfoResponse = n.ok("info", &E).await;
+    assert_eq!(i.joined, ["cancer-research", "math"]);
+    n.ok::<_, pb::Ack>("leave", &pb::CommunityRequest { community: "cancer-research".into() }).await;
+    let i: pb::InfoResponse = n.ok("info", &E).await;
+    assert_eq!(i.joined, ["math"]);
+    // joining an unknown slug lists it (empty) so the UI can show it
+    n.ok::<_, pb::Ack>("join", &pb::CommunityRequest { community: "new-topic".into() }).await;
+    let cs: pb::CommunitiesResponse = n.ok("communities", &E).await;
+    assert!(cs.communities.iter().any(|c| c.slug == "new-topic" && c.joined && c.events == 0));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn posting_threads_and_citations() {
+    let n = spawn(|_| {}).await;
+    let root: pb::Ack = n.ok("post", &post("bio", "Does X cause Y?", "Question body")).await;
+    let r1: pb::Ack = n.ok("post", &reply(&root.id, "First answer")).await;
+    let r2: pb::Ack = n.ok("post", &reply(&r1.id, "Nested answer")).await;
+    let r3: pb::Ack = n.ok("post", &reply(&root.id, "Second answer")).await;
+    // a thread in another community citing the root and a reply
+    let cite: pb::Ack = n.ok("post", &pb::PostRequest { refs: vec![root.id.clone(), r2.id.clone()], ..post("chem", "Related", "see these") }).await;
+
+    let t: pb::ThreadResponse = n.ok("thread", &id(&root.id)).await;
+    let rt = t.root.unwrap();
+    assert_eq!((rt.title.as_str(), rt.community.as_str(), rt.kind), ("Does X cause Y?", "bio", K_POST));
+    assert_eq!(rt.reply_count, 3);
+    assert_eq!(rt.replies.len(), 2);
+    let first = rt.replies.iter().find(|r| r.id == r1.id).unwrap();
+    assert_eq!(first.replies.len(), 1);
+    assert_eq!(first.replies[0].id, r2.id);
+    assert_eq!(first.replies[0].parent, r1.id);
+    assert_eq!(first.replies[0].community, "bio", "community inherited from the parent");
+    assert!(rt.replies.iter().any(|r| r.id == r3.id && r.replies.is_empty()));
+    assert!(rt.mine && first.mine);
+    assert_eq!(t.quoted_by.iter().map(|x| x.id.as_str()).collect::<Vec<_>>(), [cite.id.as_str()]);
+    assert!(t.thread_root.is_empty());
+
+    // opening a reply points back to the whole thread
+    let t2: pb::ThreadResponse = n.ok("thread", &id(&r2.id)).await;
+    assert_eq!(t2.thread_root, root.id);
+    assert_eq!(t2.quoted_by.len(), 1);
+
+    let tc: pb::ThreadResponse = n.ok("thread", &id(&cite.id)).await;
+    let mut refs: Vec<String> = tc.ref_events.iter().map(|x| x.id.clone()).collect();
+    refs.sort();
+    let mut want = vec![root.id.clone(), r2.id.clone()];
+    want.sort();
+    assert_eq!(refs, want);
+    assert_eq!(tc.root.unwrap().refs.len(), 2);
+
+    // the stored events have the NIP-22 style tags
+    let ev: pb::EventResponse = n.ok("event", &id(&r2.id)).await;
+    let raw: Event = serde_json::from_str(&ev.raw_json).unwrap();
+    assert!(raw.validate().is_ok());
+    assert_eq!(raw.kind, K_REPLY);
+    assert_eq!(raw.root().unwrap().hex(), root.id);
+    assert_eq!(raw.parent().unwrap().hex(), r1.id);
+    assert_eq!(raw.tag("p"), Some(n.node.keys.pubkey.hex().as_str()));
+    assert_eq!(ev.item.unwrap().content, "Nested answer");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn post_validation() {
+    let n = spawn(|_| {}).await;
+    assert!(n.err("post", &post("bio", "t", "  ")).await.1.contains("content"));
+    assert!(n.err("post", &post("", "t", "x")).await.1.contains("slug"));
+    assert!(n.err("post", &reply("zz", "x")).await.1.contains("parent"));
+    assert!(n.err("post", &reply(&"ab".repeat(32), "x")).await.1.contains("not found"));
+    let bad_ref = pb::PostRequest { refs: vec!["nope".into()], ..post("bio", "t", "x") };
+    assert!(n.err("post", &bad_ref).await.1.contains("refs"));
+    // titles are trimmed and capped
+    let a: pb::Ack = n.ok("post", &post("bio", &format!("  {}  ", "t".repeat(500)), "x")).await;
+    let e: pb::EventResponse = n.ok("event", &id(&a.id)).await;
+    assert_eq!(e.item.unwrap().title.len(), 200);
+    // a reply may move to another community explicitly
+    let r: pb::Ack = n.ok("post", &pb::PostRequest { community: "chem".into(), ..reply(&a.id, "x-post") }).await;
+    let e: pb::EventResponse = n.ok("event", &id(&r.id)).await;
+    assert_eq!(e.item.unwrap().community, "chem");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn feed_sorting_limits_and_truncation() {
+    let n = spawn(|_| {}).await;
+    let k = Keys::generate();
+    let t0 = now();
+    let old = k.sign_at(K_POST, tags(&[&["c", "m"], &["title", "old but discussed"]]), "x".into(), t0 - 7200);
+    let mid = k.sign_at(K_POST, tags(&[&["c", "m"], &["title", "mid"]]), "y".repeat(2000), t0 - 3600);
+    let new = k.sign_at(K_POST, tags(&[&["c", "m"], &["title", "new"]]), "z".into(), t0);
+    for e in [&old, &mid, &new] {
+        n.node.ingest(e.clone(), 9, false).unwrap();
+    }
+    for i in 0..30 {
+        let r = Keys::generate().sign(K_REPLY, tags(&[&["c", "m"], &["e", &old.id.hex(), "", "root"]]), format!("r{i}"));
+        n.node.ingest(r, 9, false).unwrap();
+    }
+    // a reply in the community is not a feed item
+    let feed = |sort: &str, limit| pb::FeedRequest { community: "m".into(), sort: sort.into(), limit };
+    let by_new: pb::Items = n.ok("feed", &feed("new", 0)).await;
+    let titles: Vec<&str> = by_new.items.iter().map(|i| i.title.as_str()).collect();
+    assert_eq!(titles, ["new", "mid", "old but discussed"]);
+    let top: pb::Items = n.ok("feed", &feed("top", 0)).await;
+    assert_eq!(top.items[0].title, "old but discussed", "replies outweigh two hours of age");
+    assert_eq!(top.items[0].reply_count, 30);
+    let mid_item = top.items.iter().find(|i| i.title == "mid").unwrap();
+    assert!(mid_item.content.chars().count() <= 601 && mid_item.content.ends_with('…'), "feeds carry previews");
+    let one: pb::Items = n.ok("feed", &feed("new", 1)).await;
+    assert_eq!(one.items.len(), 1);
+    let none: pb::Items = n.ok("feed", &feed("new", 0).clone()).await;
+    assert_eq!(none.items.len(), 3);
+    let empty: pb::Items = n.ok("feed", &pb::FeedRequest { community: "nothing".into(), ..Default::default() }).await;
+    assert!(empty.items.is_empty());
+    assert_eq!(n.err("feed", &pb::FeedRequest::default()).await.0, 400);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn search() {
+    let n = spawn(|_| {}).await;
+    n.ok::<_, pb::Ack>("post", &post("bio", "CRISPR off-target effects", "body one")).await;
+    n.ok::<_, pb::Ack>("post", &post("chem", "Solvents", "about crispr reagents")).await;
+    let a: pb::Ack = n.ok("post", &post("bio", "Other", "nothing")).await;
+    n.ok::<_, pb::Ack>("post", &reply(&a.id, "a CRISPR reply")).await;
+    n.ok::<_, pb::Ack>("create_community", &pb::CreateCommunityRequest { slug: "crispr".into(), ..Default::default() }).await;
+    let s = |q: &str, c: &str, limit| pb::SearchRequest { query: q.into(), community: c.into(), limit };
+    let all: pb::Items = n.ok("search", &s("crispr", "", 0)).await;
+    assert_eq!(all.items.len(), 3, "title, content and replies match case-insensitively; community defs do not");
+    let bio: pb::Items = n.ok("search", &s("CRISPR", "bio", 0)).await;
+    assert_eq!(bio.items.len(), 2);
+    assert!(bio.items.iter().all(|i| i.community == "bio"));
+    let one: pb::Items = n.ok("search", &s("crispr", "", 1)).await;
+    assert_eq!(one.items.len(), 1);
+    let none: pb::Items = n.ok("search", &s("zebrafish", "", 0)).await;
+    assert!(none.items.is_empty());
+    assert!(n.err("search", &s("  ", "", 0)).await.1.contains("query"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rating_and_reputation() {
+    let n = spawn(|_| {}).await;
+    let alice = Keys::generate();
+    let ae = alice.sign(K_POST, tags(&[&["c", "m"], &["title", "Proof"]]), "QED".into());
+    n.node.ingest(ae.clone(), 9, false).unwrap();
+    n.node.ingest(alice.sign(K_PROFILE, vec![], r#"{"name":"Alice","agent":true}"#.into()), 9, false).unwrap();
+
+    let rate = |score, event: &str, target: &str, c: &str| pb::RateRequest { score, event: event.into(), target: target.into(), community: c.into(), reason: "why".into() };
+    let a: pb::Ack = n.ok("rate", &rate(6, &ae.id.hex(), "", "")).await;
+    assert_eq!(a.community, "m", "community taken from the event");
+    assert!(a.rep > 0.0);
+    // re-rating the same event replaces the earlier rating
+    let b: pb::Ack = n.ok("rate", &rate(-2, &ae.id.hex(), "", "")).await;
+    assert!(b.rep < 0.0, "{}", b.rep);
+    let ratings = n.node.store.lock().unwrap().query(&Filter { kinds: Some(vec![K_RATING]), ..Default::default() }, 100).len();
+    assert_eq!(ratings, 1);
+
+    // rating a person directly, by npub
+    let bob = Keys::generate();
+    let c: pb::Ack = n.ok("rate", &rate(9, "", &bob.npub(), "m")).await;
+    assert!(c.rep > 0.0);
+
+    let lb: pb::ReputationResponse = n.ok("reputation", &pb::ReputationRequest { community: "m".into(), pubkey: String::new() }).await;
+    assert_eq!(lb.entries.len(), 2);
+    assert_eq!(lb.entries[0].pubkey, bob.pubkey.hex(), "sorted by rep");
+    assert_eq!(lb.entries[1].name, "Alice");
+    assert_eq!(lb.entries[1].raters, 1);
+    let one: pb::ReputationResponse = n.ok("reputation", &pb::ReputationRequest { community: "m".into(), pubkey: alice.npub() }).await;
+    assert_eq!(one.entries.len(), 1);
+    assert!(one.entries[0].rep < 0.0);
+    let other: pb::ReputationResponse = n.ok("reputation", &pb::ReputationRequest { community: "bio".into(), pubkey: String::new() }).await;
+    assert!(other.entries.is_empty(), "reputation is per community");
+
+    // the feed reflects the event score and author flags
+    let f: pb::Items = n.ok("feed", &pb::FeedRequest { community: "m".into(), ..Default::default() }).await;
+    let it = &f.items[0];
+    assert!(it.score < 0.0 && it.ratings == 1 && it.author_is_agent && it.author_name == "Alice");
+
+    // validation
+    assert!(n.err("rate", &rate(11, &ae.id.hex(), "", "")).await.1.contains("-10..10"));
+    assert!(n.err("rate", &rate(-11, &ae.id.hex(), "", "")).await.1.contains("-10..10"));
+    assert!(n.err("rate", &rate(1, "", "", "m")).await.1.contains("target"));
+    assert!(n.err("rate", &rate(1, "", &bob.npub(), "")).await.1.contains("slug"));
+    assert!(n.err("rate", &rate(1, "", &n.node.keys.npub(), "m")).await.1.contains("yourself"));
+    let mine: pb::Ack = n.ok("post", &post("m", "mine", "x")).await;
+    assert!(n.err("rate", &rate(1, &mine.id, "", "")).await.1.contains("yourself"));
+    assert!(n.err("rate", &rate(1, &"cd".repeat(32), "", "")).await.1.contains("not found"));
+    assert!(n.err("reputation", &pb::ReputationRequest { community: "m".into(), pubkey: "nope".into() }).await.1.contains("pubkey"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn profiles() {
+    let n = spawn(|_| {}).await;
+    let a: pb::Ack = n.ok("set_profile", &pb::Profile { name: "  Lab bot ".into(), about: "runs assays".into(), agent: true }).await;
+    assert!(a.ok);
+    let p: pb::ProfileResponse = n.ok("profile", &pb::ProfileRequest::default()).await;
+    assert_eq!(p.pubkey, n.node.keys.pubkey.hex());
+    assert_eq!(p.npub, n.node.keys.npub());
+    assert_eq!(p.profile.clone().unwrap(), pb::Profile { name: "Lab bot".into(), about: "runs assays".into(), agent: true });
+    assert!(p.last_seen + 5 >= now());
+    let i: pb::InfoResponse = n.ok("info", &E).await;
+    assert_eq!(i.name, "Lab bot");
+    // kind 0 content stays NIP-01 JSON for other nostr clients
+    let ev = n.node.store.lock().unwrap().replaceable(&n.node.keys.pubkey, K_PROFILE, "").unwrap().clone();
+    let v: serde_json::Value = serde_json::from_str(&ev.content).unwrap();
+    assert_eq!(v["name"], "Lab bot");
+    // updating replaces
+    n.ok::<_, pb::Ack>("set_profile", &pb::Profile { name: "Renamed".into(), ..Default::default() }).await;
+    let p: pb::ProfileResponse = n.ok("profile", &pb::ProfileRequest::default()).await;
+    assert_eq!(p.profile.unwrap().name, "Renamed");
+    assert!(n.err("set_profile", &pb::Profile::default()).await.1.contains("name"));
+
+    // someone else's profile with per-community reputation
+    let bob = Keys::generate();
+    n.node.ingest(bob.sign(K_POST, tags(&[&["c", "m"]]), "x".into()), 9, false).unwrap();
+    n.ok::<_, pb::Ack>("rate", &pb::RateRequest { score: 5, target: bob.pubkey.hex(), community: "m".into(), ..Default::default() }).await;
+    let p: pb::ProfileResponse = n.ok("profile", &pb::ProfileRequest { pubkey: bob.npub() }).await;
+    assert_eq!(p.pubkey, bob.pubkey.hex());
+    assert_eq!(p.profile.unwrap(), pb::Profile::default());
+    assert_eq!(p.reputation.len(), 1);
+    assert_eq!(p.reputation[0].community, "m");
+    assert!(p.reputation[0].rep > 0.0);
+    let stranger: pb::ProfileResponse = n.ok("profile", &pb::ProfileRequest { pubkey: Keys::generate().pubkey.hex() }).await;
+    assert_eq!(stranger.last_seen, 0);
+    assert!(n.err("profile", &pb::ProfileRequest { pubkey: "x".into() }).await.1.contains("pubkey"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pins_and_deletes() {
+    let n = spawn(|_| {}).await;
+    let other = Keys::generate();
+    let root = other.sign(K_POST, tags(&[&["c", "m"]]), "theirs".into());
+    n.node.ingest(root.clone(), 9, false).unwrap();
+    let r1: pb::Ack = n.ok("post", &reply(&root.id.hex(), "mine")).await;
+    n.ok::<_, pb::Ack>("post", &reply(&r1.id, "deeper")).await;
+
+    let p: pb::Ack = n.ok("pin", &pb::IdRequest { id: root.id.hex(), thread: true }).await;
+    assert_eq!(p.count, 3, "root and both replies");
+    let i: pb::InfoResponse = n.ok("info", &E).await;
+    assert_eq!(i.pinned, 3);
+    let t: pb::ThreadResponse = n.ok("thread", &id(&root.id.hex())).await;
+    assert!(t.root.unwrap().pinned);
+    let u: pb::Ack = n.ok("unpin", &pb::IdRequest { id: root.id.hex(), thread: false }).await;
+    assert_eq!(u.count, 1);
+    let i: pb::InfoResponse = n.ok("info", &E).await;
+    assert_eq!(i.pinned, 2);
+    assert!(n.err("pin", &id(&"ef".repeat(32))).await.1.contains("not found"));
+    assert!(n.err("pin", &id("x")).await.1.contains("hex"));
+
+    // delete: only our own events
+    assert!(n.err("delete", &id(&root.id.hex())).await.1.contains("own"));
+    let d: pb::Ack = n.ok("delete", &id(&r1.id)).await;
+    assert_eq!(d.id.len(), 64);
+    assert!(!n.has(&r1.id));
+    assert!(n.err("event", &id(&r1.id)).await.1.contains("not found"));
+    assert!(n.err("delete", &id(&r1.id)).await.1.contains("own"), "already gone");
+    let t: pb::ThreadResponse = n.ok("thread", &id(&root.id.hex())).await;
+    assert!(t.root.unwrap().replies.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn memory() {
+    let n = spawn(|_| {}).await;
+    let set = |k: &str, v: &str, delete| pb::MemorySetRequest { key: k.into(), value: v.into(), delete };
+    let get = |k: &str| pb::MemoryGetRequest { key: k.into() };
+    n.ok::<_, pb::Ack>("memory_set", &set("plan", "read the feed", false)).await;
+    n.ok::<_, pb::Ack>("memory_set", &set(" notes ", r#"{"a":1}"#, false)).await;
+    let one: pb::MemoryResponse = n.ok("memory_get", &get("plan")).await;
+    assert_eq!(one.entries, [pb::MemoryEntry { key: "plan".into(), value: "read the feed".into() }]);
+    let all: pb::MemoryResponse = n.ok("memory_get", &get("")).await;
+    assert_eq!(all.entries.iter().map(|e| e.key.as_str()).collect::<Vec<_>>(), ["notes", "plan"], "keys trimmed, sorted");
+    n.ok::<_, pb::Ack>("memory_set", &set("plan", "", true)).await;
+    let gone: pb::MemoryResponse = n.ok("memory_get", &get("plan")).await;
+    assert!(gone.entries.is_empty());
+    assert!(n.err("memory_set", &set("  ", "x", false)).await.1.contains("key"));
+    // 4 MiB cap: a value that would overflow is refused and nothing is stored
+    let big = "x".repeat(900 * 1024);
+    for i in 0..4 {
+        n.ok::<_, pb::Ack>("memory_set", &set(&format!("big{i}"), &big, false)).await;
+    }
+    assert!(n.err("memory_set", &set("big4", &big, false)).await.1.contains("4 MiB"));
+    let after: pb::MemoryResponse = n.ok("memory_get", &get("big4")).await;
+    assert!(after.entries.is_empty());
+    // overwriting an existing key is measured without its old value
+    n.ok::<_, pb::Ack>("memory_set", &set("big0", &big, false)).await;
+    // persisted as memory.pb
+    let m: pb::MemoryResponse = pb::decode(&std::fs::read(n.dir.0.join("memory.pb")).unwrap()).unwrap();
+    assert_eq!(m.entries.len(), 5);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fetch_and_lookups_reach_peers() {
+    let (a, b) = (spawn(|_| {}).await, spawn(|c| c.relay_all = false).await);
+    // b only relays joined communities, so gossip alone will not bring it 'bio'
+    b.connect(&a).await;
+    let root: pb::Ack = a.ok("post", &post("bio", "Remote", "only on a")).await;
+    let r: pb::Ack = a.ok("post", &reply(&root.id, "remote reply")).await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!b.has(&root.id));
+
+    // event / thread fall back to asking peers
+    let ev: pb::EventResponse = b.ok("event", &id(&root.id)).await;
+    assert_eq!(ev.item.unwrap().title, "Remote");
+    let t: pb::ThreadResponse = b.ok("thread", &id(&root.id)).await;
+    assert_eq!(t.root.unwrap().replies[0].id, r.id);
+    assert!(b.has(&r.id), "fetched replies are cached");
+
+    // explicit fetch with a filter
+    a.ok::<_, pb::Ack>("post", &post("chem", "C1", "x")).await;
+    a.ok::<_, pb::Ack>("post", &post("chem", "C2", "x")).await;
+    let filter = pb::Filter { kinds: vec![K_POST], tags: vec![pb::TagFilter { name: "c".into(), values: vec!["chem".into()] }], ..Default::default() };
+    let got: pb::Items = b.ok("fetch", &pb::FetchRequest { filter: Some(filter) }).await;
+    let mut titles: Vec<&str> = got.items.iter().map(|i| i.title.as_str()).collect();
+    titles.sort();
+    assert_eq!(titles, ["C1", "C2"]);
+    assert!(n_cached(&b, "chem") == 2);
+    assert!(b.err("fetch", &pb::FetchRequest { filter: None }).await.1.contains("filter"));
+
+    // join pulls the community's history from peers
+    a.ok::<_, pb::Ack>("post", &post("phys", "P", "x")).await;
+    let j: pb::Ack = b.ok("join", &pb::CommunityRequest { community: "phys".into() }).await;
+    assert_eq!(j.count, 1);
+    // replying to and rating events that only a peer has
+    let rr: pb::Ack = b.ok("post", &reply(&root.id, "from b")).await;
+    assert!(eventually(std::time::Duration::from_secs(5), || a.has(&rr.id)).await, "reply reached a");
+    let peers: pb::PeersResponse = b.ok("peers", &E).await;
+    assert_eq!(peers.peers.len(), 1);
+    assert!(peers.peers[0].outbound && peers.peers[0].addr == a.ws);
+}
+
+fn n_cached(n: &TestNode, c: &str) -> usize {
+    n.node.store.lock().unwrap().query(&Filter { tags: vec![("c".into(), vec![c.into()])], ..Default::default() }, 1000).len()
+}

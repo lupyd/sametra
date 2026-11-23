@@ -1,0 +1,305 @@
+//! The real binary: CLI subcommands, the MCP stdio server, restart persistence
+//! and `--peer` bootstrapping between separate processes.
+mod common;
+use common::tempdir;
+use serde_json::{Value, json};
+use std::io::{BufRead, BufReader, Write};
+use std::path::Path;
+use std::process::{Child, Command, Output, Stdio};
+use std::time::{Duration, Instant};
+
+const BIN: &str = env!("CARGO_BIN_EXE_sametra");
+
+fn cmd(data: &Path) -> Command {
+    let mut c = Command::new(BIN);
+    c.env_remove("SAMETRA_KEY").env_remove("SAMETRA_API").env_remove("SAMETRA_TOKEN").env("SAMETRA_DATA", data);
+    c
+}
+fn out(o: Output) -> (i32, String, String) {
+    (o.status.code().unwrap_or(-1), String::from_utf8_lossy(&o.stdout).into(), String::from_utf8_lossy(&o.stderr).into())
+}
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+}
+
+struct Proc(Child);
+impl Drop for Proc {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+impl Proc {
+    /// Graceful stop (SIGINT, like Ctrl-C) so the node flushes its log.
+    fn interrupt(mut self) {
+        let _ = Command::new("kill").args(["-INT", &self.0.id().to_string()]).status();
+        let end = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < end {
+            if self.0.try_wait().unwrap().is_some() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("node did not stop on SIGINT");
+    }
+}
+
+fn run_node(data: &Path, port: u16, extra: &[&str]) -> Proc {
+    let p = cmd(data).args(["run", "--listen", &format!("127.0.0.1:{port}")]).args(extra).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    let end = Instant::now() + Duration::from_secs(10);
+    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(Instant::now() < end, "node did not start");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Proc(p)
+}
+
+fn call(data: &Path, port: u16, tool: &str, args: Value) -> Result<Value, String> {
+    let o = cmd(data).args(["call", "--api", &format!("http://127.0.0.1:{port}"), tool, &args.to_string()]).output().unwrap();
+    let (code, stdout, stderr) = out(o);
+    if code == 0 { Ok(serde_json::from_str(&stdout).unwrap()) } else { Err(stderr) }
+}
+
+fn wait(timeout: Duration, mut f: impl FnMut() -> bool) -> bool {
+    let end = Instant::now() + timeout;
+    while Instant::now() < end {
+        if f() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
+#[test]
+fn help_and_unknown_commands() {
+    let d = tempdir("help");
+    let (code, stdout, _) = out(cmd(&d.0).arg("--help").output().unwrap());
+    assert_eq!(code, 0);
+    for s in ["sametra [run]", "sametra mcp", "sametra call", "--peer", "--api-token", "--no-relay-all"] {
+        assert!(stdout.contains(s), "{s}");
+    }
+    let (code, _, stderr) = out(cmd(&d.0).arg("frobnicate").output().unwrap());
+    assert_eq!(code, 2);
+    assert!(stderr.contains("USAGE"));
+    let (code, _, stderr) = out(cmd(&d.0).args(["run", "--max-peers", "lots"]).output().unwrap());
+    assert_eq!(code, 2);
+    assert!(stderr.contains("--max-peers"));
+}
+
+#[test]
+fn identity_is_created_once_and_private() {
+    let d = tempdir("id");
+    let (code, first, stderr) = out(cmd(&d.0).arg("id").output().unwrap());
+    assert_eq!(code, 0);
+    assert!(stderr.contains("generated new identity"));
+    assert!(first.contains("npub:   npub1") && first.contains("pubkey: ") && !first.contains("nsec"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(d.0.join("key")).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+    let (_, again, stderr) = out(cmd(&d.0).arg("id").output().unwrap());
+    assert_eq!(first, again, "stable across runs");
+    assert!(!stderr.contains("generated"));
+    let (_, secret, _) = out(cmd(&d.0).args(["id", "--show-secret"]).output().unwrap());
+    let nsec = secret.lines().find_map(|l| l.strip_prefix("nsec:   ")).unwrap().to_string();
+    // the same identity can be supplied by environment (e.g. a microVM secret)
+    let other = tempdir("id-env");
+    let (_, via_env, _) = out(cmd(&other.0).arg("id").env("SAMETRA_KEY", &nsec).output().unwrap());
+    assert_eq!(via_env, first);
+    assert!(!other.0.join("key").exists());
+    let (code, _, stderr) = out(cmd(&other.0).arg("id").env("SAMETRA_KEY", "garbage").output().unwrap());
+    assert_eq!(code, 2);
+    assert!(stderr.contains("SAMETRA_KEY"));
+}
+
+#[test]
+fn tools_lists_schemas() {
+    let d = tempdir("tools");
+    let (code, stdout, _) = out(cmd(&d.0).arg("tools").output().unwrap());
+    assert_eq!(code, 0);
+    let v: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(v.as_array().unwrap().len(), 21);
+    assert!(v.as_array().unwrap().iter().any(|t| t["name"] == "rate" && t["inputSchema"]["required"] == json!(["score"])));
+}
+
+#[test]
+fn call_subcommand_against_a_running_node() {
+    let d = tempdir("call");
+    let port = free_port();
+    let _node = run_node(&d.0, port, &["--join", "math"]);
+    let info = call(&d.0, port, "info", json!({})).unwrap();
+    assert_eq!(info["joined"], json!(["math"]));
+    let a = call(&d.0, port, "post", json!({"community": "math", "title": "Q", "content": "Why?"})).unwrap();
+    let id = a["id"].as_str().unwrap().to_string();
+    call(&d.0, port, "post", json!({"parent": id, "content": "Because."})).unwrap();
+    let f = call(&d.0, port, "feed", json!({"community": "math"})).unwrap();
+    assert_eq!(f["items"][0]["title"], "Q");
+    assert_eq!(f["items"][0]["reply_count"], 1);
+    // default arguments: `call info` with no JSON
+    let o = cmd(&d.0).args(["call", "--api", &format!("http://127.0.0.1:{port}"), "peers"]).output().unwrap();
+    assert_eq!(out(o).0, 0);
+    // SAMETRA_API env works like --api
+    let o = cmd(&d.0).args(["call", "info"]).env("SAMETRA_API", format!("http://127.0.0.1:{port}")).output().unwrap();
+    assert_eq!(out(o).0, 0);
+    // errors: node-side, bad JSON, bad arguments, unknown tool, missing tool
+    assert!(call(&d.0, port, "post", json!({"community": "math", "content": " "})).unwrap_err().contains("content"));
+    assert!(call(&d.0, port, "rate", json!({"score": "ten"})).unwrap_err().contains("bad arguments"));
+    assert!(call(&d.0, port, "nope", json!({})).unwrap_err().contains("unknown tool"));
+    let (code, _, stderr) = out(cmd(&d.0).args(["call", "--api", &format!("http://127.0.0.1:{port}"), "info", "{oops"]).output().unwrap());
+    assert!(code == 2 && stderr.contains("bad JSON"));
+    let (code, _, stderr) = out(cmd(&d.0).arg("call").output().unwrap());
+    assert!(code == 2 && stderr.contains("usage"));
+    let dead = free_port();
+    assert!(call(&d.0, dead, "info", json!({})).unwrap_err().contains("unreachable"));
+}
+
+#[test]
+fn mcp_stdio_server() {
+    let d = tempdir("mcp");
+    let port = free_port();
+    let _node = run_node(&d.0, port, &[]);
+    let mut p = cmd(&d.0).args(["mcp", "--api", &format!("http://127.0.0.1:{port}")]).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+    let mut stdin = p.stdin.take().unwrap();
+    let mut stdout = BufReader::new(p.stdout.take().unwrap());
+    let mut send = move |msg: Value| {
+        writeln!(stdin, "{msg}").unwrap();
+        stdin.flush().unwrap();
+    };
+    let mut recv = || -> Value {
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        serde_json::from_str(&line).unwrap()
+    };
+    send(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-03-26"}}));
+    let init = recv();
+    assert_eq!(init["id"], 1);
+    assert_eq!(init["result"]["protocolVersion"], "2025-03-26", "echoes the client's version");
+    assert_eq!(init["result"]["serverInfo"]["name"], "sametra");
+    assert!(init["result"]["capabilities"]["tools"].is_object());
+    assert!(init["result"]["instructions"].as_str().unwrap().contains("public"));
+    // notifications and junk lines get no reply: the next line answers the ping
+    send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+    send(json!("not an object"));
+    send(json!({"jsonrpc": "2.0", "id": "p", "method": "ping"}));
+    assert_eq!(recv(), json!({"jsonrpc": "2.0", "id": "p", "result": {}}));
+
+    send(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}));
+    let list = recv();
+    assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 21);
+
+    let tool = |id: u32, name: &str, args: Value| json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": name, "arguments": args}});
+    let text = |v: &Value| -> Value { serde_json::from_str(v["result"]["content"][0]["text"].as_str().unwrap()).unwrap_or(Value::Null) };
+    send(tool(3, "set_profile", json!({"name": "Agent Smith", "agent": true})));
+    assert_eq!(text(&recv())["ok"], true);
+    send(tool(4, "create_community", json!({"slug": "oncology"})));
+    assert_eq!(text(&recv())["community"], "oncology");
+    send(tool(5, "post", json!({"community": "oncology", "title": "Hypothesis", "content": "..."})));
+    let id = text(&recv())["id"].as_str().unwrap().to_string();
+    send(tool(6, "thread", json!({"id": id})));
+    let t = text(&recv());
+    assert_eq!(t["root"]["author_is_agent"], true);
+    assert_eq!(t["root"]["author_name"], "Agent Smith");
+    send(tool(7, "memory_set", json!({"key": "todo", "value": "follow up"})));
+    recv();
+    send(tool(8, "memory_get", json!({})));
+    assert_eq!(text(&recv())["entries"][0]["value"], "follow up");
+    // tool errors are results with isError, not JSON-RPC errors
+    send(tool(9, "rate", json!({"score": 50, "target": "x"})));
+    let e = recv();
+    assert_eq!(e["result"]["isError"], true);
+    assert!(e["result"]["content"][0]["text"].as_str().unwrap().contains("-10..10"));
+    send(tool(10, "nope", json!({})));
+    assert_eq!(recv()["result"]["isError"], true);
+    // unknown methods are JSON-RPC errors
+    send(json!({"jsonrpc": "2.0", "id": 11, "method": "resources/list"}));
+    assert_eq!(recv()["error"]["code"], -32601);
+    drop(send); // closes stdin
+    assert!(p.wait().unwrap().success(), "exits cleanly on EOF");
+}
+
+#[test]
+fn restart_keeps_events_state_and_identity() {
+    let d = tempdir("restart");
+    let port = free_port();
+    let node = run_node(&d.0, port, &[]);
+    let info = call(&d.0, port, "info", json!({})).unwrap();
+    let a = call(&d.0, port, "post", json!({"community": "bio", "title": "Persist me", "content": "x"})).unwrap();
+    let id = a["id"].as_str().unwrap().to_string();
+    call(&d.0, port, "pin", json!({"id": id})).unwrap();
+    call(&d.0, port, "join", json!({"community": "chem"})).unwrap();
+    call(&d.0, port, "memory_set", json!({"key": "k", "value": "v"})).unwrap();
+    node.interrupt();
+    for f in ["key", "state.pb", "memory.pb", "store/events.pb"] {
+        assert!(d.0.join(f).exists(), "{f}");
+    }
+    let port = free_port();
+    let _node = run_node(&d.0, port, &[]);
+    let info2 = call(&d.0, port, "info", json!({})).unwrap();
+    assert_eq!(info2["pubkey"], info["pubkey"]);
+    assert_eq!(info2["pinned"], 1);
+    assert!(info2["joined"].as_array().unwrap().contains(&json!("chem")));
+    let t = call(&d.0, port, "thread", json!({"id": id})).unwrap();
+    assert_eq!(t["root"]["title"], "Persist me");
+    assert_eq!(t["root"]["pinned"], true);
+    assert_eq!(call(&d.0, port, "memory_get", json!({"key": "k"})).unwrap()["entries"][0]["value"], "v");
+}
+
+#[test]
+fn bootstrap_peer_and_gossip_between_processes() {
+    let (da, db) = (tempdir("boot-a"), tempdir("boot-b"));
+    let (pa, pb) = (free_port(), free_port());
+    let _a = run_node(&da.0, pa, &["--public", &format!("ws://127.0.0.1:{pa}")]);
+    let _b = run_node(&db.0, pb, &["--peer", &format!("ws://127.0.0.1:{pa}"), "--threads", "1"]);
+    assert!(wait(Duration::from_secs(20), || call(&db.0, pb, "info", json!({})).unwrap()["peers"] == 1), "b dialed its bootstrap peer");
+    let a = call(&da.0, pa, "post", json!({"community": "m", "title": "hello b", "content": "x"})).unwrap();
+    let id = a["id"].as_str().unwrap().to_string();
+    assert!(wait(Duration::from_secs(10), || call(&db.0, pb, "event", json!({"id": id})).is_ok()));
+    let r = call(&db.0, pb, "post", json!({"parent": id, "content": "hello a"})).unwrap();
+    let rid = r["id"].as_str().unwrap().to_string();
+    assert!(wait(Duration::from_secs(10), || {
+        call(&da.0, pa, "thread", json!({"id": id})).unwrap()["root"]["replies"].as_array().is_some_and(|v| v.iter().any(|x| x["id"] == rid.as_str()))
+    }));
+    let peers = call(&db.0, pb, "peers", json!({})).unwrap();
+    assert_eq!(peers["peers"][0]["addr"], format!("ws://127.0.0.1:{pa}"));
+    assert_eq!(peers["peers"][0]["outbound"], true);
+}
+
+#[cfg(feature = "tls")]
+#[test]
+fn tls_node_and_https_calls() {
+    let d = tempdir("cli-tls");
+    let ck = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let (cert, key) = (d.0.join("cert.pem"), d.0.join("key.pem"));
+    std::fs::write(&cert, ck.cert.pem()).unwrap();
+    std::fs::write(&key, ck.signing_key.serialize_pem()).unwrap();
+    // half a TLS configuration is a startup error, not a silent plain-text node
+    let (code, _, stderr) = out(cmd(&d.0).args(["run", "--listen", "127.0.0.1:0", "--tls-cert", cert.to_str().unwrap()]).output().unwrap());
+    assert_eq!(code, 2);
+    assert!(stderr.contains("both"), "{stderr}");
+
+    let port = free_port();
+    let _node = run_node(&d.0, port, &["--tls-cert", cert.to_str().unwrap(), "--tls-key", key.to_str().unwrap()]);
+    let https = format!("https://localhost:{port}");
+    let call_tls = |tool: &str, args: Value, ca: bool| {
+        let mut c = cmd(&d.0);
+        c.args(["call", "--api", &https, tool, &args.to_string()]);
+        if ca {
+            c.args(["--tls-ca", cert.to_str().unwrap()]);
+        }
+        out(c.output().unwrap())
+    };
+    let (code, stdout, stderr) = call_tls("post", json!({"community": "m", "title": "t", "content": "over https"}), true);
+    assert_eq!(code, 0, "{stderr}");
+    let id = serde_json::from_str::<Value>(&stdout).unwrap()["id"].as_str().unwrap().to_string();
+    // the same port still answers plain http
+    assert_eq!(call(&d.0, port, "event", json!({"id": id})).unwrap()["item"]["content"], "over https");
+    // without trusting the certificate, https fails loudly
+    let (code, _, stderr) = call_tls("info", json!({}), false);
+    assert_eq!(code, 2);
+    assert!(stderr.to_lowercase().contains("certificate"), "{stderr}");
+    // SAMETRA_TLS_CA works like --tls-ca, and so does the MCP server
+    let o = cmd(&d.0).args(["call", "--api", &https, "info"]).env("SAMETRA_TLS_CA", &cert).output().unwrap();
+    assert_eq!(out(o).0, 0);
+}

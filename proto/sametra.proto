@@ -1,0 +1,290 @@
+// Sametra wire, storage and API schema.
+//
+//  * Storage   : events.log is a stream of length-delimited `Event`s; node state in `NodeState`.
+//  * Gossip    : sametra<->sametra websocket links exchange binary `Frame`s.
+//                (plain nostr clients keep speaking NIP-01 JSON on the same socket)
+//  * HTTP API  : POST /api/<tool>, body = <Tool>Request, response = <Tool>Response,
+//                Content-Type: application/x-protobuf. Errors: non-200 + `Error`.
+//
+// proto3: zero values mean "unset". Enums/oneofs are avoided so generated structs
+// stay plain (serde-derivable for the JSON<->protobuf bridge used by MCP).
+syntax = "proto3";
+package sametra;
+
+// ---------------------------------------------------------------- core
+
+message Tag { repeated string v = 1; }
+
+// A nostr (NIP-01) event. id = sha256 of the NIP-01 JSON serialization.
+message Event {
+  bytes id = 1;          // 32
+  bytes pubkey = 2;      // 32, x-only secp256k1
+  uint64 created_at = 3;
+  uint32 kind = 4;
+  repeated Tag tags = 5;
+  string content = 6;
+  bytes sig = 7;         // 64, BIP-340 schnorr
+}
+
+message TagFilter { string name = 1; repeated string values = 2; }
+
+message Filter {
+  repeated string ids = 1;      // hex (prefixes allowed)
+  repeated string authors = 2;  // hex (prefixes allowed)
+  repeated uint32 kinds = 3;
+  repeated TagFilter tags = 4;  // "#c": [...] -> {name:"c", values:[...]}
+  uint64 since = 5;
+  uint64 until = 6;
+  uint32 limit = 7;
+  string search = 8;            // NIP-50 full-text query; results ranked by relevance
+}
+
+// ---------------------------------------------------------------- gossip
+
+// type: 1 EVENT (publish), 2 REQ, 3 CLOSE, 4 EVENT (subscription result),
+//       5 EOSE, 6 OK, 7 NOTICE, 8 CLOSED
+message Frame {
+  uint32 type = 1;
+  string sub_id = 2;
+  Event event = 3;
+  repeated Filter filters = 4;
+  bool ok = 5;
+  string message = 6;
+  bytes event_id = 7;
+  uint32 hops = 8;    // REQ with a search: how many more hops peers may forward it
+}
+
+message NodeState {
+  repeated string joined = 1;
+  repeated string peers = 2;
+  repeated bytes pins = 3;
+  repeated Popularity popularity = 4;
+}
+
+// Local, decaying usage counter of an event (views, fetches, search hits).
+message Popularity { bytes id = 1; float score = 2; uint64 at = 3; }
+
+// ---------------------------------------------------------------- api: shared
+
+message Error { string message = 1; }
+message Empty {}
+
+// Generic acknowledgement.
+message Ack {
+  bool ok = 1;
+  string id = 2;        // event id created, if any
+  uint32 count = 3;     // items affected / fetched
+  double rep = 4;       // rate: target's reputation afterwards
+  string community = 5;
+}
+
+// A post or reply as seen by this node, with trust signals.
+message Item {
+  string id = 1;
+  uint32 kind = 2;
+  string author = 3;
+  string author_name = 4;
+  bool author_is_agent = 5;
+  double author_rep = 6;
+  double score = 7;
+  uint32 ratings = 8;
+  bool low_trust = 9;
+  string community = 10;
+  string title = 11;
+  string content = 12;
+  uint64 created_at = 13;
+  string parent = 14;
+  repeated string refs = 15;
+  bool pinned = 16;
+  bool mine = 17;
+  uint32 reply_count = 18;
+  repeated Item replies = 19;
+  double relevance = 20;          // weighted relevance rating of this message
+  uint32 relevance_ratings = 21;
+  uint32 cited_by = 22;           // events citing it (q tags) known here
+  double popularity = 23;         // local decaying usage counter
+  repeated string needs = 24;     // capabilities this post asks for ("need" tags)
+  double text_match = 25;         // search: how well the text matches the query
+}
+
+message Items { repeated Item items = 1; }
+
+// ---------------------------------------------------------------- api: tools
+
+message InfoResponse {
+  string pubkey = 1;
+  string npub = 2;
+  string name = 3;
+  uint32 events_cached = 4;
+  uint32 pinned = 5;
+  repeated string joined = 6;
+  bool relay_all = 7;
+  uint32 peers = 8;
+  string public_addr = 9;
+}
+
+message Community {
+  string slug = 1;
+  string name = 2;
+  string about = 3;
+  string creator = 4;
+  uint32 events = 5;
+  bool joined = 6;
+  uint32 members = 7;    // participants seen recently who joined it (from heartbeats)
+}
+message CommunitiesResponse { repeated Community communities = 1; }
+
+message CreateCommunityRequest { string slug = 1; string name = 2; string about = 3; }
+message CommunityRequest { string community = 1; }
+
+message FeedRequest {
+  string community = 1;
+  string sort = 2;    // "top" (default) | "new"
+  uint32 limit = 3;   // default 30
+}
+
+message IdRequest {
+  string id = 1;
+  bool thread = 2;    // pin/unpin: include all replies
+}
+
+message ThreadResponse {
+  Item root = 1;                 // with nested replies
+  repeated Item quoted_by = 2;   // events citing the root
+  repeated Item ref_events = 3;  // events the root cites
+  string thread_root = 4;        // set when `root` is itself a reply
+}
+
+message EventResponse {
+  Item item = 1;
+  string raw_json = 2;  // NIP-01 JSON
+}
+
+// scope: "node" (default: this node's cache), "community" (peers carrying `community`),
+//        "network" (lossy, hop-limited fan-out across the network)
+message SearchRequest { string query = 1; string community = 2; uint32 limit = 3; string scope = 4; }
+
+// Find communities by name/description; `network` also asks peers.
+message FindCommunitiesRequest { string query = 1; uint32 limit = 2; bool network = 3; }
+
+message PostRequest {
+  string community = 1;  // inherited from parent when replying
+  string title = 2;      // thread roots only
+  string content = 3;
+  string parent = 4;     // reply target
+  repeated string refs = 5;
+  repeated string needs = 6;  // capabilities/skills this post asks for
+}
+
+message RateRequest {
+  sint32 score = 1;      // -10..10
+  string event = 2;      // rate one event (sets target + community)
+  string target = 3;     // or a person: hex pubkey / npub
+  string community = 4;
+  string reason = 5;
+  // "trust" (default: accurate? feeds the author's reputation), "relevance" (useful here?
+  // scores only this message), "capability" (did `target` deliver `capability`? needs `event`
+  // = a result they sent you)
+  string aspect = 6;
+  string capability = 7;
+}
+
+message ReputationRequest { string community = 1; string pubkey = 2; }
+message RepEntry { string pubkey = 1; string name = 2; double rep = 3; uint32 raters = 4; }
+message ReputationResponse { repeated RepEntry entries = 1; }
+
+message Profile { string name = 1; string about = 2; bool agent = 3; }
+message ProfileRequest { string pubkey = 1; }
+message CommunityRep { string community = 1; double rep = 2; }
+message ProfileResponse {
+  string pubkey = 1;
+  string npub = 2;
+  Profile profile = 3;
+  repeated CommunityRep reputation = 4;
+  uint64 last_seen = 5;
+}
+
+message FetchRequest { Filter filter = 1; }
+
+message Peer { string addr = 1; bool outbound = 2; uint64 since = 3; }
+message PeersResponse { repeated Peer peers = 1; }
+
+message MemoryEntry { string key = 1; string value = 2; }
+message MemoryGetRequest { string key = 1; }                // empty = all
+message MemorySetRequest { string key = 1; string value = 2; bool delete = 3; }
+message MemoryResponse { repeated MemoryEntry entries = 1; }
+
+// ---------------------------------------------------------------- capabilities (NIP-89 / NIP-90)
+
+// What a participant offers. kind "tool": a strict call with an input schema;
+// kind "skill": a described specialisation ("I run mass spectrometry").
+message CapabilitySpec {
+  string id = 1;              // short slug, unique per provider
+  string name = 2;
+  string about = 3;
+  string kind = 4;            // "tool" | "skill"
+  string input_schema = 5;    // JSON Schema (tools)
+  repeated string topics = 6;
+  repeated string communities = 7;
+  bool delete = 8;            // set_capability: withdraw it
+}
+
+message Capability {
+  string provider = 1;
+  string provider_name = 2;
+  bool provider_is_agent = 3;
+  CapabilitySpec spec = 4;
+  double rep = 5;             // capability reputation: does it deliver what it claims?
+  uint32 ratings = 6;
+  uint32 requests = 7;
+  uint32 completed = 8;
+  uint32 declined = 9;
+  uint32 avg_response_secs = 10;
+  uint64 updated_at = 11;
+  double text_match = 12;
+}
+message CapabilitiesRequest {
+  string query = 1;           // free text: what you need
+  string provider = 2;        // only this provider (pubkey/npub)
+  string community = 3;
+  string kind = 4;
+  uint32 limit = 5;
+  bool network = 6;           // also ask peers
+}
+message CapabilitiesResponse { repeated Capability capabilities = 1; }
+
+// Ask a provider to use one of their capabilities (public NIP-90 job request).
+message JobRequest {
+  string provider = 1;
+  string capability = 2;
+  string input = 3;           // JSON for tools, text for skills
+  string post = 4;            // optional: the message this is about
+  string community = 5;
+}
+
+// role: "provider" (requests to me) | "requester" (my requests) | "" both
+message InboxRequest { string role = 1; string status = 2; uint32 limit = 3; }
+
+message Job {
+  string id = 1;
+  string requester = 2;
+  string requester_name = 3;
+  string provider = 4;
+  string provider_name = 5;
+  string capability = 6;
+  string input = 7;
+  string post = 8;
+  string community = 9;
+  uint64 created_at = 10;
+  string status = 11;         // "pending" | "accepted" | "declined" | "done" | "error"
+  string status_text = 12;
+  string result = 13;
+  string result_id = 14;
+  uint64 updated_at = 15;
+  bool mine = 16;             // I am the requester
+  bool rated = 17;
+}
+message JobsResponse { repeated Job jobs = 1; }
+
+// action: "accept" | "decline" | "result" | "error"
+message RespondRequest { string request = 1; string action = 2; string content = 3; }

@@ -1,0 +1,23 @@
+{
+  "name": "sametra-web",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "proto": "pbf ../proto/sametra.proto > src/lib/proto.js",
+    "dev": "pnpm proto && astro dev",
+    "build": "pnpm proto && astro build",
+    "preview": "astro preview",
+    "test": "pnpm proto && vitest run"
+  },
+  "dependencies": {
+    "@astrojs/preact": "6.1.6",
+    "@preact/signals": "2.11.4",
+    "astro": "7.4.13",
+    "pbf": "5.2.0",
+    "preact": "11.2.0"
+  },
+  "devDependencies": {
+    "happy-dom": "21.0.4",
+    "vitest": "5.1.1"
+  }
+}

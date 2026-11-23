@@ -1,0 +1,60 @@
+/* Documentation pages (static, no JS). Builds on global.css tokens. */
+.docs header .here{color:var(--mute);font-weight:600}
+.docs header .open{margin-left:auto;font-size:13px;padding:5px 12px}
+.dwrap{display:grid;grid-template-columns:220px minmax(0,1fr);gap:40px;max-width:1120px;margin:0 auto;padding:28px 20px 60px}
+.dnav{position:sticky;top:76px;align-self:start;display:flex;flex-direction:column}
+.dnav h3{font-size:11.5px;text-transform:uppercase;letter-spacing:.08em;color:var(--mute);margin:18px 10px 6px}
+.dnav h3:first-child{margin-top:0}
+.dnav a{padding:5px 10px;border-radius:var(--r);font-size:14px}
+.dnav a:hover{background:var(--acc2);color:var(--ink)}
+.dnav a.on{background:var(--acc);color:var(--panel)}
+@media (max-width:760px){
+  .dwrap{grid-template-columns:1fr;gap:16px;padding:16px}
+  .dnav{position:static;flex-direction:row;flex-wrap:wrap;gap:4px;border-bottom:1px solid var(--line);padding-bottom:12px}
+  .dnav h3{display:none}
+  .dnav a{font-size:13px;padding:4px 9px;border:1px solid var(--line)}
+}
+.prose{max-width:760px;min-width:0;line-height:1.65}
+.prose h1{font-size:30px;line-height:1.2;margin:0 0 8px;letter-spacing:-.01em}
+.prose .lede{font-size:17px;color:var(--mute);margin:0 0 28px}
+.prose h2{font-size:21px;margin:40px 0 10px;padding-top:4px}
+.prose h3{font-size:16px;margin:28px 0 6px}
+.prose p,.prose ul,.prose ol{margin:0 0 14px}
+.prose li{margin:3px 0}
+.prose a{color:var(--acc);text-decoration:underline;text-underline-offset:2px;text-decoration-thickness:1px}
+.prose code{font-size:.86em;margin:0}
+.prose pre{background:var(--panel);border:1px solid var(--line);border-radius:var(--r);padding:12px 14px;overflow-x:auto;font-size:13px;line-height:1.5;margin:0 0 16px}
+.prose pre.astro-code{background-color:var(--panel)!important}
+@media (prefers-color-scheme:dark){.prose .astro-code,.prose .astro-code span{color:var(--shiki-dark)!important}}
+.prose pre code{background:none;padding:0;font-size:inherit;overflow-wrap:normal}
+.prose table{border-collapse:collapse;width:100%;margin:0 0 18px;font-size:14px;display:block;overflow-x:auto}
+.prose th{text-align:left;font-weight:600;color:var(--mute);font-size:12.5px;text-transform:uppercase;letter-spacing:.04em}
+.prose td,.prose th{padding:7px 14px 7px 0;border-bottom:1px solid var(--line);vertical-align:top}
+.prose blockquote{margin:0 0 16px;padding:10px 14px;border-left:3px solid var(--acc);background:var(--acc2);border-radius:0 var(--r) var(--r) 0}
+.prose blockquote p:last-child{margin:0}
+.prose hr{border:0;border-top:1px solid var(--line);margin:32px 0}
+.prose figure{margin:8px 0 22px}
+.prose figcaption{font-size:13px;color:var(--mute);margin-top:6px}
+.prose svg{width:100%;height:auto;display:block}
+.pager{display:flex;justify-content:space-between;gap:12px;margin-top:48px;padding-top:20px;border-top:1px solid var(--line)}
+.pager a{display:flex;flex-direction:column;text-decoration:none;color:var(--ink);font-weight:600;padding:10px 14px;border:1px solid var(--line);border-radius:var(--r);background:var(--panel)}
+.pager a:hover{border-color:var(--acc)}
+.pager a.nx{text-align:right;margin-left:auto}
+.pager small{color:var(--mute);font-weight:400;font-size:12px}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px;margin:0 0 18px}
+.cards a{display:block;padding:12px 14px;border:1px solid var(--line);border-radius:var(--r);background:var(--panel);text-decoration:none;color:var(--ink)}
+.cards a:hover{border-color:var(--acc)}
+.cards b{display:block;margin-bottom:2px}
+.cards span{font-size:13px;color:var(--mute)}
+/* diagrams: drawn with theme tokens so they work in light and dark */
+.dg text{fill:var(--ink);font:13px ui-sans-serif,system-ui,sans-serif}
+.dg .mute{fill:var(--mute);font-size:11.5px}
+.dg .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px}
+.dg .h{font-weight:700}
+.dg .box{fill:var(--panel);stroke:var(--line);stroke-width:1.5}
+.dg .acc{fill:var(--acc2);stroke:var(--acc);stroke-width:1.5}
+.dg .ln{stroke:var(--mute);stroke-width:1.5;fill:none}
+.dg .la{stroke:var(--acc);stroke-width:2;fill:none}
+.dg .dash{stroke-dasharray:5 4}
+.dg .ah{fill:var(--mute)}.dg .aa{fill:var(--acc)}
+.dg .bad{fill:var(--badbg);stroke:var(--bad);stroke-width:1.5}

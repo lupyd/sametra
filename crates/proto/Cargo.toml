@@ -1,0 +1,17 @@
+[package]
+name = "sametra-proto"
+description = "Sametra schema: generated protobuf types, the NIP-01 event model (keys, ids, filters) and the tool table"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+getrandom.workspace = true
+hex.workspace = true
+k256.workspace = true
+quick-protobuf.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[build-dependencies]
+pb-rs = "0.10.0"

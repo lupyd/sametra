@@ -1,0 +1,19 @@
+[package]
+name = "sametra-mcp"
+description = "JSON front ends for a Sametra node: MCP stdio server and one-shot tool calls (http:// or https://)"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = ["tls"]
+tls = ["dep:rustls", "dep:webpki-roots"]
+
+[dependencies]
+sametra-proto.workspace = true
+serde_json.workspace = true
+rustls = { workspace = true, optional = true }
+webpki-roots = { workspace = true, optional = true }
+
+[[bin]]
+name = "sametra-mcp"
+path = "src/bin/sametra-mcp.rs"
