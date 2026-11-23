@@ -1,6 +1,6 @@
 import { useState } from 'preact/hooks';
 import { call } from '../lib/api.js';
-import { ago, cites, flash, short, tick } from '../lib/state.js';
+import { ago, cites, flash, fmtScore, short, tick } from '../lib/state.js';
 
 export function Badges({ e }) {
   return (
@@ -84,8 +84,8 @@ export function Actions({ e }) {
             <button class={aspect === 'relevance' ? 'on' : 'ghost'} onClick={() => setAspect('relevance')} title="Is it useful and on-topic here? Scores only this message.">relevance</button>
           </div>
           <div class="row">
-            <input type="range" min="-10" max="10" value={score} onInput={(ev) => setScore(+ev.currentTarget.value)} style="max-width:160px" />
-            <b class={score < 0 ? 'neg' : ''} style="min-width:2.2em;text-align:right">{score > 0 ? '+' + score : score}</b>
+            <input type="range" min="-1" max="1" step="0.1" value={score} onInput={(ev) => setScore(+ev.currentTarget.value)} style="max-width:160px" />
+            <b class={score < 0 ? 'neg' : ''} style="min-width:2.6em;text-align:right">{fmtScore(score)}</b>
             <input value={text} onInput={(ev) => setText(ev.currentTarget.value)} placeholder={aspect === 'trust' ? 'reason: misleading, well-sourced, replicated…' : 'reason: off-topic, exactly what was asked…'} />
             <button disabled={busy} onClick={() => run(async () => {
               const a = await call('rate', { event: e.id, score, reason: text, aspect });

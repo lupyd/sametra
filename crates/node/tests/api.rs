@@ -193,18 +193,18 @@ async fn rating_and_reputation() {
     n.node.ingest(alice.sign(K_PROFILE, vec![], r#"{"name":"Alice","agent":true}"#.into()), 9, false).unwrap();
 
     let rate = |score, event: &str, target: &str, c: &str| pb::RateRequest { score, event: event.into(), target: target.into(), community: c.into(), reason: "why".into(), ..Default::default() };
-    let a: pb::Ack = n.ok("rate", &rate(6, &ae.id.hex(), "", "")).await;
+    let a: pb::Ack = n.ok("rate", &rate(0.6, &ae.id.hex(), "", "")).await;
     assert_eq!(a.community, "m", "community taken from the event");
     assert!(a.rep > 0.0);
     // re-rating the same event replaces the earlier rating
-    let b: pb::Ack = n.ok("rate", &rate(-2, &ae.id.hex(), "", "")).await;
+    let b: pb::Ack = n.ok("rate", &rate(-0.2, &ae.id.hex(), "", "")).await;
     assert!(b.rep < 0.0, "{}", b.rep);
     let ratings = n.node.store.lock().unwrap().query(&Filter { kinds: Some(vec![K_RATING]), ..Default::default() }, 100).len();
     assert_eq!(ratings, 1);
 
     // rating a person directly, by npub
     let bob = Keys::generate();
-    let c: pb::Ack = n.ok("rate", &rate(9, "", &bob.npub(), "m")).await;
+    let c: pb::Ack = n.ok("rate", &rate(0.9, "", &bob.npub(), "m")).await;
     assert!(c.rep > 0.0);
 
     let lb: pb::ReputationResponse = n.ok("reputation", &pb::ReputationRequest { community: "m".into(), pubkey: String::new() }).await;
@@ -227,14 +227,14 @@ async fn rating_and_reputation() {
     assert!(t.root.unwrap().replies.is_empty());
 
     // validation
-    assert!(n.err("rate", &rate(11, &ae.id.hex(), "", "")).await.1.contains("-10..10"));
-    assert!(n.err("rate", &rate(-11, &ae.id.hex(), "", "")).await.1.contains("-10..10"));
-    assert!(n.err("rate", &rate(1, "", "", "m")).await.1.contains("target"));
-    assert!(n.err("rate", &rate(1, "", &bob.npub(), "")).await.1.contains("slug"));
-    assert!(n.err("rate", &rate(1, "", &n.node.keys.npub(), "m")).await.1.contains("yourself"));
+    assert!(n.err("rate", &rate(1.1, &ae.id.hex(), "", "")).await.1.contains("-1..1"));
+    assert!(n.err("rate", &rate(-1.1, &ae.id.hex(), "", "")).await.1.contains("-1..1"));
+    assert!(n.err("rate", &rate(0.1, "", "", "m")).await.1.contains("target"));
+    assert!(n.err("rate", &rate(0.1, "", &bob.npub(), "")).await.1.contains("slug"));
+    assert!(n.err("rate", &rate(0.1, "", &n.node.keys.npub(), "m")).await.1.contains("yourself"));
     let mine: pb::Ack = n.ok("post", &post("m", "mine", "x")).await;
-    assert!(n.err("rate", &rate(1, &mine.id, "", "")).await.1.contains("yourself"));
-    assert!(n.err("rate", &rate(1, &"cd".repeat(32), "", "")).await.1.contains("not found"));
+    assert!(n.err("rate", &rate(0.1, &mine.id, "", "")).await.1.contains("yourself"));
+    assert!(n.err("rate", &rate(0.1, &"cd".repeat(32), "", "")).await.1.contains("not found"));
     assert!(n.err("reputation", &pb::ReputationRequest { community: "m".into(), pubkey: "nope".into() }).await.1.contains("pubkey"));
 }
 
@@ -263,7 +263,7 @@ async fn profiles() {
     // someone else's profile with per-community reputation
     let bob = Keys::generate();
     n.node.ingest(bob.sign(K_POST, tags(&[&["c", "m"]]), "x".into()), 9, false).unwrap();
-    n.ok::<_, pb::Ack>("rate", &pb::RateRequest { score: 5, target: bob.pubkey.hex(), community: "m".into(), ..Default::default() }).await;
+    n.ok::<_, pb::Ack>("rate", &pb::RateRequest { score: 0.5, target: bob.pubkey.hex(), community: "m".into(), ..Default::default() }).await;
     let p: pb::ProfileResponse = n.ok("profile", &pb::ProfileRequest { pubkey: bob.npub() }).await;
     assert_eq!(p.pubkey, bob.pubkey.hex());
     assert_eq!(p.profile.unwrap(), pb::Profile::default());
@@ -394,7 +394,7 @@ async fn ranked_search_and_scopes() {
         n.node.ingest(e.clone(), 9, false).unwrap();
     }
     // relevance ratings and citations lift a result above an equal text match
-    n.ok::<_, pb::Ack>("rate", &pb::RateRequest { score: 9, event: rated.id.hex(), aspect: "relevance".into(), ..Default::default() }).await;
+    n.ok::<_, pb::Ack>("rate", &pb::RateRequest { score: 0.9, event: rated.id.hex(), aspect: "relevance".into(), ..Default::default() }).await;
     for i in 0..3 {
         n.ok::<_, pb::Ack>("post", &pb::PostRequest { refs: vec![rated.id.hex()], ..post("bio", &format!("cites {i}"), "see it") }).await;
     }
@@ -423,9 +423,9 @@ async fn relevance_is_separate_from_trust() {
     let msg = alice.sign(K_POST, tags(&[&["c", "m"], &["title", "Off topic"]]), "cat pictures".into());
     n.node.ingest(msg.clone(), 9, false).unwrap();
     let rate = |score, aspect: &str| pb::RateRequest { score, event: msg.id.hex(), aspect: aspect.into(), ..Default::default() };
-    let rel: pb::Ack = n.ok("rate", &rate(-6, "relevance")).await;
+    let rel: pb::Ack = n.ok("rate", &rate(-0.6, "relevance")).await;
     assert!(rel.rep < 0.0, "Ack.rep is the message's relevance");
-    let trust: pb::Ack = n.ok("rate", &rate(4, "trust")).await;
+    let trust: pb::Ack = n.ok("rate", &rate(0.4, "trust")).await;
     assert!(trust.rep > 0.0, "true but off-topic: the author keeps their standing");
     let ev: pb::EventResponse = n.ok("event", &id(&msg.id.hex())).await;
     let it = ev.item.unwrap();
@@ -433,8 +433,8 @@ async fn relevance_is_separate_from_trust() {
     // both ratings coexist (separate replaceable slots)
     let ratings = n.node.store.lock().unwrap().query(&Filter { kinds: Some(vec![K_RATING]), ..Default::default() }, 10).len();
     assert_eq!(ratings, 2);
-    assert!(n.err("rate", &pb::RateRequest { score: 1, target: alice.npub(), community: "m".into(), aspect: "relevance".into(), ..Default::default() }).await.1.contains("event"));
-    assert!(n.err("rate", &rate(1, "vibes")).await.1.contains("unknown aspect"));
+    assert!(n.err("rate", &pb::RateRequest { score: 0.1, target: alice.npub(), community: "m".into(), aspect: "relevance".into(), ..Default::default() }).await.1.contains("event"));
+    assert!(n.err("rate", &rate(0.1, "vibes")).await.1.contains("unknown aspect"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -1,13 +1,12 @@
-//! Per-community reputation.
+//! Reputation, on a scale of -1..1.
 //!
-//! Every participant starts at 0 on a scale of -10..10. A rating is a
-//! replaceable event (kind 31985) from a rater to a target participant,
-//! optionally about one specific event. Ratings are weighted by the rater's
-//! own reputation in the same community, so a "2" from a well-reputed member
-//! can outweigh a "10" from a distrusted one:
+//! Every participant starts at 0. A rating is a replaceable event (kind 31985)
+//! from a rater to a target participant, optionally about one specific event,
+//! with a score in -1..1. Ratings are weighted by the rater's own standing, so
+//! a 0.2 from a well-reputed member can outweigh a 1 from a distrusted one:
 //!
-//!   weight(r) = ((rep(r) + 10) / 10)^2            rep 10 -> 4, 0 -> 1, -10 -> 0
-//!   rep(t)    = 10 · tanh( Σ_r weight(r)·score(r,t) / SCALE )
+//!   weight(r) = (rep(r) + 1)^2                 rep 1 -> 4, 0 -> 1, -1 -> 0
+//!   rep(t)    = tanh( Σ_r weight(r)·score(r,t) / SCALE )
 //!
 //! iterated to a fixed point (a small EigenTrust-like computation). When r's
 //! weight is used to rate t, t's own vote for r is excluded, so two accounts
@@ -16,10 +15,13 @@
 //! ignored.
 //!
 //! Ratings have an aspect (`aspect` tag):
-//!  * trust (default): is it accurate? Feeds the target's reputation and the
-//!    event's trust score.
+//!  * trust (default): is it accurate? Feeds the target's community reputation
+//!    and the event's trust score.
 //!  * relevance: how useful/on-topic is this message here? Scores only the
 //!    message, never the author's reputation.
+//!  * human: is this participant really a human? Network-wide (no community);
+//!    the same fixed point, so people verified as human vouch with more weight
+//!    (see `humanity`).
 //!  * capability: did the provider deliver what their capability claims? Kept
 //!    out of community reputation entirely (see `capability_scores`).
 //!
@@ -29,7 +31,10 @@ use crate::event::*;
 use crate::store::Ev;
 use std::collections::HashMap;
 
-const SCALE: f64 = 80.0;
+/// Weighted sum that maps to tanh(1) ≈ 0.76: eight average votes.
+const SCALE: f64 = 8.0;
+/// Capability reputation saturates faster: a few satisfied requesters count.
+const CAP_SCALE: f64 = 4.0;
 const ITERS: usize = 30;
 
 #[derive(Default, Debug)]
@@ -53,14 +58,19 @@ impl RepTable {
 }
 
 pub fn weight(rep: f64) -> f64 {
-    let x = (rep + 10.0) / 10.0;
+    let x = rep + 1.0;
     x * x
+}
+
+fn squash(sum: f64) -> f64 {
+    (sum / SCALE).tanh()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Aspect {
     Trust,
     Relevance,
+    Human,
     Capability(String),
 }
 
@@ -84,36 +94,41 @@ pub fn parse_rating(e: &Event) -> Option<Rating> {
     let aspect = match e.tag("aspect").unwrap_or("trust") {
         "trust" => Aspect::Trust,
         "relevance" => Aspect::Relevance,
+        "human" => Aspect::Human,
         "capability" => Aspect::Capability(e.tag("capability")?.to_string()),
         _ => return None,
     };
     let event = e.tag("e").and_then(H32::from_hex);
-    if aspect != Aspect::Trust && event.is_none() {
-        return None; // relevance rates a message; capability ratings cite a delivered result
+    match aspect {
+        // relevance rates a message; capability ratings cite a delivered result
+        Aspect::Relevance | Aspect::Capability(_) if event.is_none() => return None,
+        // humanity is about the person, never a message
+        Aspect::Human if event.is_some() => return None,
+        _ => {}
     }
-    Some(Rating { rater: e.pubkey, target, event, score: score.clamp(-10.0, 10.0), aspect })
+    Some(Rating { rater: e.pubkey, target, event, score: score.clamp(-1.0, 1.0), aspect })
 }
 
-pub fn compute(ratings: &[Ev]) -> RepTable {
-    let all: Vec<Rating> = ratings.iter().filter_map(|e| parse_rating(e)).collect();
-    let (rs, rel): (Vec<Rating>, Vec<Rating>) = all.into_iter().filter(|r| !matches!(r.aspect, Aspect::Capability(_))).partition(|r| r.aspect == Aspect::Trust);
-    // one vote per (rater, target)
-    let mut votes: HashMap<(H32, H32), (f64, usize)> = HashMap::new();
-    for r in &rs {
-        let v = votes.entry((r.rater, r.target)).or_insert((0.0, 0));
-        v.0 += r.score;
-        v.1 += 1;
+/// One averaged vote per (rater, target).
+fn votes(rs: &[&Rating]) -> Vec<(H32, H32, f64)> {
+    let mut v: HashMap<(H32, H32), (f64, usize)> = HashMap::new();
+    for r in rs {
+        let e = v.entry((r.rater, r.target)).or_insert((0.0, 0));
+        e.0 += r.score;
+        e.1 += 1;
     }
-    let votes: Vec<(H32, H32, f64)> = votes.into_iter().map(|((a, b), (s, n))| (a, b, s / n as f64)).collect();
+    v.into_iter().map(|((a, b), (s, n))| (a, b, s / n as f64)).collect()
+}
 
-    let squash = |sum: f64| 10.0 * (sum / SCALE).tanh();
+/// The weighted fixed point shared by community reputation and humanity.
+fn fixed_point(votes: &[(H32, H32, f64)]) -> HashMap<H32, f64> {
     let mut rep: HashMap<H32, f64> = HashMap::new();
     let mut sum: HashMap<H32, f64> = HashMap::new(); // raw weighted sums received
     let mut contrib: HashMap<(H32, H32), f64> = HashMap::new(); // w·s each vote added last round
     for _ in 0..ITERS {
         let mut next_sum: HashMap<H32, f64> = HashMap::new();
         let mut next_contrib = HashMap::with_capacity(votes.len());
-        for (rater, target, s) in &votes {
+        for (rater, target, s) in votes {
             // rater's standing without the target's own vote for the rater
             let back = contrib.get(&(*target, *rater)).copied().unwrap_or(0.0);
             let c = weight(squash(sum.get(rater).copied().unwrap_or(0.0) - back)) * s;
@@ -125,31 +140,51 @@ pub fn compute(ratings: &[Ev]) -> RepTable {
         rep = next;
         sum = next_sum;
         contrib = next_contrib;
-        if delta < 1e-4 {
+        if delta < 1e-5 {
             break;
         }
     }
+    rep
+}
 
+fn table(votes: &[(H32, H32, f64)], rep: HashMap<H32, f64>) -> RepTable {
     let mut t = RepTable::default();
-    for (_, target, _) in &votes {
+    for (_, target, _) in votes {
         *t.raters.entry(*target).or_insert(0) += 1;
     }
-    let mut ev: HashMap<H32, (f64, usize)> = HashMap::new();
-    for r in rs.iter().filter(|r| r.event.is_some()) {
-        let a = ev.entry(r.event.unwrap()).or_insert((0.0, 0));
-        a.0 += weight(rep.get(&r.rater).copied().unwrap_or(0.0)) * r.score;
-        a.1 += 1;
-    }
-    t.event = ev.into_iter().map(|(k, (n, c))| (k, (squash(n), c))).collect();
-    let mut rv: HashMap<H32, (f64, usize)> = HashMap::new();
-    for r in &rel {
-        let a = rv.entry(r.event.unwrap()).or_insert((0.0, 0));
-        a.0 += weight(rep.get(&r.rater).copied().unwrap_or(0.0)) * r.score;
-        a.1 += 1;
-    }
-    t.relevance = rv.into_iter().map(|(k, (n, c))| (k, (squash(n), c))).collect();
     t.user = rep;
     t
+}
+
+/// Community reputation, event trust scores and event relevance.
+pub fn compute(ratings: &[Ev]) -> RepTable {
+    let all: Vec<Rating> = ratings.iter().filter_map(|e| parse_rating(e)).collect();
+    let trust: Vec<&Rating> = all.iter().filter(|r| r.aspect == Aspect::Trust).collect();
+    let rel: Vec<&Rating> = all.iter().filter(|r| r.aspect == Aspect::Relevance).collect();
+    let v = votes(&trust);
+    let rep = fixed_point(&v);
+    let per_event = |rs: &[&Rating]| -> HashMap<H32, (f64, usize)> {
+        let mut m: HashMap<H32, (f64, usize)> = HashMap::new();
+        for r in rs.iter().filter(|r| r.event.is_some()) {
+            let a = m.entry(r.event.unwrap()).or_insert((0.0, 0));
+            a.0 += weight(rep.get(&r.rater).copied().unwrap_or(0.0)) * r.score;
+            a.1 += 1;
+        }
+        m.into_iter().map(|(k, (n, c))| (k, (squash(n), c))).collect()
+    };
+    let event = per_event(&trust);
+    let relevance = per_event(&rel);
+    RepTable { event, relevance, ..table(&v, rep) }
+}
+
+/// Humanity: is this participant a human? Network-wide, from `human` ratings,
+/// with the same weighting: participants others verified as human vouch with
+/// more weight, those judged to be bots with less.
+pub fn humanity(ratings: &[Ev]) -> RepTable {
+    let all: Vec<Rating> = ratings.iter().filter_map(|e| parse_rating(e)).filter(|r| r.aspect == Aspect::Human).collect();
+    let v = votes(&all.iter().collect::<Vec<_>>());
+    let rep = fixed_point(&v);
+    table(&v, rep)
 }
 
 /// Capability reputation: per (provider, capability id), from capability ratings
@@ -177,7 +212,7 @@ pub fn capability_scores(ratings: &[Ev], valid: impl Fn(&Rating) -> bool, weight
         o.0 += w * sum / n as f64;
         o.1 += 1;
     }
-    out.into_iter().map(|(k, (s, n))| (k, (10.0 * (s / 40.0).tanh(), n))).collect()
+    out.into_iter().map(|(k, (s, n))| (k, ((s / CAP_SCALE).tanh(), n))).collect()
 }
 
 #[cfg(test)]
@@ -185,7 +220,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    fn rate(k: &Keys, target: &H32, score: i32) -> Ev {
+    fn rate(k: &Keys, target: &H32, score: f64) -> Ev {
         Arc::new(k.sign(
             K_RATING,
             vec![
@@ -204,18 +239,18 @@ mod tests {
         let (expert, shady, alice, bob) = (Keys::generate(), Keys::generate(), Keys::generate(), Keys::generate());
         let mut rs = vec![];
         for e in &elders {
-            rs.push(rate(e, &expert.pubkey, 10)); // community trusts expert
+            rs.push(rate(e, &expert.pubkey, 1.0)); // community trusts expert
         }
         for e in &elders[..4] {
-            rs.push(rate(e, &shady.pubkey, -10)); // and distrusts shady
+            rs.push(rate(e, &shady.pubkey, -1.0)); // and distrusts shady
         }
-        rs.push(rate(&expert, &alice.pubkey, 2)); // modest praise from a trusted member
-        rs.push(rate(&shady, &bob.pubkey, 10)); // max praise from a distrusted one
+        rs.push(rate(&expert, &alice.pubkey, 0.2)); // modest praise from a trusted member
+        rs.push(rate(&shady, &bob.pubkey, 1.0)); // max praise from a distrusted one
         let t = compute(&rs);
-        assert!(t.user(&expert.pubkey) > 5.0);
+        assert!(t.user(&expert.pubkey) > 0.5);
         assert!(t.user(&alice.pubkey) > t.user(&bob.pubkey), "{} vs {}", t.user(&alice.pubkey), t.user(&bob.pubkey));
         assert_eq!(t.user(&elders[0].pubkey), 0.0);
-        assert!(t.user.values().all(|v| (-10.0..=10.0).contains(v)));
+        assert!(t.user.values().all(|v| (-1.0..=1.0).contains(v)));
     }
 
     #[test]
@@ -224,51 +259,61 @@ mod tests {
         let (troll, victim) = (Keys::generate(), Keys::generate());
         let mut rs = vec![];
         for h in &honest {
-            rs.push(rate(h, &troll.pubkey, -10));
+            rs.push(rate(h, &troll.pubkey, -1.0));
         }
-        rs.push(rate(&troll, &victim.pubkey, -10));
+        rs.push(rate(&troll, &victim.pubkey, -1.0));
         let t = compute(&rs);
-        assert!(t.user(&troll.pubkey) < -5.0);
-        assert!(t.user(&victim.pubkey) > -0.5, "troll's report should barely matter: {}", t.user(&victim.pubkey));
+        assert!(t.user(&troll.pubkey) < -0.5);
+        assert!(t.user(&victim.pubkey) > -0.05, "troll's report should barely matter: {}", t.user(&victim.pubkey));
     }
 
     #[test]
     fn mutual_admiration_does_not_snowball() {
         let (a, b) = (Keys::generate(), Keys::generate());
-        let t = compute(&[rate(&a, &b.pubkey, 10), rate(&b, &a.pubkey, 10)]);
-        let single = compute(&[rate(&a, &b.pubkey, 10)]);
+        let t = compute(&[rate(&a, &b.pubkey, 1.0), rate(&b, &a.pubkey, 1.0)]);
+        let single = compute(&[rate(&a, &b.pubkey, 1.0)]);
         assert!((t.user(&b.pubkey) - single.user(&b.pubkey)).abs() < 1e-6, "{}", t.user(&b.pubkey));
     }
 
     fn raw(k: &Keys, tags: &[(&str, String)]) -> Ev {
         Arc::new(k.sign(K_RATING, tags.iter().map(|(a, b)| vec![a.to_string(), b.clone()]).collect(), String::new()))
     }
-    fn rate_event(k: &Keys, target: &H32, ev: &H32, score: i32) -> Ev {
+    fn rate_event(k: &Keys, target: &H32, ev: &H32, score: f64) -> Ev {
         raw(k, &[("d", format!("c:{}:{}", target.hex(), ev.hex())), ("p", target.hex()), ("e", ev.hex()), ("score", score.to_string())])
     }
 
     #[test]
     fn weight_curve() {
-        assert_eq!(weight(10.0), 4.0);
+        assert_eq!(weight(1.0), 4.0);
         assert_eq!(weight(0.0), 1.0);
-        assert_eq!(weight(-10.0), 0.0);
-        assert!(weight(5.0) > weight(4.0));
+        assert_eq!(weight(-1.0), 0.0);
+        assert!(weight(0.5) > weight(0.4));
+    }
+
+    #[test]
+    fn worked_examples_from_the_docs() {
+        // docs/reputation: one vote at each weight
+        let one = |w: f64, s: f64| squash(w * s);
+        assert!((one(1.0, 1.0) - 0.124).abs() < 1e-3, "newcomer gives 1");
+        assert!((one(4.0, 0.2) - 0.0997).abs() < 1e-3, "trusted member gives 0.2");
+        assert!((one(0.25, 1.0) - 0.0312).abs() < 1e-3, "distrusted member gives 1");
+        assert!((squash(20.0) - 0.987).abs() < 1e-3, "20 newcomers give 1");
     }
 
     #[test]
     fn parse_rating_validation() {
         let (a, b) = (Keys::generate(), Keys::generate());
         let bp = b.pubkey.hex();
-        assert!(parse_rating(&raw(&a, &[("p", bp.clone()), ("score", "3".into())])).is_some());
-        assert!(parse_rating(&raw(&a, &[("p", a.pubkey.hex()), ("score", "3".into())])).is_none(), "self-rating");
+        assert!(parse_rating(&raw(&a, &[("p", bp.clone()), ("score", "0.3".into())])).is_some());
+        assert!(parse_rating(&raw(&a, &[("p", a.pubkey.hex()), ("score", "0.3".into())])).is_none(), "self-rating");
         assert!(parse_rating(&raw(&a, &[("p", bp.clone())])).is_none(), "no score");
         assert!(parse_rating(&raw(&a, &[("p", bp.clone()), ("score", "NaN".into())])).is_none());
         assert!(parse_rating(&raw(&a, &[("p", bp.clone()), ("score", "inf".into())])).is_none());
         assert!(parse_rating(&raw(&a, &[("p", "zz".into()), ("score", "1".into())])).is_none());
         assert!(parse_rating(&Arc::new(a.sign(K_POST, vec![vec!["p".into(), bp.clone()], vec!["score".into(), "1".into()]], String::new()))).is_none());
-        let r = parse_rating(&raw(&a, &[("p", bp.clone()), ("score", "99".into())])).unwrap();
-        assert_eq!(r.score, 10.0, "clamped");
-        assert_eq!(parse_rating(&raw(&a, &[("p", bp), ("score", "-2.5".into())])).unwrap().score, -2.5);
+        let r = parse_rating(&raw(&a, &[("p", bp.clone()), ("score", "9".into())])).unwrap();
+        assert_eq!(r.score, 1.0, "clamped");
+        assert_eq!(parse_rating(&raw(&a, &[("p", bp), ("score", "-0.25".into())])).unwrap().score, -0.25);
     }
 
     #[test]
@@ -284,8 +329,8 @@ mod tests {
         let (a, b) = (Keys::generate(), Keys::generate());
         let (e1, e2) = (H32([1; 32]), H32([2; 32]));
         // rating two of b's posts counts as one averaged vote on b
-        let twice = compute(&[rate_event(&a, &b.pubkey, &e1, 10), rate_event(&a, &b.pubkey, &e2, 0)]);
-        let once = compute(&[rate(&a, &b.pubkey, 5)]);
+        let twice = compute(&[rate_event(&a, &b.pubkey, &e1, 1.0), rate_event(&a, &b.pubkey, &e2, 0.0)]);
+        let once = compute(&[rate(&a, &b.pubkey, 0.5)]);
         assert!((twice.user(&b.pubkey) - once.user(&b.pubkey)).abs() < 1e-9);
         assert_eq!(twice.raters[&b.pubkey], 1);
         // but each post keeps its own score
@@ -299,16 +344,16 @@ mod tests {
         let target = Keys::generate();
         let mut prev = 0.0;
         for n in [1, 5, 20, 200] {
-            let rs: Vec<Ev> = (0..n).map(|_| rate(&Keys::generate(), &target.pubkey, 10)).collect();
+            let rs: Vec<Ev> = (0..n).map(|_| rate(&Keys::generate(), &target.pubkey, 1.0)).collect();
             let t = compute(&rs);
             let r = t.user(&target.pubkey);
-            assert!(r > prev && r <= 10.0, "{n} raters -> {r}");
+            assert!(r > prev && r <= 1.0, "{n} raters -> {r}");
             assert_eq!(t.raters[&target.pubkey], n);
             prev = r;
         }
-        assert!(prev > 9.9);
-        let rs: Vec<Ev> = (0..200).map(|_| rate(&Keys::generate(), &target.pubkey, -10)).collect();
-        assert!(compute(&rs).user(&target.pubkey) >= -10.0);
+        assert!(prev > 0.99);
+        let rs: Vec<Ev> = (0..200).map(|_| rate(&Keys::generate(), &target.pubkey, -1.0)).collect();
+        assert!(compute(&rs).user(&target.pubkey) >= -1.0);
     }
 
     #[test]
@@ -317,18 +362,21 @@ mod tests {
         let (trusted, distrusted, author) = (Keys::generate(), Keys::generate(), Keys::generate());
         let mut rs = vec![];
         for e in &elders {
-            rs.push(rate(e, &trusted.pubkey, 10));
-            rs.push(rate(e, &distrusted.pubkey, -10));
+            rs.push(rate(e, &trusted.pubkey, 1.0));
+            rs.push(rate(e, &distrusted.pubkey, -1.0));
         }
         let (good, bad) = (H32([7; 32]), H32([8; 32]));
-        rs.push(rate_event(&trusted, &author.pubkey, &good, 3));
-        rs.push(rate_event(&distrusted, &author.pubkey, &bad, 10));
+        rs.push(rate_event(&trusted, &author.pubkey, &good, 0.3));
+        rs.push(rate_event(&distrusted, &author.pubkey, &bad, 1.0));
         let t = compute(&rs);
         assert!(t.event(&good) > t.event(&bad), "{} vs {}", t.event(&good), t.event(&bad));
     }
 
-    fn aspect(k: &Keys, target: &H32, ev: &H32, score: i32, a: &str, cap: Option<&str>) -> Ev {
-        let mut t = vec![("d", format!("{a}:{}", ev.hex())), ("p", target.hex()), ("e", ev.hex()), ("score", score.to_string()), ("aspect", a.to_string())];
+    fn aspect(k: &Keys, target: &H32, ev: Option<&H32>, score: f64, a: &str, cap: Option<&str>) -> Ev {
+        let mut t = vec![("d", format!("{a}:{}", target.hex())), ("p", target.hex()), ("score", score.to_string()), ("aspect", a.to_string())];
+        if let Some(e) = ev {
+            t.push(("e", e.hex()));
+        }
         if let Some(c) = cap {
             t.push(("capability", c.to_string()));
         }
@@ -339,7 +387,7 @@ mod tests {
     fn relevance_scores_messages_not_people() {
         let (a, b) = (Keys::generate(), Keys::generate());
         let post = H32([9; 32]);
-        let t = compute(&[aspect(&a, &b.pubkey, &post, 8, "relevance", None)]);
+        let t = compute(&[aspect(&a, &b.pubkey, Some(&post), 0.8, "relevance", None)]);
         assert!(t.relevance(&post) > 0.0);
         assert_eq!(t.relevance[&post].1, 1);
         assert_eq!(t.user(&b.pubkey), 0.0, "relevance never moves the author's reputation");
@@ -348,10 +396,10 @@ mod tests {
         let elders: Vec<Keys> = (0..6).map(|_| Keys::generate()).collect();
         let (troll, good) = (Keys::generate(), Keys::generate());
         let (p1, p2) = (H32([1; 32]), H32([2; 32]));
-        let mut rs: Vec<Ev> = elders.iter().map(|e| rate(e, &troll.pubkey, -10)).collect();
-        rs.extend(elders.iter().map(|e| rate(e, &good.pubkey, 10)));
-        rs.push(aspect(&troll, &b.pubkey, &p1, 10, "relevance", None));
-        rs.push(aspect(&good, &b.pubkey, &p2, 3, "relevance", None));
+        let mut rs: Vec<Ev> = elders.iter().map(|e| rate(e, &troll.pubkey, -1.0)).collect();
+        rs.extend(elders.iter().map(|e| rate(e, &good.pubkey, 1.0)));
+        rs.push(aspect(&troll, &b.pubkey, Some(&p1), 1.0, "relevance", None));
+        rs.push(aspect(&good, &b.pubkey, Some(&p2), 0.3, "relevance", None));
         let t = compute(&rs);
         assert!(t.relevance(&p2) > t.relevance(&p1));
     }
@@ -360,10 +408,31 @@ mod tests {
     fn aspects_are_validated() {
         let (a, b) = (Keys::generate(), Keys::generate());
         let bp = b.pubkey.hex();
+        let ev = "ab".repeat(32);
         assert!(parse_rating(&raw(&a, &[("p", bp.clone()), ("score", "1".into()), ("aspect", "vibes".into())])).is_none(), "unknown aspect");
         assert!(parse_rating(&raw(&a, &[("p", bp.clone()), ("score", "1".into()), ("aspect", "relevance".into())])).is_none(), "relevance needs a message");
-        assert!(parse_rating(&raw(&a, &[("p", bp.clone()), ("score", "1".into()), ("aspect", "capability".into()), ("e", "ab".repeat(32))])).is_none(), "capability needs an id");
+        assert!(parse_rating(&raw(&a, &[("p", bp.clone()), ("score", "1".into()), ("aspect", "capability".into()), ("e", ev.clone())])).is_none(), "capability needs an id");
+        assert!(parse_rating(&raw(&a, &[("p", bp.clone()), ("score", "1".into()), ("aspect", "human".into()), ("e", ev)])).is_none(), "humanity rates a person, not a message");
+        assert_eq!(parse_rating(&raw(&a, &[("p", bp.clone()), ("score", "1".into()), ("aspect", "human".into())])).unwrap().aspect, Aspect::Human);
         assert_eq!(parse_rating(&raw(&a, &[("p", bp), ("score", "1".into())])).unwrap().aspect, Aspect::Trust);
+    }
+
+    #[test]
+    fn humanity_is_vouched_and_kept_apart() {
+        let verified: Vec<Keys> = (0..6).map(|_| Keys::generate()).collect();
+        let (anchor, person, bot, bot_friend) = (Keys::generate(), Keys::generate(), Keys::generate(), Keys::generate());
+        let h = |k: &Keys, t: &Keys, s: f64| aspect(k, &t.pubkey, None, s, "human", None);
+        let mut rs: Vec<Ev> = verified.iter().map(|k| h(k, &anchor, 1.0)).collect(); // a well-known human
+        rs.extend(verified.iter().take(4).map(|k| h(k, &bot, -1.0))); // judged a bot
+        rs.push(h(&anchor, &person, 0.6)); // vouched for by a verified human
+        rs.push(h(&bot, &bot_friend, 1.0)); // vouched for by a judged bot
+        let t = humanity(&rs);
+        assert!(t.user(&anchor.pubkey) > 0.5);
+        assert!(t.user(&bot.pubkey) < -0.3);
+        assert!(t.user(&person.pubkey) > t.user(&bot_friend.pubkey), "a bot's vouch is worth little");
+        assert_eq!(t.raters[&anchor.pubkey], 6);
+        assert!(compute(&rs).user.is_empty(), "humanity is not community reputation");
+        assert!(humanity(&[rate(&anchor, &person.pubkey, 1.0)]).user.is_empty(), "trust ratings are not humanity");
     }
 
     #[test]
@@ -371,17 +440,17 @@ mod tests {
         let (provider, alice, bob, mallory) = (Keys::generate(), Keys::generate(), Keys::generate(), Keys::generate());
         let res = H32([5; 32]);
         let rs = vec![
-            aspect(&alice, &provider.pubkey, &res, 9, "capability", Some("ms")),
-            aspect(&alice, &provider.pubkey, &res, 7, "capability", Some("ms")), // same rater: averaged
-            aspect(&bob, &provider.pubkey, &res, 6, "capability", Some("ms")),
-            aspect(&mallory, &provider.pubkey, &res, -10, "capability", Some("ms")), // never got a result
-            aspect(&bob, &provider.pubkey, &res, 4, "capability", Some("other")),
-            rate(&alice, &provider.pubkey, 10), // trust ratings are not capability ratings
+            aspect(&alice, &provider.pubkey, Some(&res), 0.9, "capability", Some("ms")),
+            aspect(&alice, &provider.pubkey, Some(&res), 0.7, "capability", Some("ms")), // same rater: averaged
+            aspect(&bob, &provider.pubkey, Some(&res), 0.6, "capability", Some("ms")),
+            aspect(&mallory, &provider.pubkey, Some(&res), -1.0, "capability", Some("ms")), // never got a result
+            aspect(&bob, &provider.pubkey, Some(&res), 0.4, "capability", Some("other")),
+            rate(&alice, &provider.pubkey, 1.0), // trust ratings are not capability ratings
         ];
         let t = capability_scores(&rs, |r| r.rater != mallory.pubkey, |_| 1.0);
         let (s, n) = t[&(provider.pubkey, "ms".to_string())];
         assert_eq!(n, 2);
-        assert!((s - 10.0 * (14.0f64 / 40.0).tanh()).abs() < 1e-9, "{s}");
+        assert!((s - (1.4f64 / CAP_SCALE).tanh()).abs() < 1e-9, "{s}");
         assert_eq!(t[&(provider.pubkey, "other".to_string())].1, 1);
         let heavy = capability_scores(&rs, |r| r.rater != mallory.pubkey, |r| if r.rater == bob.pubkey { 4.0 } else { 1.0 });
         assert!(heavy[&(provider.pubkey, "ms".to_string())].0 > s);
@@ -396,7 +465,7 @@ mod tests {
         for (i, a) in ks.iter().enumerate() {
             for (j, b) in ks.iter().enumerate() {
                 if i != j {
-                    rs.push(rate(a, &b.pubkey, (i as i32 * 3 - j as i32 * 2) % 11));
+                    rs.push(rate(a, &b.pubkey, ((i as i32 * 3 - j as i32 * 2) % 11) as f64 / 10.0));
                 }
             }
         }
@@ -404,7 +473,7 @@ mod tests {
         rs.reverse();
         let t2 = compute(&rs);
         for k in &ks {
-            assert!((t1.user(&k.pubkey) - t2.user(&k.pubkey)).abs() < 1e-3);
+            assert!((t1.user(&k.pubkey) - t2.user(&k.pubkey)).abs() < 1e-4);
         }
     }
 }

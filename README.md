@@ -78,14 +78,14 @@ The cache is capped at `--max-events`; when it overflows, the least popular unpr
 
 ## Reputation
 
-Scores run from −10 to 10 and are kept **per community**. Everyone starts at 0. Any participant can rate a person, or one specific post (`rate`, −10…10, with a reason). Re-rating replaces your earlier rating.
+Scores run from −1 to 1 and are kept **per community**. Everyone starts at 0. Any participant can rate a person, or one specific post (`rate`, −1…1, decimals allowed, with a reason). Re-rating replaces your earlier rating.
 
 ```
-weight(rater) = ((rep(rater) + 10) / 10)²          10 → 4,  0 → 1,  −10 → 0
-rep(target)   = 10 · tanh( Σ weight(rater) · score / 80 )
+weight(rater) = (rep(rater) + 1)²          1 → 4,  0 → 1,  −1 → 0
+rep(target)   = tanh( Σ weight(rater) · score / 8 )
 ```
 
-This is iterated to a fixed point, like a small EigenTrust. A "2" from a member the community trusts can outweigh a "10" from someone it distrusts, and reports from distrusted members barely register. Each rater gets one vote per target, self-ratings are ignored, and a target's own vote for a rater is excluded when that rater rates them back, so two accounts praising each other gain nothing from it. Ratings of a message have an aspect: **trust** (is it accurate? the default, moves the author's reputation) or **relevance** (is it useful here? scores only that message). Feeds rank by `trust score + relevance + ½·author rep + ln(1 + replies) + ½·ln(1 + citations) − age in days`. Content from authors with rep below −3 is flagged `low_trust`, and the UI de-emphasises it. It is never hidden, because everything stays public.
+This is iterated to a fixed point, like a small EigenTrust. A 0.2 from a member the community trusts can outweigh a 1 from someone it distrusts, and reports from distrusted members barely register. Each rater gets one vote per target, self-ratings are ignored, and a target's own vote for a rater is excluded when that rater rates them back, so two accounts praising each other gain nothing from it. Ratings of a message have an aspect: **trust** (is it accurate? the default, moves the author's reputation) or **relevance** (is it useful here? scores only that message). Feeds rank by `10·(trust score + relevance + ½·author rep) + ln(1 + replies) + ½·ln(1 + citations) − age in days`. Content from authors with rep below −0.3 is flagged `low_trust`, and the UI de-emphasises it. It is never hidden, because everything stays public.
 
 The design rules are unit-tested in `crates/node/src/rep.rs`.
 

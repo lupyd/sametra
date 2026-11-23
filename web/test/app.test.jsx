@@ -113,7 +113,7 @@ describe('shell', () => {
 describe('feed', () => {
   it('lists threads with metadata and sorts on request', async () => {
     await mount('/c/math', {
-      feed: (r) => ({ items: r.sort === 'new' ? [item({ title: 'Newest' })] : [item({ author_is_agent: true, author_rep: 4.5, ratings: 2, score: -4, refs: ['c'.repeat(64)], reply_count: 2 })] }),
+      feed: (r) => ({ items: r.sort === 'new' ? [item({ title: 'Newest' })] : [item({ author_is_agent: true, author_rep: 0.45, ratings: 2, score: -0.4, refs: ['c'.repeat(64)], reply_count: 2 })] }),
     });
     expect(sent('feed')[0]).toEqual({ community: 'math', sort: 'top', limit: 100 });
     expect($('main h2').textContent).toBe('Mathematics');
@@ -122,7 +122,7 @@ describe('feed', () => {
     expect(card.querySelector('a.title').getAttribute('href')).toBe('/t/' + ROOT);
     expect(card.textContent).toContain('2 replies');
     const tags = [...card.querySelectorAll('.tag')].map((t) => t.textContent);
-    expect(tags).toEqual(expect.arrayContaining(['rep 4.5', 'score -4', 'agent']));
+    expect(tags).toEqual(expect.arrayContaining(['rep 0.45', 'score -0.4', 'agent']));
     expect(card.querySelector('.meta a[href^="/t/cccc"]').textContent).toBe('cccccccc');
     const sel = $('select');
     sel.value = 'new';
@@ -133,10 +133,10 @@ describe('feed', () => {
   });
 
   it('de-emphasises low-trust content without hiding it', async () => {
-    await mount('/c/math', { feed: () => ({ items: [item({ low_trust: true, author_rep: -6 })] }) });
+    await mount('/c/math', { feed: () => ({ items: [item({ low_trust: true, author_rep: -0.6 })] }) });
     expect($('article').className).toContain('low');
     expect($('article').textContent).toContain('Body text');
-    expect($$('.tag.bad').map((t) => t.textContent)).toEqual(['rep -6', 'low trust']);
+    expect($$('.tag.bad').map((t) => t.textContent)).toEqual(['rep -0.6', 'low trust']);
   });
 
   it('shows an empty state and a join button for unjoined communities', async () => {
@@ -216,16 +216,16 @@ describe('thread', () => {
   });
 
   it('rates with the slider', async () => {
-    await mount('/t/' + ROOT, { thread: () => thread(), rate: () => ({ ok: true, rep: -1.25 }) });
+    await mount('/t/' + ROOT, { thread: () => thread(), rate: () => ({ ok: true, rep: -0.12 }) });
     await click(button('rate', $('#e' + R1 + ' > .acts')));
     const slider = $('input[type=range]');
-    expect([slider.min, slider.max]).toEqual(['-10', '10']);
-    await type(slider, '-4');
-    expect($('.box b').textContent).toBe('-4');
+    expect([slider.min, slider.max, slider.step]).toEqual(['-1', '1', '0.1']);
+    await type(slider, '-0.4');
+    expect($('.box b').textContent).toBe('-0.4');
     await type(byPlaceholder('reason'), 'not replicated');
     await click(button('Rate'));
-    expect(sent('rate')).toEqual([{ score: -4, event: R1, target: '', community: '', reason: 'not replicated', aspect: 'trust', capability: '' }]);
-    expect(toast.value).toContain('-1.25');
+    expect(sent('rate')).toEqual([{ score: -0.4, event: R1, target: '', community: '', reason: 'not replicated', aspect: 'trust', capability: '' }]);
+    expect(toast.value).toContain('-0.12');
   });
 
   it('cites, pins and deletes', async () => {
@@ -253,10 +253,10 @@ describe('thread', () => {
 
 describe('other views', () => {
   it('reputation table', async () => {
-    await mount('/c/math/reputation', { reputation: () => ({ entries: [{ pubkey: 'p1', name: 'Good', rep: 7.5, raters: 4 }, { pubkey: 'p2', name: 'Troll', rep: -8, raters: 6 }] }) });
+    await mount('/c/math/reputation', { reputation: () => ({ entries: [{ pubkey: 'p1', name: 'Good', rep: 0.75, raters: 4 }, { pubkey: 'p2', name: 'Troll', rep: -0.8, raters: 6 }] }) });
     expect(sent('reputation')[0]).toEqual({ community: 'math', pubkey: '' });
     const rows = $$('table.rep tbody tr').map((r) => [...r.children].map((c) => c.textContent));
-    expect(rows).toEqual([['Good', '7.5', '4'], ['Troll', '-8', '6']]);
+    expect(rows).toEqual([['Good', '0.75', '4'], ['Troll', '-0.8', '6']]);
     expect($$('td.neg').length).toBe(1);
     expect($('main a[href="/docs/reputation"]')).not.toBeNull();
   });
@@ -306,20 +306,20 @@ describe('other views', () => {
 
 describe('relevance, needs and search scopes', () => {
   it('rates relevance separately from accuracy', async () => {
-    await mount('/t/' + ROOT, { thread: () => ({ root: item({ relevance: 2.5, relevance_ratings: 3, cited_by: 4 }), quoted_by: [], ref_events: [], thread_root: '' }), rate: () => ({ ok: true, rep: 3.1 }) });
+    await mount('/t/' + ROOT, { thread: () => ({ root: item({ relevance: 0.25, relevance_ratings: 3, cited_by: 4 }), quoted_by: [], ref_events: [], thread_root: '' }), rate: () => ({ ok: true, rep: 0.31 }) });
     const tags = $$('.tag').map((t) => t.textContent);
-    expect(tags).toEqual(expect.arrayContaining(['relevance 2.5', 'cited 4']));
+    expect(tags).toEqual(expect.arrayContaining(['relevance 0.25', 'cited 4']));
     await click(button('rate'));
     await click(button('relevance'));
     expect(byPlaceholder('reason').getAttribute('placeholder')).toContain('off-topic');
-    await type($('input[type=range]'), '6');
+    await type($('input[type=range]'), '0.6');
     await click(button('Rate'));
-    expect(sent('rate')[0]).toMatchObject({ event: ROOT, score: 6, aspect: 'relevance' });
-    expect(toast.value).toContain('This message now 3.1');
+    expect(sent('rate')[0]).toMatchObject({ event: ROOT, score: 0.6, aspect: 'relevance' });
+    expect(toast.value).toContain('This message now 0.31');
   });
 
   it('posts needs and suggests who can help', async () => {
-    const helper = { provider: 'h'.repeat(64), provider_name: 'Lab agent', provider_is_agent: true, rep: 6.2, ratings: 3, requests: 4, completed: 3, declined: 0, spec: { id: 'assay', name: 'Plasma assay', kind: 'tool', about: '', input_schema: '{"type":"object"}', topics: [], communities: [] } };
+    const helper = { provider: 'h'.repeat(64), provider_name: 'Lab agent', provider_is_agent: true, rep: 0.62, ratings: 3, requests: 4, completed: 3, declined: 0, spec: { id: 'assay', name: 'Plasma assay', kind: 'tool', about: '', input_schema: '{"type":"object"}', topics: [], communities: [] } };
     await mount('/c/math', {
       post: () => ({ ok: true, id: 'f'.repeat(64) }),
       thread: () => ({ root: item({ id: 'f'.repeat(64), needs: ['plasma assay'] }), quoted_by: [], ref_events: [], thread_root: '' }),
@@ -339,7 +339,7 @@ describe('relevance, needs and search scopes', () => {
     expect(sent('capabilities').at(-1)).toMatchObject({ query: 'plasma assay', limit: 5 });
     const card = $('.card.cap');
     expect(card.textContent).toContain('Plasma assay');
-    expect(card.textContent).toContain('delivers 6.2');
+    expect(card.textContent).toContain('delivers 0.62');
     await click(button('request', card));
     expect($('pre.schema').textContent).toBe('{"type":"object"}');
     await type(byPlaceholder('JSON input'), '{"sample":"S1"}');
@@ -410,13 +410,13 @@ describe('capabilities', () => {
   });
 
   it('requesters rate delivered results', async () => {
-    await mount('/inbox', { inbox: () => ({ jobs: [job({ mine: true, status: 'done', result: '42 ng/ml', result_id: 'x'.repeat(64) })] }), rate: () => ({ ok: true, rep: 7.4 }) });
+    await mount('/inbox', { inbox: () => ({ jobs: [job({ mine: true, status: 'done', result: '42 ng/ml', result_id: 'x'.repeat(64) })] }), rate: () => ({ ok: true, rep: 0.74 }) });
     expect($('.result').textContent).toBe('42 ng/ml');
     expect(button('Accept')).toBeUndefined();
-    await type($('.job input[type=range]'), '8');
+    await type($('.job input[type=range]'), '0.8');
     await click(button('Rate'));
-    expect(sent('rate')[0]).toMatchObject({ event: 'x'.repeat(64), score: 8, aspect: 'capability' });
-    expect(toast.value).toContain('assay now 7.4');
+    expect(sent('rate')[0]).toMatchObject({ event: 'x'.repeat(64), score: 0.8, aspect: 'capability' });
+    expect(toast.value).toContain('assay now 0.74');
   });
 
   it('offers and withdraws capabilities from your profile', async () => {

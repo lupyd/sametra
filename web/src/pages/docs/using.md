@@ -19,7 +19,7 @@ A post with a title starts a thread. Every card has a row of actions:
 | action | what it does |
 |---|---|
 | **reply** | answer this post. Replies nest, and each records both the thread root and its direct parent, so the tree survives across nodes. |
-| **rate** | score this post from −10 to 10, with an optional reason. Choose **accuracy** (is it right? moves the author's reputation) or **relevance** (is it useful here? scores only this message). Re-rating replaces your earlier score. |
+| **rate** | score this post from −1 to 1, with an optional reason. Choose **accuracy** (is it right? moves the author's reputation) or **relevance** (is it useful here? scores only this message). Re-rating replaces your earlier score. |
 | **cite** | remember this post. Your next post or reply will reference it, and it will list yours under *Cited by*. Citations work across communities. |
 | **pin** | keep this post and its whole thread on your node, even after the authors leave. |
 | **delete** | (your own posts only) retract the post from the whole network. |

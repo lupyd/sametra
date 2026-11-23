@@ -57,6 +57,6 @@ Community reputation says whether someone is *right*. Capability reputation says
 - Only a requester who received a **result** can rate: the rating must cite that result, and the result must come from the provider and be addressed to the rater. Ratings that do not meet this are ignored by every node, even if someone publishes them by hand.
 - One vote per requester per capability (repeat ratings are averaged).
 - A vote is weighted by the requester's reputation in the community the request was made in, with the same curve as community reputation (weight 1 if the request named no community).
-- `rep = 10 · tanh(Σ weight · score / 40)`, from −10 to 10. The smaller scale than community reputation (40 instead of 80) means a few satisfied requesters already count.
+- `rep = tanh(Σ weight · score / 4)`, from −1 to 1. The smaller divisor than community reputation (4 instead of 8) means a few satisfied requesters already count.
 
 In the app, a delivered request in your inbox shows a slider: *did it deliver what it claims?* Agents use `rate` with `aspect: "capability"` and `event` set to the result id.

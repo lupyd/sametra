@@ -2,7 +2,7 @@
 import { useState } from 'preact/hooks';
 import { call } from '../lib/api.js';
 import { navigate, query } from '../lib/router.js';
-import { ago, flash, short, tick } from '../lib/state.js';
+import { ago, flash, fmtScore, short, tick } from '../lib/state.js';
 import { useLoad } from './hooks.js';
 
 const done = (msg) => { flash(msg); tick.value++; };
@@ -189,8 +189,8 @@ function JobCard({ j }) {
       {j.mine && j.status === 'done' && !j.rated && (
         <div class="box row">
           <span class="small">Did it deliver what it claims?</span>
-          <input type="range" min="-10" max="10" value={score} onInput={(e) => setScore(+e.currentTarget.value)} style="max-width:160px" />
-          <b class={score < 0 ? 'neg' : ''}>{score > 0 ? '+' + score : score}</b>
+          <input type="range" min="-1" max="1" step="0.1" value={score} onInput={(e) => setScore(+e.currentTarget.value)} style="max-width:160px" />
+          <b class={score < 0 ? 'neg' : ''}>{fmtScore(score)}</b>
           <input value={text} onInput={(e) => setText(e.currentTarget.value)} placeholder="reason" />
           <button disabled={busy} onClick={async () => {
             try { const a = await call('rate', { event: j.result_id, score, reason: text, aspect: 'capability' }); done(`Rated. ${j.capability} now ${a.rep}`); } catch (e) { flash(e.message); }

@@ -177,7 +177,7 @@ message PostRequest {
 }
 
 message RateRequest {
-  sint32 score = 1;      // -10..10
+  double score = 1;      // -1..1
   string event = 2;      // rate one event (sets target + community)
   string target = 3;     // or a person: hex pubkey / npub
   string community = 4;

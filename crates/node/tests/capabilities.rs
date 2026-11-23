@@ -139,7 +139,7 @@ async fn request_accept_deliver_and_rate() {
     assert!(!d.rated);
 
     // only the asker, who received the result, may rate the capability
-    let rate = |event: &str| pb::RateRequest { score: 8, event: event.into(), aspect: "capability".into(), reason: "accurate and fast".into(), ..Default::default() };
+    let rate = |event: &str| pb::RateRequest { score: 0.8, event: event.into(), aspect: "capability".into(), reason: "accurate and fast".into(), ..Default::default() };
     assert!(mallory.err("rate", &rate(&d.result_id)).await.1.contains("delivered a result to you"));
     assert!(asker.err("rate", &rate(&post.id)).await.1.contains("capability result"));
     let a: pb::Ack = asker.ok("rate", &rate(&d.result_id)).await;
@@ -154,7 +154,7 @@ async fn request_accept_deliver_and_rate() {
             vec!["d".into(), format!("cap:{}:assay", cap.provider)],
             vec!["p".into(), cap.provider.clone()],
             vec!["e".into(), d.result_id.clone()],
-            vec!["score".into(), "-10".into()],
+            vec!["score".into(), "-1".into()],
             vec!["aspect".into(), "capability".into()],
             vec!["capability".into(), "assay".into()],
         ],

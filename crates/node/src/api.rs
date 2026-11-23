@@ -96,7 +96,7 @@ fn view(st: &Store, rep: &RepTable, e: &Event, full: bool, me: &H32) -> Item {
         author_rep: round2(author_rep),
         score: round2(score),
         ratings: rep.event.get(&e.id).map(|x| x.1 as u32).unwrap_or(0),
-        low_trust: author_rep < -3.0 || score < -3.0,
+        low_trust: author_rep < LOW_TRUST || score < LOW_TRUST,
         community: e.community().unwrap_or("").into(),
         title: e.tag("title").unwrap_or("").into(),
         content,
@@ -116,11 +116,25 @@ fn view(st: &Store, rep: &RepTable, e: &Event, full: bool, me: &H32) -> Item {
     }
 }
 
-/// Feed and reply order: trust and relevance of the message, author standing,
-/// discussion and citations, minus a point per day of age.
+/// Below this (author reputation or message score) content is flagged low trust.
+pub const LOW_TRUST: f64 = -0.3;
+
+/// Feed and reply order: trust and relevance of the message, author standing
+/// (each worth up to 10 points at full strength), discussion and citations,
+/// minus a point per day of age.
 fn rank(rep: &RepTable, e: &Event, replies: usize, cites: usize) -> f64 {
     let age_h = now().saturating_sub(e.created_at) as f64 / 3600.0;
-    rep.event(&e.id) + rep.relevance(&e.id) + 0.5 * rep.user(&e.pubkey) + (1.0 + replies as f64).ln() + 0.5 * (1.0 + cites as f64).ln() - age_h / 24.0
+    10.0 * (rep.event(&e.id) + rep.relevance(&e.id) + 0.5 * rep.user(&e.pubkey)) + (1.0 + replies as f64).ln() + 0.5 * (1.0 + cites as f64).ln() - age_h / 24.0
+}
+
+/// A score as it goes into a `score` tag: at most three decimals, no trailing zeros.
+fn score_tag(s: f64) -> String {
+    let t = format!("{s:.3}");
+    let t = t.trim_end_matches('0').trim_end_matches('.');
+    if t == "-0" { "0".into() } else { t.to_string() }
+}
+fn check_score(s: f64) -> R<()> {
+    if s.is_finite() && (-1.0..=1.0).contains(&s) { Ok(()) } else { Err("score must be in -1..1".into()) }
 }
 
 fn tree(st: &Store, rep: &RepTable, e: &Ev, depth: usize, budget: &mut usize, me: &H32) -> Item {
@@ -370,7 +384,7 @@ async fn search(node: &Arc<Node>, r: SearchRequest) -> R<Items> {
         .map(|(e, m)| {
             let rep = &reps[e.community().unwrap_or("")];
             let mut v = view(&st, rep, e, false, &node.keys.pubkey);
-            let quality = (0.1 * v.relevance + 0.1 * v.score + 0.05 * v.author_rep + 0.3 * (1.0 + v.cited_by as f64).ln() + 0.2 * (1.0 + v.popularity).ln()).max(0.0);
+            let quality = (v.relevance + v.score + 0.5 * v.author_rep + 0.3 * (1.0 + v.cited_by as f64).ln() + 0.2 * (1.0 + v.popularity).ln()).max(0.0);
             let score = m * (1.0 + quality) * if v.low_trust { 0.5 } else { 1.0 };
             v.text_match = round2(*m);
             (score, v)
@@ -423,9 +437,7 @@ async fn post(node: &Arc<Node>, r: PostRequest) -> R<Ack> {
 /// author's reputation) or "relevance" (how useful this message is here; scores
 /// only the message).
 async fn rate(node: &Arc<Node>, r: RateRequest) -> R<Ack> {
-    if !(-10..=10).contains(&r.score) {
-        return Err("score must be in -10..10".into());
-    }
+    check_score(r.score)?;
     let aspect = match r.aspect.trim() {
         "" | "trust" => "trust",
         "relevance" => "relevance",
@@ -450,7 +462,7 @@ async fn rate(node: &Arc<Node>, r: RateRequest) -> R<Ack> {
     let c = slug(&comm)?;
     // trust keeps the original slot layout; relevance gets its own slot per message
     let mut d = format!("{c}:{}:{}", target.hex(), ev.map(|e| e.hex()).unwrap_or_default());
-    let mut tags = vec![t("c", &c), t("p", target.hex()), t("score", r.score.to_string())];
+    let mut tags = vec![t("c", &c), t("p", target.hex()), t("score", score_tag(r.score))];
     if aspect == "relevance" {
         d.push_str(":relevance");
         tags.push(t("aspect", "relevance"));
@@ -810,7 +822,7 @@ async fn capabilities(node: &Arc<Node>, r: CapabilitiesRequest) -> R<Capabilitie
         let (rep, raters) = scores.get(&key).copied().unwrap_or((0.0, 0));
         let s = stats.get(&key).copied().unwrap_or_default();
         let profile = profile_of(&st, &e.pubkey);
-        let quality = 1.0 + rep.max(-9.0) / 10.0 + (1.0 + s.completed as f64).ln() / 4.0;
+        let quality = 1.0 + rep.max(-0.9) + (1.0 + s.completed as f64).ln() / 4.0;
         let rank = if q.is_empty() { quality } else { m * quality };
         out.push((
             rank,
@@ -975,6 +987,7 @@ async fn respond(node: &Arc<Node>, r: RespondRequest) -> R<Ack> {
 
 /// Rate a capability after receiving its result: does it deliver what it claims?
 async fn rate_capability(node: &Arc<Node>, r: RateRequest) -> R<Ack> {
+    check_score(r.score)?;
     let rid = hex_id(opt_slug(&r.event).ok_or("a capability rating cites the result you received: give 'event'")?, "event")?;
     let res = get_or_fetch(node, &rid).await.ok_or("result not found")?;
     if res.kind != K_JOB_RESULT {
@@ -989,7 +1002,7 @@ async fn rate_capability(node: &Arc<Node>, r: RateRequest) -> R<Ack> {
         t("d", format!("cap:{}:{cap}", provider.hex())),
         t("p", provider.hex()),
         t("e", rid.hex()),
-        t("score", r.score.to_string()),
+        t("score", score_tag(r.score)),
         t("aspect", "capability"),
         t("capability", &cap),
     ];
@@ -1068,12 +1081,12 @@ mod tests {
         assert!(!short.mine && !short.low_trust && short.parent.is_empty());
         assert!(short.author_name.starts_with("npub1"), "falls back to a short npub");
         let mut rep = RepTable::default();
-        rep.user.insert(k.pubkey, -4.0);
+        rep.user.insert(k.pubkey, -0.4);
         assert!(view(&st, &rep, &e, false, &n.keys.pubkey).low_trust);
         let mut rep = RepTable::default();
-        rep.event.insert(e.id, (-5.0, 3));
+        rep.event.insert(e.id, (-0.5, 3));
         let v = view(&st, &rep, &e, false, &n.keys.pubkey);
-        assert!(v.low_trust && v.ratings == 3 && v.score == -5.0);
+        assert!(v.low_trust && v.ratings == 3 && v.score == -0.5);
     }
 
     #[test]
@@ -1085,12 +1098,23 @@ mod tests {
         assert!(rank(&rep, &fresh, 0, 0) > rank(&rep, &old, 0, 0));
         assert!(rank(&rep, &fresh, 10, 0) > rank(&rep, &fresh, 0, 0));
         let mut good = RepTable::default();
-        good.user.insert(k.pubkey, 8.0);
+        good.user.insert(k.pubkey, 0.8);
         assert!(rank(&good, &fresh, 0, 0) > rank(&rep, &fresh, 0, 0));
         assert!(rank(&rep, &fresh, 0, 5) > rank(&rep, &fresh, 0, 0), "citations lift");
         let mut relevant = RepTable::default();
-        relevant.relevance.insert(fresh.id, (4.0, 2));
+        relevant.relevance.insert(fresh.id, (0.4, 2));
         assert!(rank(&relevant, &fresh, 0, 0) > rank(&rep, &fresh, 0, 0), "relevance lifts");
+    }
+
+    #[test]
+    fn scores_are_tagged_compactly_and_bounded() {
+        assert_eq!(score_tag(0.5), "0.5");
+        assert_eq!(score_tag(-1.0), "-1");
+        assert_eq!(score_tag(0.0), "0");
+        assert_eq!(score_tag(-0.0001), "0");
+        assert_eq!(score_tag(1.0 / 3.0), "0.333");
+        assert!(check_score(1.0).is_ok() && check_score(-1.0).is_ok());
+        assert!(check_score(1.01).is_err() && check_score(f64::NAN).is_err() && check_score(f64::INFINITY).is_err());
     }
 
     #[test]

@@ -24,6 +24,12 @@ describe('formatting', () => {
     expect(S.ago(now - 86400 * 3)).toBe('3d');
   });
   it('short', () => expect(S.short('abcdef0123456789')).toBe('abcdef01'));
+  it('fmtScore', () => {
+    expect(S.fmtScore(0.6)).toBe('+0.6');
+    expect(S.fmtScore(-0.26)).toBe('-0.3');
+    expect(S.fmtScore(0)).toBe('0.0');
+    expect(S.fmtScore(1)).toBe('+1.0');
+  });
 });
 
 describe('flash', () => {

@@ -59,7 +59,7 @@ async fn deletes_ratings_and_profiles_propagate() {
     let good: pb::Ack = a.ok("post", &post("m", "good", "work")).await;
     assert!(eventually(T, || b.has(&good.id)).await);
     b.ok::<_, pb::Ack>("set_profile", &pb::Profile { name: "Bee".into(), ..Default::default() }).await;
-    b.ok::<_, pb::Ack>("rate", &pb::RateRequest { score: 7, event: good.id.clone(), ..Default::default() }).await;
+    b.ok::<_, pb::Ack>("rate", &pb::RateRequest { score: 0.7, event: good.id.clone(), ..Default::default() }).await;
     let ka = a.node.keys.pubkey.hex();
     let rep_on = |n: &TestNode| n.node.reputation("m").user(&H32::from_hex(&ka).unwrap());
     assert!(eventually(T, || rep_on(&a) > 0.0).await, "rating reached the author's node");

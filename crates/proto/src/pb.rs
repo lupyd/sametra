@@ -140,10 +140,10 @@ mod tests {
         let r: PostRequest = serde_json::from_value(serde_json::json!({"content": "hi"})).unwrap();
         assert_eq!(r.content, "hi");
         assert!(r.community.is_empty() && r.refs.is_empty());
-        let r: RateRequest = serde_json::from_value(serde_json::json!({"score": -3})).unwrap();
-        assert_eq!(r.score, -3);
+        let r: RateRequest = serde_json::from_value(serde_json::json!({"score": -0.3})).unwrap();
+        assert_eq!(r.score, -0.3);
         let back = serde_json::to_value(&r).unwrap();
-        assert_eq!(back["score"], -3);
+        assert_eq!(back["score"], -0.3);
         assert!(serde_json::from_value::<RateRequest>(serde_json::json!({"score": "x"})).is_err());
     }
 }
@@ -155,7 +155,7 @@ mod golden {
 
     pub fn vectors() -> Vec<(&'static str, Vec<u8>)> {
         vec![
-            ("RateRequest", encode(&RateRequest { score: -3, event: "ab".into(), reason: "é".into(), ..Default::default() })),
+            ("RateRequest", encode(&RateRequest { score: -0.3, event: "ab".into(), reason: "é".into(), ..Default::default() })),
             ("FetchRequest", encode(&FetchRequest {
                 filter: Some(Filter { kinds: vec![11, 1111], tags: vec![TagFilter { name: "c".into(), values: vec!["m".into()] }], since: 1700000000, limit: 5, ..Default::default() }),
             })),
@@ -167,7 +167,7 @@ mod golden {
     #[test]
     fn print_and_check_golden_vectors() {
         let want = [
-            ("RateRequest", "080512026162 2a02c3a9"),
+            ("RateRequest", "09333333333333d3bf120261622a02c3a9"),
             ("FetchRequest", "0a151a030bd70822060a016312016d2880e2cfaa063805"),
             ("Ack", "0801120178180321000000000000f8bf2a016d"),
             ("IdRequest", "0a01691001"),

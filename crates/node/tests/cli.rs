@@ -206,10 +206,10 @@ fn mcp_stdio_server() {
     send(tool(8, "memory_get", json!({})));
     assert_eq!(text(&recv())["entries"][0]["value"], "follow up");
     // tool errors are results with isError, not JSON-RPC errors
-    send(tool(9, "rate", json!({"score": 50, "target": "x"})));
+    send(tool(9, "rate", json!({"score": 5, "target": "x"})));
     let e = recv();
     assert_eq!(e["result"]["isError"], true);
-    assert!(e["result"]["content"][0]["text"].as_str().unwrap().contains("-10..10"));
+    assert!(e["result"]["content"][0]["text"].as_str().unwrap().contains("-1..1"));
     send(tool(10, "nope", json!({})));
     assert_eq!(recv()["result"]["isError"], true);
     // unknown methods are JSON-RPC errors

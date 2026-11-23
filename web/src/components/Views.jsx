@@ -143,7 +143,7 @@ export function Reputation({ slug }) {
             ))}</tbody>
           </table>
         )}
-        <p class="muted small">Everyone starts at 0 on a −10…10 scale. Ratings are weighted by the rater's own reputation in this community, so trusted members' judgement carries further, and distrusted members' reports barely count. <a class="ul" href="/docs/reputation">How reputation works</a></p>
+        <p class="muted small">Everyone starts at 0 on a −1…1 scale. Ratings are weighted by the rater's own reputation in this community, so trusted members' judgement carries further, and distrusted members' reports barely count. <a class="ul" href="/docs/reputation">How reputation works</a></p>
       </div>
     </>
   );

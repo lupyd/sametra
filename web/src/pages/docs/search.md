@@ -34,11 +34,11 @@ Text match decides *what* is found; quality decides the order:
 
 ```
 score = text match × (1 + quality)
-quality = 0.1·relevance + 0.1·trust score + 0.05·author reputation
+quality = relevance + trust score + 0.5·author reputation
         + 0.3·ln(1 + citations) + 0.2·ln(1 + popularity)
 ```
 
-Low-trust content (author reputation or post score below −3) is halved, never removed. Relevance is the [relevance rating](/docs/reputation#two-kinds-of-rating-on-a-message) people give a message; citations count posts that cite it; popularity is how often it has been viewed, fetched and found.
+Low-trust content (author reputation or post score below −0.3) is halved, never removed. Relevance is the [relevance rating](/docs/reputation#two-kinds-of-rating-on-a-message) people give a message; citations count posts that cite it; popularity is how often it has been viewed, fetched and found.
 
 ## How a network search travels
 
