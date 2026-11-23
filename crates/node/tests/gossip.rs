@@ -287,3 +287,65 @@ async fn nostr_clients_and_sametra_peers_interoperate() {
     let m = recv(&mut hb).await;
     assert_eq!((m[0].as_str(), m[2]["kind"].as_u64(), m[2]["pubkey"].as_str()), (Some("EVENT"), Some(K_HEARTBEAT as u64), Some(a.node.keys.pubkey.hex().as_str())));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn search_reaches_beyond_direct_peers() {
+    // a <- b <- c <- e, where b, c and e only relay what they joined: content stays on a
+    let a = spawn(|c| {
+        c.relay_all = false;
+        c.join = vec!["bio".into()];
+    })
+    .await;
+    let b = spawn(|c| c.relay_all = false).await;
+    let c = spawn(|c| c.relay_all = false).await;
+    let e = spawn(|c| c.relay_all = false).await;
+    b.connect(&a).await;
+    c.connect(&b).await;
+    e.connect(&c).await;
+    let found: pb::Ack = a.ok("post", &post("bio", "Zebrafish fin regeneration", "single-cell atlas")).await;
+    a.ok::<_, pb::Ack>("post", &post("bio", "Unrelated", "nothing to see")).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!b.has(&found.id) && !c.has(&found.id), "not gossiped to non-members");
+    let s = |scope: &str| pb::SearchRequest { query: "zebrafish regeneration".into(), community: "bio".into(), scope: scope.into(), ..Default::default() };
+    let local: pb::Items = e.ok("search", &s("node")).await;
+    assert!(local.items.is_empty());
+    // community scope: peers and their peers (e -> c -> b): a is three levels away
+    let near: pb::Items = e.ok("search", &s("community")).await;
+    assert!(near.items.is_empty(), "community scope stops two levels out");
+    // network scope: three levels (e -> c -> b -> a)
+    let net: pb::Items = e.ok("search", &pb::SearchRequest { query: "zebrafish regeneration".into(), scope: "network".into(), ..Default::default() }).await;
+    assert_eq!(net.items.len(), 1, "three levels reach a");
+    assert_eq!(net.items[0].id, found.id);
+    assert!(e.has(&found.id), "found content is cached where it was searched");
+    // from c, a is two levels away: community scope finds it
+    let r: pb::Items = c.ok("search", &s("community")).await;
+    assert_eq!(r.items.len(), 1);
+    // nostr clients get NIP-50 search from the local index (no forwarding)
+    let mut ws = client(&a).await;
+    send(&mut ws, json!(["REQ", "s", {"search": "zebrafish", "kinds": [11]}])).await;
+    let m = recv(&mut ws).await;
+    assert_eq!((m[0].as_str(), m[2]["id"].as_str()), (Some("EVENT"), Some(found.id.as_str())));
+    assert_eq!(recv(&mut ws).await[0], "EOSE");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn communities_found_across_the_network_with_members() {
+    let a = spawn(|c| c.join = vec!["glaciology".into()]).await;
+    let b = spawn(|_| {}).await;
+    a.ok::<_, pb::Ack>("create_community", &pb::CreateCommunityRequest { slug: "glaciology".into(), name: "Glaciology".into(), about: "ice sheets and sea level".into() }).await;
+    b.connect(&a).await;
+    // definitions are global metadata: b learns them through gossip, and a's heartbeat counts a member
+    let f = pb::FindCommunitiesRequest { query: "ice sheets".into(), network: true, ..Default::default() };
+    let mut found = None;
+    for _ in 0..40 {
+        let r: pb::CommunitiesResponse = b.ok("find_communities", &f).await;
+        if let Some(c) = r.communities.into_iter().find(|c| c.slug == "glaciology" && c.members >= 1) {
+            found = Some(c);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let c = found.expect("community and its member visible from b");
+    assert_eq!(c.name, "Glaciology");
+    assert!(!c.joined);
+}

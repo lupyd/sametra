@@ -39,11 +39,6 @@ macro_rules! tools {
             peers: Empty => PeersResponse, false;
             memory_get: MemoryGetRequest => MemoryResponse, true;
             memory_set: MemorySetRequest => Ack, true;
-            set_capability: CapabilitySpec => Ack, true;
-            capabilities: CapabilitiesRequest => CapabilitiesResponse, false;
-            request: JobRequest => Ack, true;
-            inbox: InboxRequest => JobsResponse, true;
-            respond: RespondRequest => Ack, true;
         }
     };
 }

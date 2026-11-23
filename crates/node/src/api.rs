@@ -106,18 +106,26 @@ fn view(st: &Store, rep: &RepTable, e: &Event, full: bool, me: &H32) -> Item {
         mine: e.pubkey == *me,
         reply_count: 0,
         replies: vec![],
+        relevance: round2(rep.relevance(&e.id)),
+        relevance_ratings: rep.relevance.get(&e.id).map(|x| x.1 as u32).unwrap_or(0),
+        cited_by: st.cited_by(&e.id) as u32,
+        popularity: round2(st.popularity(&e.id)),
+        needs: e.tags_named("need").map(String::from).collect(),
+        text_match: 0.0,
     }
 }
 
-fn rank(rep: &RepTable, e: &Event, replies: usize) -> f64 {
+/// Feed and reply order: trust and relevance of the message, author standing,
+/// discussion and citations, minus a point per day of age.
+fn rank(rep: &RepTable, e: &Event, replies: usize, cites: usize) -> f64 {
     let age_h = now().saturating_sub(e.created_at) as f64 / 3600.0;
-    rep.event(&e.id) + 0.5 * rep.user(&e.pubkey) + (1.0 + replies as f64).ln() - age_h / 24.0
+    rep.event(&e.id) + rep.relevance(&e.id) + 0.5 * rep.user(&e.pubkey) + (1.0 + replies as f64).ln() + 0.5 * (1.0 + cites as f64).ln() - age_h / 24.0
 }
 
 fn tree(st: &Store, rep: &RepTable, e: &Ev, depth: usize, budget: &mut usize, me: &H32) -> Item {
     let mut v = view(st, rep, e, true, me);
     let mut kids = st.children(&e.id);
-    kids.sort_by(|a, b| rank(rep, b, 0).total_cmp(&rank(rep, a, 0)));
+    kids.sort_by(|a, b| rank(rep, b, 0, st.cited_by(&b.id)).total_cmp(&rank(rep, a, 0, st.cited_by(&a.id))));
     for k in kids {
         if *budget == 0 || depth > 64 {
             break;
@@ -183,9 +191,51 @@ async fn communities(node: &Arc<Node>, _: Empty) -> R<CommunitiesResponse> {
     for c in &joined {
         m.entry(c.clone()).or_insert_with(|| blank(c));
     }
-    let mut v: Vec<Community> = m.into_values().map(|mut x| (x.joined = joined.contains(&x.slug), x).1).collect();
+    drop(st);
+    let mut v: Vec<Community> = m
+        .into_values()
+        .map(|mut x| {
+            x.joined = joined.contains(&x.slug);
+            x.members = node.members(&x.slug) as u32;
+            x
+        })
+        .collect();
     v.sort_by(|a, b| b.joined.cmp(&a.joined).then(b.events.cmp(&a.events)));
     Ok(CommunitiesResponse { communities: v })
+}
+
+/// Find communities by name or description, ranked by match, members and activity.
+async fn find_communities(node: &Arc<Node>, r: FindCommunitiesRequest) -> R<CommunitiesResponse> {
+    let q = r.query.trim().to_string();
+    let limit = if r.limit == 0 { 30 } else { r.limit.min(200) } as usize;
+    if r.network && !q.is_empty() {
+        let f = Filter { kinds: Some(vec![K_COMMUNITY]), search: Some(q.clone()), limit: Some(50), ..Default::default() };
+        node.remote_search(vec![f], 1).await;
+    }
+    let all = communities(node, Empty {}).await?.communities;
+    let qt: Vec<String> = tokens(&q).collect();
+    let matches: std::collections::HashMap<String, f64> = {
+        let st = node.store.lock().unwrap();
+        st.search(&q, 1000)
+            .into_iter()
+            .filter_map(|h| st.get(&h.id).filter(|e| e.kind == K_COMMUNITY).map(|e| (e.d_tag().to_string(), h.score * if h.all { 1.0 } else { 0.5 })))
+            .collect()
+    };
+    let activity = |c: &Community| (1.0 + c.members as f64 + c.events as f64 / 10.0).ln();
+    let mut v: Vec<(f64, Community)> = all
+        .into_iter()
+        .filter_map(|c| {
+            if qt.is_empty() {
+                return Some((activity(&c), c));
+            }
+            // slugs of communities nobody defined are matched by name only
+            let slug_hit = qt.iter().any(|t| c.slug.contains(t.as_str())) as u8 as f64;
+            let m = matches.get(&c.slug).copied().unwrap_or(0.0) + slug_hit;
+            (m > 0.0).then(|| (m * (1.0 + 0.3 * activity(&c)), c))
+        })
+        .collect();
+    v.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.slug.cmp(&b.1.slug)));
+    Ok(CommunitiesResponse { communities: v.into_iter().take(limit).map(|x| x.1).collect() })
 }
 
 async fn create_community(node: &Arc<Node>, r: CreateCommunityRequest) -> R<Ack> {
@@ -227,7 +277,7 @@ async fn feed(node: &Arc<Node>, r: FeedRequest) -> R<Items> {
             let n = st.descendant_count(&e.id, 10_000);
             let mut v = view(&st, &rep, e, false, &me);
             v.reply_count = n as u32;
-            (if r.sort == "new" { e.created_at as f64 } else { rank(&rep, e, n) }, v)
+            (if r.sort == "new" { e.created_at as f64 } else { rank(&rep, e, n, v.cited_by as usize) }, v)
         })
         .collect();
     items.sort_by(|x, y| y.0.total_cmp(&x.0));
@@ -237,6 +287,7 @@ async fn feed(node: &Arc<Node>, r: FeedRequest) -> R<Items> {
 async fn thread(node: &Arc<Node>, r: IdRequest) -> R<ThreadResponse> {
     let id = hex_id(&r.id, "id")?;
     let root = get_or_fetch(node, &id).await.ok_or("event not found on this node or its peers")?;
+    node.store.lock().unwrap().bump(&id, 1.0); // viewed
     if !node.peers.lock().unwrap().is_empty() {
         let f = Filter { tags: vec![("e".into(), vec![id.hex()])], limit: Some(5000), ..Default::default() };
         node.remote_fetch(vec![f], Duration::from_millis(1500)).await;
@@ -257,34 +308,81 @@ async fn thread(node: &Arc<Node>, r: IdRequest) -> R<ThreadResponse> {
 async fn event(node: &Arc<Node>, r: IdRequest) -> R<EventResponse> {
     let id = hex_id(&r.id, "id")?;
     let e = get_or_fetch(node, &id).await.ok_or("event not found")?;
+    node.store.lock().unwrap().bump(&id, 1.0); // viewed
     let rep = node.reputation(e.community().unwrap_or(""));
     let st = node.store.lock().unwrap();
     Ok(EventResponse { item: Some(view(&st, &rep, &e, true, &node.keys.pubkey)), raw_json: serde_json::to_string(&*e).unwrap() })
 }
 
+/// Full-text search. `scope`: "node" (this node's cache, default), "community"
+/// (also ask peers and their peers, filtered to `community`), "network" (lossy
+/// fan-out three levels deep). Found events are cached here, then everything is ranked locally:
+/// text match x (1 + quality), where quality is relevance, trust, author
+/// standing, citations and use.
 async fn search(node: &Arc<Node>, r: SearchRequest) -> R<Items> {
-    let q = r.query.trim().to_lowercase();
+    let q = r.query.trim().to_string();
     if q.is_empty() {
         return Err("missing 'query'".into());
     }
-    let c = opt_slug(&r.community);
-    let limit = if r.limit == 0 { 20 } else { r.limit.min(200) } as usize;
-    let hits: Vec<Ev> = node
-        .store
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|e| (e.kind == K_POST || e.kind == K_REPLY) && c.is_none_or(|c| e.community() == Some(c)))
-        .filter(|e| e.content.to_lowercase().contains(&q) || e.tag("title").is_some_and(|t| t.to_lowercase().contains(&q)))
-        .take(limit)
-        .cloned()
-        .collect();
-    let mut items = vec![];
-    for e in hits {
-        let rep = node.reputation(e.community().unwrap_or(""));
-        items.push(view(&node.store.lock().unwrap(), &rep, &e, false, &node.keys.pubkey));
+    if tokens(&q).next().is_none() {
+        return Err("'query' needs a word of at least two letters that is not a stopword".into());
     }
-    Ok(Items { items })
+    let c = match opt_slug(&r.community) {
+        Some(c) => Some(slug(c)?),
+        None => None,
+    };
+    let limit = if r.limit == 0 { 20 } else { r.limit.min(200) } as usize;
+    let hops = match r.scope.trim() {
+        "" | "node" => None,
+        "community" if c.is_none() => return Err("scope 'community' needs 'community'".into()),
+        "community" => Some(1),
+        "network" => Some(2),
+        other => return Err(format!("unknown scope '{other}': use node, community or network")),
+    };
+    if let Some(hops) = hops {
+        let mut f = Filter { kinds: Some(vec![K_POST, K_REPLY]), search: Some(q.clone()), limit: Some(50), ..Default::default() };
+        if let Some(c) = &c {
+            f.tags = vec![("c".into(), vec![c.clone()])];
+        }
+        node.remote_search(vec![f], hops).await;
+    }
+    let hits: Vec<(Ev, f64)> = {
+        let st = node.store.lock().unwrap();
+        st.search(&q, 2000)
+            .into_iter()
+            .filter_map(|h| st.get(&h.id).map(|e| (e.clone(), h.score * if h.all { 1.0 } else { 0.4 })))
+            .filter(|(e, _)| (e.kind == K_POST || e.kind == K_REPLY) && c.as_deref().is_none_or(|c| e.community() == Some(c)))
+            .take(1000)
+            .collect()
+    };
+    let mut reps: std::collections::HashMap<String, Arc<RepTable>> = Default::default();
+    for (e, _) in &hits {
+        let cm = e.community().unwrap_or("").to_string();
+        if let std::collections::hash_map::Entry::Vacant(v) = reps.entry(cm) {
+            let t = node.reputation(v.key());
+            v.insert(t);
+        }
+    }
+    let mut st = node.store.lock().unwrap();
+    let mut items: Vec<(f64, Item)> = hits
+        .iter()
+        .map(|(e, m)| {
+            let rep = &reps[e.community().unwrap_or("")];
+            let mut v = view(&st, rep, e, false, &node.keys.pubkey);
+            let quality = (0.1 * v.relevance + 0.1 * v.score + 0.05 * v.author_rep + 0.3 * (1.0 + v.cited_by as f64).ln() + 0.2 * (1.0 + v.popularity).ln()).max(0.0);
+            let score = m * (1.0 + quality) * if v.low_trust { 0.5 } else { 1.0 };
+            v.text_match = round2(*m);
+            (score, v)
+        })
+        .collect();
+    items.sort_by(|a, b| b.0.total_cmp(&a.0));
+    items.truncate(limit);
+    for (_, it) in &items {
+        if let Some(id) = H32::from_hex(&it.id) {
+            st.bump(&id, 0.2); // found by a search
+        }
+    }
+    Ok(Items { items: items.into_iter().map(|x| x.1).collect() })
 }
 
 async fn post(node: &Arc<Node>, r: PostRequest) -> R<Ack> {
@@ -313,13 +411,27 @@ async fn post(node: &Arc<Node>, r: PostRequest) -> R<Ack> {
     for x in r.refs.iter().take(50) {
         tags.push(t("q", hex_id(x, "refs")?.hex()));
     }
+    for n in r.needs.iter().map(|n| n.trim()).filter(|n| !n.is_empty()).take(10) {
+        tags.push(t("need", n.chars().take(100).collect::<String>()));
+    }
     let e = node.publish(kind, tags, r.content)?;
     Ok(ack(Some(&e.id)))
 }
 
+/// Rate a person or a message. Aspects: "trust" (default; accuracy, feeds the
+/// author's reputation) or "relevance" (how useful this message is here; scores
+/// only the message).
 async fn rate(node: &Arc<Node>, r: RateRequest) -> R<Ack> {
     if !(-10..=10).contains(&r.score) {
         return Err("score must be in -10..10".into());
+    }
+    let aspect = match r.aspect.trim() {
+        "" | "trust" => "trust",
+        "relevance" => "relevance",
+        other => return Err(format!("unknown aspect '{other}': use trust or relevance")),
+    };
+    if aspect == "relevance" && opt_slug(&r.event).is_none() {
+        return Err("relevance rates a message: give 'event'".into());
     }
     let (target, ev, comm) = if let Some(eid) = opt_slug(&r.event) {
         let id = hex_id(eid, "event")?;
@@ -334,13 +446,22 @@ async fn rate(node: &Arc<Node>, r: RateRequest) -> R<Ack> {
         return Err("you cannot rate yourself".into());
     }
     let c = slug(&comm)?;
-    let d = format!("{c}:{}:{}", target.hex(), ev.map(|e| e.hex()).unwrap_or_default());
-    let mut tags = vec![t("d", d), t("c", &c), t("p", target.hex()), t("score", r.score.to_string())];
+    // trust keeps the original slot layout; relevance gets its own slot per message
+    let mut d = format!("{c}:{}:{}", target.hex(), ev.map(|e| e.hex()).unwrap_or_default());
+    let mut tags = vec![t("c", &c), t("p", target.hex()), t("score", r.score.to_string())];
+    if aspect == "relevance" {
+        d.push_str(":relevance");
+        tags.push(t("aspect", "relevance"));
+    }
+    tags.insert(0, t("d", d));
     if let Some(e) = ev {
         tags.push(t("e", e.hex()));
     }
     let e = node.publish(K_RATING, tags, r.reason)?;
-    Ok(Ack { rep: round2(node.reputation(&c).user(&target)), community: c, ..ack(Some(&e.id)) })
+    let table = node.reputation(&c);
+    // Ack.rep: the person's reputation for trust ratings, the message's relevance otherwise
+    let rep = if aspect == "relevance" { table.relevance(&ev.unwrap()) } else { table.user(&target) };
+    Ok(Ack { rep: round2(rep), community: c, ..ack(Some(&e.id)) })
 }
 
 async fn reputation(node: &Arc<Node>, r: ReputationRequest) -> R<ReputationResponse> {
@@ -553,11 +674,15 @@ mod tests {
         let fresh = k.sign(K_POST, vec![], "a".into());
         let old = k.sign_at(K_POST, vec![], "b".into(), now() - 3 * 86400);
         let rep = RepTable::default();
-        assert!(rank(&rep, &fresh, 0) > rank(&rep, &old, 0));
-        assert!(rank(&rep, &fresh, 10) > rank(&rep, &fresh, 0));
+        assert!(rank(&rep, &fresh, 0, 0) > rank(&rep, &old, 0, 0));
+        assert!(rank(&rep, &fresh, 10, 0) > rank(&rep, &fresh, 0, 0));
         let mut good = RepTable::default();
         good.user.insert(k.pubkey, 8.0);
-        assert!(rank(&good, &fresh, 0) > rank(&rep, &fresh, 0));
+        assert!(rank(&good, &fresh, 0, 0) > rank(&rep, &fresh, 0, 0));
+        assert!(rank(&rep, &fresh, 0, 5) > rank(&rep, &fresh, 0, 0), "citations lift");
+        let mut relevant = RepTable::default();
+        relevant.relevance.insert(fresh.id, (4.0, 2));
+        assert!(rank(&relevant, &fresh, 0, 0) > rank(&rep, &fresh, 0, 0), "relevance lifts");
     }
 
     #[test]

@@ -22,6 +22,7 @@
 //!    message, never the author's reputation.
 //!  * capability: did the provider deliver what their capability claims? Kept
 //!    out of community reputation entirely (see `capability_scores`).
+//!
 //! Event scores of both kinds use the same rater weighting.
 
 use crate::event::*;

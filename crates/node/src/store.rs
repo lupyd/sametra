@@ -728,4 +728,98 @@ mod tests {
         assert_eq!(s.len(), 20);
         let _ = fs::remove_dir_all(dir);
     }
+
+    #[test]
+    fn popularity_decays_persists_and_counts_citations() {
+        let (mut s, dir) = open("pop");
+        let k = Keys::generate();
+        let a = at(&k, K_POST, tg(&[&["c", "m"]]), "a", now());
+        s.insert(a.clone());
+        s.bump(&a.id, 3.0);
+        s.bump(&a.id, 1.0);
+        assert!((s.popularity(&a.id) - 4.0).abs() < 1e-3);
+        s.bump(&H32([7; 32]), 5.0); // unknown events are ignored
+        assert_eq!(s.popularity(&H32([7; 32])), 0.0);
+        assert!((decayed(4.0, 0, POP_HALF_LIFE) - 2.0).abs() < 1e-9, "halves every half-life");
+        let exported = s.export_popularity(10);
+        assert_eq!(exported.len(), 1);
+        let (mut s2, dir2) = open("pop2");
+        s2.insert(a.clone());
+        s2.load_popularity(&exported);
+        assert!((s2.popularity(&a.id) - 4.0).abs() < 1e-3);
+        // citations: q tags only (replies don't count)
+        let cite = at(&k, K_POST, tg(&[&["c", "m"], &["q", &a.id.hex()]]), "cites a", now());
+        let reply = reply_to(&k, &a, &a, now());
+        s.insert(cite);
+        s.insert(reply);
+        assert_eq!(s.cited_by(&a.id), 1);
+        assert!(s.keep_score(&a.id) > s.keep_score(&H32([1; 32])));
+        let _ = fs::remove_dir_all(dir);
+        let _ = fs::remove_dir_all(dir2);
+    }
+
+    #[test]
+    fn popular_content_outlives_its_author_longer() {
+        let (mut s, dir) = open("grace");
+        let (me, gone) = (Keys::generate(), Keys::generate());
+        let plain = at(&gone, K_POST, tg(&[&["c", "m"]]), "plain", 100);
+        let popular = at(&gone, K_POST, tg(&[&["c", "m"]]), "popular", 101);
+        s.insert(plain.clone());
+        s.insert(popular.clone());
+        s.bump(&popular.id, 20.0);
+        // author last seen 2 TTLs ago: plain content is gone, popular content stays
+        s.last_seen.insert(gone.pubkey, now() - 7200);
+        assert_eq!(s.evict(&me.pubkey, 3600, 1000), 1);
+        assert!(!s.contains(&plain.id) && s.contains(&popular.id));
+        // ...but not forever: grace is capped at 10 TTLs
+        s.last_seen.insert(gone.pubkey, now() - 11 * 3600);
+        assert_eq!(s.evict(&me.pubkey, 3600, 1000), 1);
+        assert!(!s.contains(&popular.id));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cache_pressure_drops_least_popular_first() {
+        let (mut s, dir) = open("pressure");
+        let (me, other) = (Keys::generate(), Keys::generate());
+        let t = now();
+        let old_cited = at(&other, K_POST, tg(&[&["c", "m"]]), "old but cited", t - 86400);
+        s.insert(old_cited.clone());
+        let posts: Vec<Event> = (0..15).map(|i| at(&other, K_POST, tg(&[&["c", "m"]]), &format!("p{i}"), t - 3600 + i)).collect();
+        for p in &posts {
+            s.insert(p.clone());
+        }
+        let hot = posts[0].clone();
+        for _ in 0..3 {
+            s.insert(at(&other, K_POST, tg(&[&["c", "x"], &["q", &old_cited.id.hex()]]), &format!("cite {}", s.len()), t));
+        }
+        s.bump(&hot.id, 50.0);
+        s.touch(other.pubkey, t);
+        s.evict(&me.pubkey, 3600, 10);
+        assert_eq!(s.len(), 9);
+        assert!(s.contains(&old_cited.id), "cited content survives the cap");
+        assert!(s.contains(&hot.id), "used content survives the cap");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn nip50_queries_use_the_index() {
+        let (mut s, dir) = open("nip50");
+        let k = Keys::generate();
+        let a = at(&k, K_POST, tg(&[&["c", "bio"], &["title", "CRISPR screen"]]), "off-target effects", 10);
+        let b = at(&k, K_REPLY, tg(&[&["c", "bio"]]), "crispr reply", 20);
+        let c = at(&k, K_POST, tg(&[&["c", "chem"]]), "crispr reagents", 30);
+        for e in [&a, &b, &c] {
+            s.insert(e.clone());
+        }
+        let ids = |v: serde_json::Value| q(&s, v).iter().map(|e| e.id).collect::<Vec<_>>();
+        assert_eq!(ids(serde_json::json!({"search": "crispr", "#c": ["bio"], "kinds": [11]})), [a.id]);
+        assert_eq!(ids(serde_json::json!({"search": "crispr"})).len(), 3);
+        assert_eq!(ids(serde_json::json!({"search": "crispr effects"})), [a.id], "all tokens must match");
+        assert_eq!(ids(serde_json::json!({"search": "crispr", "limit": 1})).len(), 1);
+        assert_eq!(ids(serde_json::json!({"search": "crispr"}))[0], a.id, "relevance order: title match first");
+        s.remove(&a.id);
+        assert!(q(&s, serde_json::json!({"search": "effects"})).is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
 }

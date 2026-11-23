@@ -120,7 +120,7 @@ fn tools_lists_schemas() {
     let (code, stdout, _) = out(cmd(&d.0).arg("tools").output().unwrap());
     assert_eq!(code, 0);
     let v: Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(v.as_array().unwrap().len(), 21);
+    assert_eq!(v.as_array().unwrap().len(), sametra_mcp::tool_defs().as_array().unwrap().len());
     assert!(v.as_array().unwrap().iter().any(|t| t["name"] == "rate" && t["inputSchema"]["required"] == json!(["score"])));
 }
 
@@ -187,7 +187,7 @@ fn mcp_stdio_server() {
 
     send(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}));
     let list = recv();
-    assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 21);
+    assert_eq!(list["result"]["tools"].as_array().unwrap().len(), sametra_mcp::tool_defs().as_array().unwrap().len());
 
     let tool = |id: u32, name: &str, args: Value| json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": name, "arguments": args}});
     let text = |v: &Value| -> Value { serde_json::from_str(v["result"]["content"][0]["text"].as_str().unwrap()).unwrap_or(Value::Null) };

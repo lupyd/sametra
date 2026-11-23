@@ -109,7 +109,7 @@ pub struct Node {
     /// concurrent outgoing forwarded searches
     search_slots: Arc<tokio::sync::Semaphore>,
     /// capability reputation table, rebuilt on demand (see api.rs)
-    pub cap_cache: Mutex<Option<Arc<HashMap<(H32, String), (f64, usize)>>>>,
+    pub cap_cache: Mutex<Option<Arc<CapScores>>>,
     tx: broadcast::Sender<(Ev, u64)>,
     next_conn: AtomicU64,
     dialer: Dialer,
@@ -117,6 +117,9 @@ pub struct Node {
     #[cfg(feature = "tls")]
     pub tls: Option<sametra_transport::tls::TlsAcceptor>,
 }
+
+/// (provider, capability id) -> (reputation, raters)
+pub type CapScores = HashMap<(H32, String), (f64, usize)>;
 
 pub const ORIGIN_LOCAL: u64 = 0;
 const GLOBAL_KINDS: [u32; 5] = [K_PROFILE, K_COMMUNITY, K_RATING, K_DELETE, K_CAPABILITY];
@@ -178,11 +181,15 @@ impl Node {
 
     /// Persist joined communities, address book and pins (NodeState protobuf, atomic replace).
     pub fn save_state(&self) {
+        let (pins, popularity) = {
+            let store = self.store.lock().unwrap();
+            (store.pinned.iter().map(|p| p.0.to_vec()).collect(), store.export_popularity(5000))
+        };
         let st = pb::NodeState {
             joined: self.joined.lock().unwrap().iter().cloned().collect(),
             peers: self.book.lock().unwrap().iter().filter(|(_, i)| i.fails < 8).map(|(a, _)| a.clone()).collect(),
-            pins: self.store.lock().unwrap().pinned.iter().map(|p| p.0.to_vec()).collect(),
-            popularity: self.store.lock().unwrap().export_popularity(5000),
+            pins,
+            popularity,
         };
         write_atomic(&self.cfg.data.join("state.pb"), &pb::encode(&st));
     }
@@ -430,7 +437,7 @@ where
 
     if outbound {
         let since = node.store.lock().unwrap().iter().next().map(|e| e.created_at.saturating_sub(3600)).unwrap_or(0);
-        let _ = sink.send(wire.req("sync", &node.sync_filters(since)).unwrap()).await;
+        let _ = sink.send(wire.req("sync", &node.sync_filters(since), 0).unwrap()).await;
         node.heartbeat();
     }
 
@@ -785,6 +792,37 @@ mod tests {
         assert!(st.replaceable(&n.keys.pubkey, K_PROFILE, "").unwrap().content.contains("v4"));
         assert_eq!(st.replaceable(&n.keys.pubkey, K_RATING, "x").unwrap().content, "r4");
         assert_eq!(st.len(), 2);
+    }
+
+    #[test]
+    fn heartbeats_count_members_and_popularity_persists() {
+        let n = node_with("members", |c| c.join = vec!["bio".into(), "math".into()]);
+        n.heartbeat();
+        let hb = n.heartbeat_event();
+        assert_eq!(hb.tags_named("c").collect::<Vec<_>>(), ["bio", "math"], "heartbeats carry joined communities");
+        let k = Keys::generate();
+        n.ingest(k.sign(K_HEARTBEAT, vec![vec!["c".into(), "bio".into()]], String::new()), 1, false).unwrap();
+        assert_eq!(n.members("bio"), 2);
+        assert_eq!(n.members("math"), 1);
+        assert_eq!(n.members("chem"), 0);
+        // popularity survives a restart through state.pb
+        let e = n.publish(K_POST, c("bio"), "x".into()).unwrap();
+        n.store.lock().unwrap().bump(&e.id, 5.0);
+        n.save_state();
+        n.store.lock().unwrap().flush();
+        let data = n.cfg.data.clone();
+        drop(n);
+        let again = Node::new(Config { data, ..Default::default() }, Keys::generate()).unwrap();
+        assert!(again.store.lock().unwrap().popularity(&e.id) > 4.9);
+    }
+
+    #[tokio::test]
+    async fn remote_search_without_peers_returns_immediately() {
+        let n = node_with("nosearch", |_| {});
+        let t = std::time::Instant::now();
+        let f = Filter { search: Some("x".into()), ..Default::default() };
+        assert!(n.remote_search(vec![f], 2).await.is_empty());
+        assert!(t.elapsed() < Duration::from_millis(500));
     }
 
     #[test]

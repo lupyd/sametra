@@ -154,7 +154,7 @@ describe('feed', () => {
     await type(byPlaceholder('Details'), 'Asking for a friend');
     expect(root.textContent).toContain('citing cccccccc');
     await click(button('Post'));
-    expect(sent('post')).toEqual([{ community: 'math', title: 'Is P = NP?', content: 'Asking for a friend', parent: '', refs: ['c'.repeat(64)] }]);
+    expect(sent('post')).toEqual([{ community: 'math', title: 'Is P = NP?', content: 'Asking for a friend', parent: '', refs: ['c'.repeat(64)], needs: [] }]);
     expect(loc.value).toBe('/t/' + 'f'.repeat(64));
     expect(cites.value).toEqual([]);
   });
@@ -209,7 +209,7 @@ describe('thread', () => {
     await click(button('reply', top.querySelector('.acts')));
     await type(byPlaceholder('Reply'), 'my answer');
     await click(button('Reply'));
-    expect(sent('post')).toEqual([{ community: '', title: '', content: 'my answer', parent: ROOT, refs: [] }]);
+    expect(sent('post')).toEqual([{ community: '', title: '', content: 'my answer', parent: ROOT, refs: [], needs: [] }]);
     expect(toast.value).toBe('Replied');
     expect(byPlaceholder('Reply')).toBeUndefined();
   });
@@ -223,7 +223,7 @@ describe('thread', () => {
     expect($('.box b').textContent).toBe('-4');
     await type(byPlaceholder('reason'), 'not replicated');
     await click(button('Rate'));
-    expect(sent('rate')).toEqual([{ score: -4, event: R1, target: '', community: '', reason: 'not replicated' }]);
+    expect(sent('rate')).toEqual([{ score: -4, event: R1, target: '', community: '', reason: 'not replicated', aspect: '', capability: '' }]);
     expect(toast.value).toContain('-1.25');
   });
 

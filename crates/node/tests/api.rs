@@ -171,7 +171,7 @@ async fn search() {
     let a: pb::Ack = n.ok("post", &post("bio", "Other", "nothing")).await;
     n.ok::<_, pb::Ack>("post", &reply(&a.id, "a CRISPR reply")).await;
     n.ok::<_, pb::Ack>("create_community", &pb::CreateCommunityRequest { slug: "crispr".into(), ..Default::default() }).await;
-    let s = |q: &str, c: &str, limit| pb::SearchRequest { query: q.into(), community: c.into(), limit };
+    let s = |q: &str, c: &str, limit| pb::SearchRequest { query: q.into(), community: c.into(), limit, ..Default::default() };
     let all: pb::Items = n.ok("search", &s("crispr", "", 0)).await;
     assert_eq!(all.items.len(), 3, "title, content and replies match case-insensitively; community defs do not");
     let bio: pb::Items = n.ok("search", &s("CRISPR", "bio", 0)).await;
@@ -192,7 +192,7 @@ async fn rating_and_reputation() {
     n.node.ingest(ae.clone(), 9, false).unwrap();
     n.node.ingest(alice.sign(K_PROFILE, vec![], r#"{"name":"Alice","agent":true}"#.into()), 9, false).unwrap();
 
-    let rate = |score, event: &str, target: &str, c: &str| pb::RateRequest { score, event: event.into(), target: target.into(), community: c.into(), reason: "why".into() };
+    let rate = |score, event: &str, target: &str, c: &str| pb::RateRequest { score, event: event.into(), target: target.into(), community: c.into(), reason: "why".into(), ..Default::default() };
     let a: pb::Ack = n.ok("rate", &rate(6, &ae.id.hex(), "", "")).await;
     assert_eq!(a.community, "m", "community taken from the event");
     assert!(a.rep > 0.0);
@@ -377,4 +377,101 @@ async fn fetch_and_lookups_reach_peers() {
 
 fn n_cached(n: &TestNode, c: &str) -> usize {
     n.node.store.lock().unwrap().query(&Filter { tags: vec![("c".into(), vec![c.into()])], ..Default::default() }, 1000).len()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ranked_search_and_scopes() {
+    let n = spawn(|_| {}).await;
+    let k = Keys::generate();
+    let mk = |title: &str, body: &str| k.sign(K_POST, tags(&[&["c", "bio"], &["title", title]]), body.into());
+    let plain = mk("Marker X notes", "marker x appears in cohort b");
+    let rated = mk("Marker X replicated", "we replicated marker x in cohort b");
+    let partial = mk("Cohort logistics", "shipping samples for cohort b");
+    for e in [&plain, &rated, &partial] {
+        n.node.ingest(e.clone(), 9, false).unwrap();
+    }
+    // relevance ratings and citations lift a result above an equal text match
+    n.ok::<_, pb::Ack>("rate", &pb::RateRequest { score: 9, event: rated.id.hex(), aspect: "relevance".into(), ..Default::default() }).await;
+    for i in 0..3 {
+        n.ok::<_, pb::Ack>("post", &pb::PostRequest { refs: vec![rated.id.hex()], ..post("bio", &format!("cites {i}"), "see it") }).await;
+    }
+    let s = |q: &str, scope: &str| pb::SearchRequest { query: q.into(), community: "bio".into(), scope: scope.into(), ..Default::default() };
+    let r: pb::Items = n.ok("search", &s("marker cohort", "")).await;
+    let ids: Vec<&str> = r.items.iter().map(|i| i.id.as_str()).collect();
+    assert_eq!(ids[0], rated.id.hex(), "relevance and citations rank it first");
+    assert_eq!(ids[1], plain.id.hex());
+    assert_eq!(ids.last().copied(), Some(partial.id.hex().as_str()), "partial matches come last");
+    assert!(r.items[0].text_match > 0.0 && r.items[0].relevance > 0.0 && r.items[0].cited_by == 3);
+    let again: pb::Items = n.ok("search", &s("marker cohort", "")).await;
+    assert!(again.items[0].popularity > 0.0, "being found counts as use");
+    // scopes
+    let ok: pb::Items = n.ok("search", &s("marker", "community")).await;
+    assert_eq!(ok.items.len(), 2, "no peers: community scope still answers locally");
+    let _: pb::Items = n.ok("search", &pb::SearchRequest { query: "marker".into(), scope: "network".into(), ..Default::default() }).await;
+    assert!(n.err("search", &pb::SearchRequest { query: "marker".into(), scope: "community".into(), ..Default::default() }).await.1.contains("needs 'community'"));
+    assert!(n.err("search", &s("marker", "galaxy")).await.1.contains("unknown scope"));
+    assert!(n.err("search", &s("the of a", "")).await.1.contains("stopword"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relevance_is_separate_from_trust() {
+    let n = spawn(|_| {}).await;
+    let alice = Keys::generate();
+    let msg = alice.sign(K_POST, tags(&[&["c", "m"], &["title", "Off topic"]]), "cat pictures".into());
+    n.node.ingest(msg.clone(), 9, false).unwrap();
+    let rate = |score, aspect: &str| pb::RateRequest { score, event: msg.id.hex(), aspect: aspect.into(), ..Default::default() };
+    let rel: pb::Ack = n.ok("rate", &rate(-6, "relevance")).await;
+    assert!(rel.rep < 0.0, "Ack.rep is the message's relevance");
+    let trust: pb::Ack = n.ok("rate", &rate(4, "trust")).await;
+    assert!(trust.rep > 0.0, "true but off-topic: the author keeps their standing");
+    let ev: pb::EventResponse = n.ok("event", &id(&msg.id.hex())).await;
+    let it = ev.item.unwrap();
+    assert!(it.relevance < 0.0 && it.relevance_ratings == 1 && it.score > 0.0 && it.ratings == 1);
+    // both ratings coexist (separate replaceable slots)
+    let ratings = n.node.store.lock().unwrap().query(&Filter { kinds: Some(vec![K_RATING]), ..Default::default() }, 10).len();
+    assert_eq!(ratings, 2);
+    assert!(n.err("rate", &pb::RateRequest { score: 1, target: alice.npub(), community: "m".into(), aspect: "relevance".into(), ..Default::default() }).await.1.contains("event"));
+    assert!(n.err("rate", &rate(1, "vibes")).await.1.contains("unknown aspect"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn posts_declare_needs() {
+    let n = spawn(|_| {}).await;
+    let a: pb::Ack = n.ok("post", &pb::PostRequest { needs: vec![" mass spectrometry ".into(), "".into(), "x".repeat(300)], ..post("bio", "Help", "who can run this?") }).await;
+    let e: pb::EventResponse = n.ok("event", &id(&a.id)).await;
+    let needs = e.item.unwrap().needs;
+    assert_eq!(needs[0], "mass spectrometry");
+    assert_eq!(needs.len(), 2);
+    assert_eq!(needs[1].len(), 100);
+    // needs are searchable
+    let r: pb::Items = n.ok("search", &pb::SearchRequest { query: "spectrometry".into(), ..Default::default() }).await;
+    assert_eq!(r.items[0].id, a.id);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn find_communities_by_topic() {
+    let n = spawn(|_| {}).await;
+    let k = Keys::generate();
+    for (slug, name, about) in [("onco", "Oncology", "tumour biology and cancer research"), ("nt", "Number theory", "primes"), ("cancer-data", "Datasets", "open cancer cohorts")] {
+        n.node.ingest(k.sign(K_COMMUNITY, tags(&[&["d", slug], &["name", name]]), about.into()), 9, false).unwrap();
+    }
+    for i in 0..30 {
+        n.node.ingest(k.sign(K_POST, tags(&[&["c", "cancer-data"]]), format!("p{i}")), 9, false).unwrap();
+    }
+    // a member announces 'onco'
+    n.node.ingest(Keys::generate().sign(K_HEARTBEAT, tags(&[&["c", "onco"]]), String::new()), 9, false).unwrap();
+    let f = |q: &str| pb::FindCommunitiesRequest { query: q.into(), ..Default::default() };
+    let r: pb::CommunitiesResponse = n.ok("find_communities", &f("cancer")).await;
+    let slugs: Vec<&str> = r.communities.iter().map(|c| c.slug.as_str()).collect();
+    assert_eq!(slugs.len(), 2);
+    assert!(slugs.contains(&"onco") && slugs.contains(&"cancer-data"));
+    assert_eq!(r.communities.iter().find(|c| c.slug == "onco").unwrap().members, 1);
+    let r: pb::CommunitiesResponse = n.ok("find_communities", &f("primes")).await;
+    assert_eq!(r.communities[0].name, "Number theory");
+    let all: pb::CommunitiesResponse = n.ok("find_communities", &f("")).await;
+    assert_eq!(all.communities.len(), 3);
+    let order: Vec<&str> = all.communities.iter().map(|c| c.slug.as_str()).collect();
+    assert_eq!(order, ["cancer-data", "onco", "nt"], "empty query: most active first (30 posts > 1 member > nothing)");
+    let none: pb::CommunitiesResponse = n.ok("find_communities", &f("zebrafish")).await;
+    assert!(none.communities.is_empty());
 }

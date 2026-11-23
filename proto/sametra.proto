@@ -160,8 +160,8 @@ message EventResponse {
   string raw_json = 2;  // NIP-01 JSON
 }
 
-// scope: "node" (default: this node's cache), "community" (peers carrying `community`),
-//        "network" (lossy, hop-limited fan-out across the network)
+// scope: "node" (default: this node's cache), "community" (peers and their peers, posts in
+//        `community`), "network" (lossy fan-out three levels deep)
 message SearchRequest { string query = 1; string community = 2; uint32 limit = 3; string scope = 4; }
 
 // Find communities by name/description; `network` also asks peers.

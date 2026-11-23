@@ -13,6 +13,7 @@ export const TOOLS = {
   thread: ['IdRequest', 'ThreadResponse'],
   event: ['IdRequest', 'EventResponse'],
   search: ['SearchRequest', 'Items'],
+  find_communities: ['FindCommunitiesRequest', 'CommunitiesResponse'],
   post: ['PostRequest', 'Ack'],
   rate: ['RateRequest', 'Ack'],
   reputation: ['ReputationRequest', 'ReputationResponse'],

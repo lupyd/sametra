@@ -88,6 +88,9 @@ async fn one_port_serves_plain_and_tls() {
     let mut events = 0;
     loop {
         let m = tokio::time::timeout(T, ws.next()).await.unwrap().unwrap().unwrap();
+        if !m.is_text() {
+            continue; // keepalive pings
+        }
         let v: serde_json::Value = serde_json::from_str(m.to_text().unwrap()).unwrap();
         if v[0] == "EOSE" {
             break;
@@ -98,7 +101,12 @@ async fn one_port_serves_plain_and_tls() {
     // and plain ws:// on the same port
     let mut plain_ws = Dialer::new(&[]).unwrap().connect(&n.ws).await.unwrap();
     plain_ws.send(Message::text(r#"["REQ","s",{"kinds":[1]}]"#)).await.unwrap();
-    let m = tokio::time::timeout(T, plain_ws.next()).await.unwrap().unwrap().unwrap();
+    let m = loop {
+        let m = tokio::time::timeout(T, plain_ws.next()).await.unwrap().unwrap().unwrap();
+        if m.is_text() {
+            break m;
+        }
+    };
     assert!(m.to_text().unwrap().starts_with("[\"EOSE\""));
 }
 
