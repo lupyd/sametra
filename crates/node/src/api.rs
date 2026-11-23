@@ -9,7 +9,8 @@ use crate::event::*;
 use crate::event::{Event, Filter};
 use crate::node::Node;
 use crate::pb::{self, *};
-use crate::rep::RepTable;
+use crate::node::CapScores;
+use crate::rep::{self, Aspect, RepTable};
 use crate::store::{Ev, Store};
 use std::sync::Arc;
 use std::time::Duration;
@@ -428,7 +429,8 @@ async fn rate(node: &Arc<Node>, r: RateRequest) -> R<Ack> {
     let aspect = match r.aspect.trim() {
         "" | "trust" => "trust",
         "relevance" => "relevance",
-        other => return Err(format!("unknown aspect '{other}': use trust or relevance")),
+        "capability" => return rate_capability(node, r).await,
+        other => return Err(format!("unknown aspect '{other}': use trust, relevance or capability")),
     };
     if aspect == "relevance" && opt_slug(&r.event).is_none() {
         return Err("relevance rates a message: give 'event'".into());
@@ -588,6 +590,412 @@ async fn memory_set(node: &Arc<Node>, r: MemorySetRequest) -> R<Ack> {
     }
     node.save_memory();
     Ok(ack(None))
+}
+
+// ---- capabilities (NIP-89 announcements, NIP-90 jobs) -------------------------
+
+/// A live (not withdrawn) capability announcement.
+fn spec_of(e: &Event) -> Option<CapabilitySpec> {
+    if e.kind != K_CAPABILITY || e.tag("status") == Some("withdrawn") {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(&e.content).ok()?;
+    let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+    Some(CapabilitySpec {
+        id: e.d_tag().to_string(),
+        name: s("name"),
+        about: s("about"),
+        kind: s("kind"),
+        input_schema: v.get("input_schema").filter(|x| !x.is_null()).map(|x| x.to_string()).unwrap_or_default(),
+        topics: e.tags_named("t").map(String::from).collect(),
+        communities: e.tags_named("c").map(String::from).collect(),
+        delete: false,
+    })
+}
+
+/// `["param", name, value]` (NIP-90).
+fn param<'a>(e: &'a Event, name: &str) -> Option<&'a str> {
+    e.tags.iter().find(|t| t.len() >= 3 && t[0] == "param" && t[1] == name).map(|t| t[2].as_str())
+}
+/// `["i", data, type]` inputs (NIP-90).
+fn input<'a>(e: &'a Event, ty: &str) -> Option<&'a str> {
+    e.tags.iter().find(|t| t.len() >= 3 && t[0] == "i" && t[2] == ty).map(|t| t[1].as_str())
+}
+
+struct JobState {
+    status: &'static str,
+    text: String,
+    result: Option<Ev>,
+    updated: u64,
+}
+
+/// Status of a job request from the provider's feedback and results.
+fn job_state(st: &Store, req: &Event) -> JobState {
+    let provider = req.tag("p").and_then(H32::from_hex);
+    let from_provider: Vec<Ev> = st.referencing(&req.id).into_iter().filter(|e| Some(e.pubkey) == provider).collect();
+    let latest = |k: u32| from_provider.iter().filter(|e| e.kind == k).max_by_key(|e| (e.created_at, e.id)).cloned();
+    if let Some(res) = latest(K_JOB_RESULT) {
+        return JobState { status: "done", text: String::new(), updated: res.created_at, result: Some(res) };
+    }
+    let Some(fb) = latest(K_JOB_FEEDBACK) else {
+        return JobState { status: "pending", text: String::new(), result: None, updated: req.created_at };
+    };
+    let tag = fb.tags.iter().find(|t| t.len() >= 2 && t[0] == "status");
+    let extra = tag.and_then(|t| t.get(2)).map(String::as_str).unwrap_or("");
+    let status = match tag.map(|t| t[1].as_str()) {
+        Some("processing") | Some("partial") => "accepted",
+        Some("error") if extra.starts_with("declined") => "declined",
+        Some("error") => "error",
+        _ => "pending",
+    };
+    JobState { status, text: fb.content.clone(), result: None, updated: fb.created_at }
+}
+
+#[derive(Default, Clone, Copy)]
+struct CapStats {
+    requests: u32,
+    completed: u32,
+    declined: u32,
+    response_secs: u64,
+}
+
+fn cap_stats(st: &Store) -> std::collections::HashMap<(H32, String), CapStats> {
+    let mut out: std::collections::HashMap<(H32, String), CapStats> = Default::default();
+    for req in st.query(&Filter { kinds: Some(vec![K_JOB]), ..Default::default() }, usize::MAX) {
+        let (Some(p), Some(cap)) = (req.tag("p").and_then(H32::from_hex), param(&req, "capability")) else { continue };
+        let s = out.entry((p, cap.to_string())).or_default();
+        s.requests += 1;
+        let j = job_state(st, &req);
+        match j.status {
+            "done" => {
+                s.completed += 1;
+                s.response_secs += j.updated.saturating_sub(req.created_at);
+            }
+            "declined" => s.declined += 1,
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Capability reputation for every (provider, capability), cached until a new
+/// rating or result arrives. A rating counts only if it cites a result that
+/// provider delivered to the rater for that capability; it is weighted by the
+/// rater's reputation in the community the request was made in (1 if none).
+fn cap_scores(node: &Arc<Node>) -> Arc<CapScores> {
+    if let Some(c) = node.cap_cache.lock().unwrap().clone() {
+        return c;
+    }
+    // result id -> (provider, requester, capability, community of the request)
+    type Ctx = (H32, Option<H32>, String, Option<String>);
+    let (ratings, ctx) = {
+        let st = node.store.lock().unwrap();
+        let ratings: Vec<Ev> = st
+            .query(&Filter { kinds: Some(vec![K_RATING]), ..Default::default() }, usize::MAX)
+            .into_iter()
+            .filter(|e| e.tag("aspect") == Some("capability"))
+            .collect();
+        let mut ctx: std::collections::HashMap<H32, Ctx> = Default::default();
+        for rt in &ratings {
+            let Some(rid) = rt.tag("e").and_then(H32::from_hex) else { continue };
+            let Some(res) = st.get(&rid).filter(|e| e.kind == K_JOB_RESULT) else { continue };
+            let req = res.tag("e").and_then(H32::from_hex).and_then(|i| st.get(&i).cloned());
+            let cap = param(res, "capability").or(req.as_deref().and_then(|q| param(q, "capability"))).unwrap_or("").to_string();
+            let comm = req.as_deref().and_then(|q| q.community()).map(String::from);
+            ctx.insert(rid, (res.pubkey, res.tag("p").and_then(H32::from_hex), cap, comm));
+        }
+        (ratings, ctx)
+    };
+    let mut reps: std::collections::HashMap<String, Arc<RepTable>> = Default::default();
+    for (_, _, _, c) in ctx.values() {
+        if let Some(c) = c
+            && !reps.contains_key(c)
+        {
+            reps.insert(c.clone(), node.reputation(c));
+        }
+    }
+    let ctx_of = |r: &rep::Rating| r.event.and_then(|e| ctx.get(&e));
+    let table = Arc::new(rep::capability_scores(
+        &ratings,
+        |r| ctx_of(r).is_some_and(|(prov, req, cap, _)| *prov == r.target && *req == Some(r.rater) && r.aspect == Aspect::Capability(cap.clone())),
+        |r| ctx_of(r).and_then(|c| c.3.as_ref()).map(|c| rep::weight(reps[c].user(&r.rater))).unwrap_or(1.0),
+    ));
+    *node.cap_cache.lock().unwrap() = Some(table.clone());
+    table
+}
+
+/// Publish (or withdraw) a capability: a NIP-89 announcement, replaceable per id.
+async fn set_capability(node: &Arc<Node>, c: CapabilitySpec) -> R<Ack> {
+    let id = slug(&c.id).map_err(|_| "capability 'id' must be 1-64 chars of a-z 0-9 - _ .".to_string())?;
+    let mut tags = vec![t("d", &id), t("k", K_JOB.to_string())];
+    if c.delete {
+        tags.push(t("status", "withdrawn"));
+        let e = node.publish(K_CAPABILITY, tags, "{}".into())?;
+        return Ok(ack(Some(&e.id)));
+    }
+    if c.name.trim().is_empty() {
+        return Err("missing 'name'".into());
+    }
+    let kind = match c.kind.trim() {
+        "tool" => "tool",
+        "skill" | "" => "skill",
+        other => return Err(format!("'kind' must be tool or skill, not '{other}'")),
+    };
+    let schema = match c.input_schema.trim() {
+        "" => serde_json::Value::Null,
+        s => {
+            let v: serde_json::Value = serde_json::from_str(s).map_err(|e| format!("'input_schema' is not JSON: {e}"))?;
+            if !v.is_object() {
+                return Err("'input_schema' must be a JSON Schema object".into());
+            }
+            v
+        }
+    };
+    for tp in c.topics.iter().map(|x| x.trim()).filter(|x| !x.is_empty()).take(20) {
+        tags.push(t("t", tp.to_lowercase().chars().take(50).collect::<String>()));
+    }
+    for cm in c.communities.iter().filter(|x| !x.trim().is_empty()).take(10) {
+        tags.push(t("c", slug(cm)?));
+    }
+    let content = serde_json::json!({
+        "name": c.name.trim().chars().take(100).collect::<String>(),
+        "about": c.about.chars().take(4000).collect::<String>(),
+        "kind": kind,
+        "input_schema": schema,
+    });
+    let e = node.publish(K_CAPABILITY, tags, content.to_string())?;
+    Ok(ack(Some(&e.id)))
+}
+
+/// Find capabilities: by need (free text), provider, community or kind.
+async fn capabilities(node: &Arc<Node>, r: CapabilitiesRequest) -> R<CapabilitiesResponse> {
+    let q = r.query.trim().to_string();
+    let provider = match opt_slug(&r.provider) {
+        Some(p) => Some(parse_pubkey(p).ok_or("bad 'provider' pubkey")?),
+        None => None,
+    };
+    let community = opt_slug(&r.community).map(slug).transpose()?;
+    let limit = if r.limit == 0 { 30 } else { r.limit.min(200) } as usize;
+    if r.network {
+        if !q.is_empty() {
+            let f = Filter { kinds: Some(vec![K_CAPABILITY]), search: Some(q.clone()), limit: Some(100), ..Default::default() };
+            node.remote_search(vec![f], 1).await;
+        } else if let Some(p) = provider {
+            let f = Filter { kinds: Some(vec![K_CAPABILITY]), authors: Some(vec![p.hex()]), ..Default::default() };
+            node.remote_fetch(vec![f], Duration::from_secs(3)).await;
+        }
+    }
+    let scores = cap_scores(node);
+    let st = node.store.lock().unwrap();
+    let matches: std::collections::HashMap<H32, f64> = if q.is_empty() {
+        Default::default()
+    } else {
+        st.search(&q, 2000).into_iter().map(|h| (h.id, h.score * if h.all { 1.0 } else { 0.4 })).collect()
+    };
+    let stats = cap_stats(&st);
+    let mut out: Vec<(f64, Capability)> = vec![];
+    for e in st.query(&Filter { kinds: Some(vec![K_CAPABILITY]), ..Default::default() }, usize::MAX) {
+        let Some(spec) = spec_of(&e) else { continue };
+        if provider.is_some_and(|p| p != e.pubkey)
+            || community.as_ref().is_some_and(|c| !spec.communities.contains(c))
+            || (!r.kind.trim().is_empty() && spec.kind != r.kind.trim())
+        {
+            continue;
+        }
+        let m = matches.get(&e.id).copied().unwrap_or(0.0);
+        if !q.is_empty() && m == 0.0 {
+            continue;
+        }
+        let key = (e.pubkey, spec.id.clone());
+        let (rep, raters) = scores.get(&key).copied().unwrap_or((0.0, 0));
+        let s = stats.get(&key).copied().unwrap_or_default();
+        let profile = profile_of(&st, &e.pubkey);
+        let quality = 1.0 + rep.max(-9.0) / 10.0 + (1.0 + s.completed as f64).ln() / 4.0;
+        let rank = if q.is_empty() { quality } else { m * quality };
+        out.push((
+            rank,
+            Capability {
+                provider: e.pubkey.hex(),
+                provider_name: name_of(&st, &e.pubkey),
+                provider_is_agent: profile.agent,
+                spec: Some(spec),
+                rep: round2(rep),
+                ratings: raters as u32,
+                requests: s.requests,
+                completed: s.completed,
+                declined: s.declined,
+                avg_response_secs: if s.completed > 0 { (s.response_secs / s.completed as u64) as u32 } else { 0 },
+                updated_at: e.created_at,
+                text_match: round2(m),
+            },
+        ));
+    }
+    out.sort_by(|a, b| b.0.total_cmp(&a.0).then(b.1.updated_at.cmp(&a.1.updated_at)));
+    Ok(CapabilitiesResponse { capabilities: out.into_iter().take(limit).map(|x| x.1).collect() })
+}
+
+/// Ask a provider to use one of their capabilities: a public NIP-90 job request.
+async fn request(node: &Arc<Node>, r: JobRequest) -> R<Ack> {
+    let provider = parse_pubkey(&r.provider).ok_or("'provider' must be a pubkey or npub")?;
+    if provider == node.keys.pubkey {
+        return Err("that is your own capability".into());
+    }
+    let cap = r.capability.trim().to_string();
+    let lookup = |node: &Arc<Node>| node.store.lock().unwrap().replaceable(&provider, K_CAPABILITY, &cap).cloned();
+    let ann = match lookup(node) {
+        Some(a) => Some(a),
+        None => {
+            let f = Filter { kinds: Some(vec![K_CAPABILITY]), authors: Some(vec![provider.hex()]), tags: vec![("d".into(), vec![cap.clone()])], ..Default::default() };
+            node.remote_fetch(vec![f], Duration::from_secs(3)).await;
+            lookup(node)
+        }
+    };
+    let spec = ann.as_deref().and_then(spec_of).ok_or_else(|| format!("{} offers no capability '{cap}'", npub(&provider)))?;
+    let input_text = r.input.trim();
+    if spec.kind == "tool" {
+        let v: serde_json::Value = serde_json::from_str(if input_text.is_empty() { "{}" } else { input_text }).map_err(|e| format!("'{cap}' is a tool: 'input' must be JSON ({e})"))?;
+        if let Ok(schema) = serde_json::from_str::<serde_json::Value>(&spec.input_schema) {
+            for k in schema.get("required").and_then(|x| x.as_array()).into_iter().flatten().filter_map(|k| k.as_str()) {
+                if v.get(k).is_none() {
+                    return Err(format!("'{cap}' requires input field '{k}'"));
+                }
+            }
+        }
+    } else if input_text.is_empty() {
+        return Err("describe what you need in 'input'".into());
+    }
+    if r.input.len() > 32 * 1024 {
+        return Err("'input' is limited to 32 KiB".into());
+    }
+    let mut tags = vec![t("p", provider.hex()), vec!["param".into(), "capability".into(), cap.clone()], vec!["i".into(), r.input.clone(), "text".into()]];
+    let mut community = opt_slug(&r.community).map(slug).transpose()?;
+    if let Some(p) = opt_slug(&r.post) {
+        let pid = hex_id(p, "post")?;
+        let post = get_or_fetch(node, &pid).await.ok_or("'post' not found")?;
+        if community.is_none() {
+            community = post.community().map(String::from);
+        }
+        tags.push(vec!["i".into(), pid.hex(), "event".into()]);
+    }
+    if let Some(c) = community {
+        tags.push(t("c", c));
+    }
+    let e = node.publish(K_JOB, tags, String::new())?;
+    Ok(ack(Some(&e.id)))
+}
+
+/// Requests to me (role "provider"), my requests ("requester"), or both.
+async fn inbox(node: &Arc<Node>, r: InboxRequest) -> R<JobsResponse> {
+    let me = node.keys.pubkey;
+    let role = r.role.trim();
+    if !matches!(role, "" | "provider" | "requester") {
+        return Err("'role' must be provider or requester".into());
+    }
+    let limit = if r.limit == 0 { 50 } else { r.limit.min(500) } as usize;
+    let st = node.store.lock().unwrap();
+    let rated: std::collections::HashSet<String> = st
+        .query(&Filter { kinds: Some(vec![K_RATING]), authors: Some(vec![me.hex()]), ..Default::default() }, usize::MAX)
+        .iter()
+        .filter(|e| e.tag("aspect") == Some("capability"))
+        .filter_map(|e| e.tag("e").map(String::from))
+        .collect();
+    let mut jobs = vec![];
+    for req in st.query(&Filter { kinds: Some(vec![K_JOB]), ..Default::default() }, usize::MAX) {
+        let Some(provider) = req.tag("p").and_then(H32::from_hex) else { continue };
+        let mine = req.pubkey == me;
+        let to_me = provider == me;
+        if !(mine && role != "provider" || to_me && role != "requester") {
+            continue;
+        }
+        let j = job_state(&st, &req);
+        if !r.status.trim().is_empty() && j.status != r.status.trim() {
+            continue;
+        }
+        let result_id = j.result.as_ref().map(|e| e.id.hex()).unwrap_or_default();
+        jobs.push(Job {
+            id: req.id.hex(),
+            requester: req.pubkey.hex(),
+            requester_name: name_of(&st, &req.pubkey),
+            provider: provider.hex(),
+            provider_name: name_of(&st, &provider),
+            capability: param(&req, "capability").unwrap_or("").into(),
+            input: input(&req, "text").unwrap_or("").into(),
+            post: input(&req, "event").unwrap_or("").into(),
+            community: req.community().unwrap_or("").into(),
+            created_at: req.created_at,
+            status: j.status.into(),
+            status_text: j.text,
+            result: j.result.as_ref().map(|e| e.content.clone()).unwrap_or_default(),
+            rated: !result_id.is_empty() && rated.contains(&result_id),
+            result_id,
+            updated_at: j.updated,
+            mine,
+        });
+    }
+    jobs.sort_by_key(|j| std::cmp::Reverse(j.updated_at));
+    jobs.truncate(limit);
+    Ok(JobsResponse { jobs })
+}
+
+/// The provider answers a request: accept, decline, deliver a result, or report an error.
+async fn respond(node: &Arc<Node>, r: RespondRequest) -> R<Ack> {
+    let id = hex_id(&r.request, "request")?;
+    let req = get_or_fetch(node, &id).await.ok_or("request not found")?;
+    if req.kind != K_JOB || req.tag("p").and_then(H32::from_hex) != Some(node.keys.pubkey) {
+        return Err("that is not a request addressed to you".into());
+    }
+    let base = vec![t("e", id.hex()), t("p", req.pubkey.hex())];
+    let status = |s: &str, extra: &str| {
+        let mut tags = vec![vec!["status".to_string(), s.to_string(), extra.to_string()]];
+        tags.extend(base.clone());
+        tags
+    };
+    let e = match r.action.trim() {
+        "accept" => node.publish(K_JOB_FEEDBACK, status("processing", "accepted"), r.content)?,
+        "decline" => node.publish(K_JOB_FEEDBACK, status("error", "declined"), r.content)?,
+        "error" => node.publish(K_JOB_FEEDBACK, status("error", "failed"), r.content)?,
+        "result" => {
+            if r.content.trim().is_empty() {
+                return Err("a result needs 'content'".into());
+            }
+            let mut tags = base.clone();
+            tags.push(t("request", serde_json::to_string(&*req).unwrap()));
+            if let Some(cap) = param(&req, "capability") {
+                tags.push(vec!["param".into(), "capability".into(), cap.into()]);
+            }
+            if let Some(c) = req.community() {
+                tags.push(t("c", c));
+            }
+            node.publish(K_JOB_RESULT, tags, r.content)?
+        }
+        other => return Err(format!("unknown action '{other}': use accept, decline, result or error")),
+    };
+    Ok(ack(Some(&e.id)))
+}
+
+/// Rate a capability after receiving its result: does it deliver what it claims?
+async fn rate_capability(node: &Arc<Node>, r: RateRequest) -> R<Ack> {
+    let rid = hex_id(opt_slug(&r.event).ok_or("a capability rating cites the result you received: give 'event'")?, "event")?;
+    let res = get_or_fetch(node, &rid).await.ok_or("result not found")?;
+    if res.kind != K_JOB_RESULT {
+        return Err("'event' must be a capability result".into());
+    }
+    if res.tag("p").and_then(H32::from_hex) != Some(node.keys.pubkey) {
+        return Err("you can only rate a capability that delivered a result to you".into());
+    }
+    let cap = param(&res, "capability").map(String::from).or_else(|| opt_slug(&r.capability).map(String::from)).ok_or("unknown capability")?;
+    let provider = res.pubkey;
+    let tags = vec![
+        t("d", format!("cap:{}:{cap}", provider.hex())),
+        t("p", provider.hex()),
+        t("e", rid.hex()),
+        t("score", r.score.to_string()),
+        t("aspect", "capability"),
+        t("capability", &cap),
+    ];
+    let e = node.publish(K_RATING, tags, r.reason)?;
+    let rep = cap_scores(node).get(&(provider, cap)).map(|x| x.0).unwrap_or(0.0);
+    Ok(Ack { rep: round2(rep), ..ack(Some(&e.id)) })
 }
 
 #[cfg(test)]

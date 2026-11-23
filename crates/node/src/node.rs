@@ -122,7 +122,9 @@ pub struct Node {
 pub type CapScores = HashMap<(H32, String), (f64, usize)>;
 
 pub const ORIGIN_LOCAL: u64 = 0;
-const GLOBAL_KINDS: [u32; 5] = [K_PROFILE, K_COMMUNITY, K_RATING, K_DELETE, K_CAPABILITY];
+/// Relayed by every node, whatever it joined: small metadata, and capability
+/// jobs (so requests and results find their way through scoped nodes).
+const GLOBAL_KINDS: [u32; 8] = [K_PROFILE, K_COMMUNITY, K_RATING, K_DELETE, K_CAPABILITY, K_JOB, K_JOB_RESULT, K_JOB_FEEDBACK];
 
 impl Node {
     pub fn new(cfg: Config, keys: Keys) -> std::io::Result<Arc<Node>> {

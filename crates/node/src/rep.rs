@@ -154,24 +154,27 @@ pub fn compute(ratings: &[Ev]) -> RepTable {
 
 /// Capability reputation: per (provider, capability id), from capability ratings
 /// that `valid` accepts (the caller checks each cites a result the provider
-/// delivered to the rater), each weighted by `weight_of(rater)`.
+/// delivered to the rater), each weighted by `weight_of(rating)` (the rater's
+/// standing where the request was made).
 /// Same squashing as community reputation but on a smaller scale, so a handful
 /// of satisfied requesters is already meaningful.
-pub fn capability_scores(ratings: &[Ev], valid: impl Fn(&Rating) -> bool, weight_of: impl Fn(&H32) -> f64) -> HashMap<(H32, String), (f64, usize)> {
-    let mut votes: HashMap<(H32, String, H32), (f64, usize)> = HashMap::new();
+pub fn capability_scores(ratings: &[Ev], valid: impl Fn(&Rating) -> bool, weight_of: impl Fn(&Rating) -> f64) -> HashMap<(H32, String), (f64, usize)> {
+    let mut votes: HashMap<(H32, String, H32), (f64, usize, f64)> = HashMap::new();
     for r in ratings.iter().filter_map(|e| parse_rating(e)).filter(|r| matches!(r.aspect, Aspect::Capability(_))) {
         if !valid(&r) {
             continue;
         }
         let Aspect::Capability(c) = &r.aspect else { continue };
-        let v = votes.entry((r.target, c.clone(), r.rater)).or_insert((0.0, 0));
+        let w = weight_of(&r);
+        let v = votes.entry((r.target, c.clone(), r.rater)).or_insert((0.0, 0, 0.0));
         v.0 += r.score;
         v.1 += 1;
+        v.2 = v.2.max(w);
     }
     let mut out: HashMap<(H32, String), (f64, usize)> = HashMap::new();
-    for ((target, cap, rater), (sum, n)) in votes {
+    for ((target, cap, _), (sum, n, w)) in votes {
         let o = out.entry((target, cap)).or_insert((0.0, 0));
-        o.0 += weight_of(&rater) * sum / n as f64;
+        o.0 += w * sum / n as f64;
         o.1 += 1;
     }
     out.into_iter().map(|(k, (s, n))| (k, (10.0 * (s / 40.0).tanh(), n))).collect()
@@ -380,7 +383,7 @@ mod tests {
         assert_eq!(n, 2);
         assert!((s - 10.0 * (14.0f64 / 40.0).tanh()).abs() < 1e-9, "{s}");
         assert_eq!(t[&(provider.pubkey, "other".to_string())].1, 1);
-        let heavy = capability_scores(&rs, |r| r.rater != mallory.pubkey, |k| if *k == bob.pubkey { 4.0 } else { 1.0 });
+        let heavy = capability_scores(&rs, |r| r.rater != mallory.pubkey, |r| if r.rater == bob.pubkey { 4.0 } else { 1.0 });
         assert!(heavy[&(provider.pubkey, "ms".to_string())].0 > s);
         // capability ratings stay out of community reputation
         assert!(compute(&rs[..5]).user.is_empty());

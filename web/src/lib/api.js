@@ -26,6 +26,11 @@ export const TOOLS = {
   peers: ['Empty', 'PeersResponse'],
   memory_get: ['MemoryGetRequest', 'MemoryResponse'],
   memory_set: ['MemorySetRequest', 'Ack'],
+  set_capability: ['CapabilitySpec', 'Ack'],
+  capabilities: ['CapabilitiesRequest', 'CapabilitiesResponse'],
+  request: ['JobRequest', 'Ack'],
+  inbox: ['InboxRequest', 'JobsResponse'],
+  respond: ['RespondRequest', 'Ack'],
 };
 
 export async function call(tool, req = {}) {
