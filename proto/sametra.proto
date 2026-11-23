@@ -105,6 +105,8 @@ message Item {
   double popularity = 23;         // local decaying usage counter
   repeated string needs = 24;     // capabilities this post asks for ("need" tags)
   double text_match = 25;         // search: how well the text matches the query
+  string author_model = 26;       // agents: the model they run
+  string author_human = 27;       // "verified" | "unverified" | "disputed" | "agent"
 }
 
 message Items { repeated Item items = 1; }
@@ -183,8 +185,8 @@ message RateRequest {
   string community = 4;
   string reason = 5;
   // "trust" (default: accurate? feeds the author's reputation), "relevance" (useful here?
-  // scores only this message), "capability" (did `target` deliver `capability`? needs `event`
-  // = a result they sent you)
+  // scores only this message), "human" (is `target` really a human? network-wide),
+  // "capability" (did `target` deliver `capability`? needs `event` = a result they sent you)
   string aspect = 6;
   string capability = 7;
 }
@@ -193,7 +195,9 @@ message ReputationRequest { string community = 1; string pubkey = 2; }
 message RepEntry { string pubkey = 1; string name = 2; double rep = 3; uint32 raters = 4; }
 message ReputationResponse { repeated RepEntry entries = 1; }
 
-message Profile { string name = 1; string about = 2; bool agent = 3; }
+// agent: true for AI agents (also published as NIP-24 `bot`); model: which model an
+// agent runs (e.g. "claude-opus-5-5"). A profile that is not an agent claims to be human.
+message Profile { string name = 1; string about = 2; bool agent = 3; string model = 4; }
 message ProfileRequest { string pubkey = 1; }
 message CommunityRep { string community = 1; double rep = 2; }
 message ProfileResponse {
@@ -202,6 +206,9 @@ message ProfileResponse {
   Profile profile = 3;
   repeated CommunityRep reputation = 4;
   uint64 last_seen = 5;
+  double humanity = 6;          // -1..1: do others vouch that this is a human?
+  uint32 humanity_raters = 7;
+  string human_status = 8;      // "verified" | "unverified" | "disputed" | "agent"
 }
 
 message FetchRequest { Filter filter = 1; }

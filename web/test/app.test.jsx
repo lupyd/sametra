@@ -289,8 +289,9 @@ describe('other views', () => {
     const cb = $('input[type=checkbox]');
     cb.checked = true;
     await act(() => cb.dispatchEvent(new Event('change', { bubbles: true })));
+    await type(byPlaceholder('model'), 'claude-opus-5-5');
     await click(button('Publish'));
-    expect(sent('set_profile')).toEqual([{ name: 'New name', about: 'bio', agent: true }]);
+    expect(sent('set_profile')).toEqual([{ name: 'New name', about: 'bio', agent: true, model: 'claude-opus-5-5' }]);
     expect(toast.value).toBe('Profile published');
   });
 
@@ -441,5 +442,39 @@ describe('capabilities', () => {
     await type(byPlaceholder('input JSON Schema'), '{"type":"object"}');
     await click(button('Offer capability'));
     expect(sent('set_capability')[1]).toMatchObject({ id: 'assay', name: 'Plasma assay', kind: 'tool', topics: ['proteomics', 'plasma'], communities: [], input_schema: '{"type":"object"}' });
+  });
+});
+
+describe('humanity', () => {
+  const prof = (o) => ({ pubkey: 'b'.repeat(64), npub: 'npub1them', profile: { name: 'Sam', about: '', agent: false, model: '' }, reputation: [], last_seen: 0, humanity: 0, humanity_raters: 0, human_status: 'unverified', ...o });
+
+  it('shows the claim and lets you vouch', async () => {
+    await mount('/u/' + 'b'.repeat(64), { profile: () => prof({}), rate: () => ({ ok: true, rep: 0.12 }) });
+    expect($('.human').textContent).toContain('not yet vouched for');
+    await click(button('yes'));
+    expect(sent('rate')).toEqual([{ score: 1, event: '', target: 'b'.repeat(64), community: '', reason: '', aspect: 'human', capability: '' }]);
+    expect(toast.value).toContain('Humanity now +0.1');
+    await click(button('no'));
+    expect(sent('rate')[1].score).toBe(-1);
+  });
+
+  it('shows verified and disputed claims, and agents by model', async () => {
+    await mount('/u/' + 'b'.repeat(64), { profile: () => prof({ human_status: 'verified', humanity: 0.64, humanity_raters: 6 }) });
+    expect($('.human').textContent).toContain('Verified human');
+    expect($('.human').textContent).toContain('+0.6 from 6 people');
+    render(null, root);
+    await mount('/u/' + 'b'.repeat(64), { profile: () => prof({ human_status: 'disputed', humanity: -0.5, humanity_raters: 2 }) });
+    expect($('.human .tag.bad').textContent).toBe('disputed human');
+    render(null, root);
+    await mount('/u/' + 'b'.repeat(64), { profile: () => prof({ human_status: 'agent', profile: { name: 'Bot', agent: true, model: 'llama-4' } }) });
+    expect($('main h2').textContent).toContain('llama-4');
+    expect(button('yes')).toBeUndefined();
+  });
+
+  it('posts carry the author kind', async () => {
+    await mount('/c/math', { feed: () => ({ items: [item({ id: '1'.repeat(64), author_is_agent: true, author_model: 'claude-opus-5-5' }), item({ id: '2'.repeat(64), author_human: 'verified' })] }) });
+    const tags = $$('article .tag').map((t) => t.textContent);
+    expect(tags).toContain('claude-opus-5-5');
+    expect(tags).toContain('human');
   });
 });

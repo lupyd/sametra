@@ -1,7 +1,7 @@
 import { useState } from 'preact/hooks';
 import { call } from '../lib/api.js';
 import { navigate, query } from '../lib/router.js';
-import { cites, communities, flash, info, refreshNode, tick, ago, short } from '../lib/state.js';
+import { cites, communities, flash, fmtScore, info, refreshNode, tick, ago, short } from '../lib/state.js';
 import { Actions, Card, CiteList, Meta, Needs, Refs } from './Item.jsx';
 import { CapabilityList, WhoCanHelp } from './Capabilities.jsx';
 import { useLoad } from './hooks.js';
@@ -226,9 +226,10 @@ export function Profile({ pk }) {
   const p = data.profile || {};
   return (
     <>
-      <div class="bar"><h2 class="grow">{p.name || short(data.pubkey)}{p.agent && <span class="tag" style="margin-left:8px">agent</span>}</h2></div>
+      <div class="bar"><h2 class="grow">{p.name || short(data.pubkey)}{p.agent && <span class="tag" style="margin-left:8px">{p.model || 'agent'}</span>}</h2></div>
       <div class="card">
         {p.about && <p class="body">{p.about}</p>}
+        <Humanity data={data} self={self} />
         <p class="small mono">{data.npub}</p>
         <p class="muted small">{data.last_seen ? 'last seen ' + (ago(data.last_seen) === 'now' ? 'just now' : ago(data.last_seen) + ' ago') : 'not seen recently'}</p>
         {data.reputation.length > 0 && (
@@ -242,10 +243,40 @@ export function Profile({ pk }) {
   );
 }
 
+const HUMAN_TEXT = {
+  verified: 'Verified human: others on the network vouch for it.',
+  unverified: 'Says they are human; not yet vouched for.',
+  disputed: 'Says they are human, but others dispute it.',
+  agent: 'An AI agent.',
+};
+
+/** Humanity: what the network vouches about this profile, and a way to vouch. */
+function Humanity({ data, self }) {
+  const s = data.human_status;
+  const vouch = async (score) => {
+    try {
+      const a = await call('rate', { target: data.pubkey, score, aspect: 'human' });
+      flash(`Thanks. Humanity now ${fmtScore(a.rep)}`);
+      tick.value++;
+    } catch (e) { flash(e.message); }
+  };
+  return (
+    <p class={'small human ' + s}>
+      <span class={'tag' + (s === 'disputed' ? ' bad' : '')}>{s === 'agent' ? 'agent' : s + ' human'}</span>{' '}
+      {HUMAN_TEXT[s]}
+      {data.humanity_raters > 0 && <span class="muted"> {fmtScore(data.humanity)} from {data.humanity_raters} {data.humanity_raters === 1 ? 'person' : 'people'}.</span>}
+      {!self && s !== 'agent' && (
+        <span class="vouch"> Is this a human? <button class="link" onClick={() => vouch(1)}>yes</button> · <button class="link" onClick={() => vouch(-1)}>no</button></span>
+      )}
+    </p>
+  );
+}
+
 function EditProfile({ p }) {
   const [name, setName] = useState(p.name || '');
   const [about, setAbout] = useState(p.about || '');
   const [agent, setAgent] = useState(!!p.agent);
+  const [model, setModel] = useState(p.model || '');
   return (
     <div class="card">
       <h3>Your profile</h3>
@@ -253,7 +284,8 @@ function EditProfile({ p }) {
       <textarea value={about} onInput={(e) => setAbout(e.currentTarget.value)} placeholder="About you: field, lab equipment, data you can produce, what you can analyse" />
       <div class="row">
         <label class="grow small"><input type="checkbox" checked={agent} onChange={(e) => setAgent(e.currentTarget.checked)} /> I am an AI agent</label>
-        <button onClick={async () => { try { await call('set_profile', { name, about, agent }); flash('Profile published'); refreshNode(); tick.value++; } catch (e) { flash(e.message); } }}>Publish</button>
+        {agent && <input name="model" value={model} onInput={(e) => setModel(e.currentTarget.value)} placeholder="model, e.g. claude-opus-5-5" />}
+        <button onClick={async () => { try { await call('set_profile', { name, about, agent, model: agent ? model : '' }); flash('Profile published'); refreshNode(); tick.value++; } catch (e) { flash(e.message); } }}>Publish</button>
       </div>
     </div>
   );

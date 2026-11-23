@@ -241,12 +241,12 @@ async fn rating_and_reputation() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn profiles() {
     let n = spawn(|_| {}).await;
-    let a: pb::Ack = n.ok("set_profile", &pb::Profile { name: "  Lab bot ".into(), about: "runs assays".into(), agent: true }).await;
+    let a: pb::Ack = n.ok("set_profile", &pb::Profile { name: "  Lab bot ".into(), about: "runs assays".into(), agent: true, ..Default::default() }).await;
     assert!(a.ok);
     let p: pb::ProfileResponse = n.ok("profile", &pb::ProfileRequest::default()).await;
     assert_eq!(p.pubkey, n.node.keys.pubkey.hex());
     assert_eq!(p.npub, n.node.keys.npub());
-    assert_eq!(p.profile.clone().unwrap(), pb::Profile { name: "Lab bot".into(), about: "runs assays".into(), agent: true });
+    assert_eq!(p.profile.clone().unwrap(), pb::Profile { name: "Lab bot".into(), about: "runs assays".into(), agent: true, ..Default::default() });
     assert!(p.last_seen + 5 >= now());
     let i: pb::InfoResponse = n.ok("info", &E).await;
     assert_eq!(i.name, "Lab bot");
@@ -477,4 +477,60 @@ async fn find_communities_by_topic() {
     assert_eq!(order, ["cancer-data", "onco", "nt"], "empty query: most active first (30 posts > 1 member > nothing)");
     let none: pb::CommunitiesResponse = n.ok("find_communities", &f("zebrafish")).await;
     assert!(none.communities.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn humanity_verifies_human_claims_and_agents_name_models() {
+    let n = spawn(|_| {}).await;
+    let (alice, bot) = (Keys::generate(), Keys::generate());
+    n.node.ingest(alice.sign(K_PROFILE, vec![], r#"{"name":"Alice"}"#.into()), 9, false).unwrap();
+    n.node.ingest(bot.sign(K_PROFILE, vec![], r#"{"name":"Totally human"}"#.into()), 9, false).unwrap();
+    let prof = |pk: &Keys| pb::ProfileRequest { pubkey: pk.npub() };
+    let p: pb::ProfileResponse = n.ok("profile", &prof(&alice)).await;
+    assert_eq!((p.human_status.as_str(), p.humanity, p.humanity_raters), ("unverified", 0.0, 0), "claims are unverified until vouched");
+
+    // people vouch: six for alice, five dispute the "human" who is a bot
+    let human = |rater: &Keys, target: &Keys, score: &str| {
+        rater.sign(K_RATING, tags(&[&["d", &format!("human:{}", target.pubkey.hex())], &["p", &target.pubkey.hex()], &["score", score], &["aspect", "human"]]), String::new())
+    };
+    for _ in 0..6 {
+        n.node.ingest(human(&Keys::generate(), &alice, "1"), 9, false).unwrap();
+    }
+    for _ in 0..5 {
+        n.node.ingest(human(&Keys::generate(), &bot, "-1"), 9, false).unwrap();
+    }
+    let p: pb::ProfileResponse = n.ok("profile", &prof(&alice)).await;
+    assert_eq!(p.human_status, "verified");
+    assert!(p.humanity > 0.3 && p.humanity_raters == 6);
+    let b: pb::ProfileResponse = n.ok("profile", &prof(&bot)).await;
+    assert_eq!(b.human_status, "disputed");
+    // the node itself vouches through the API
+    let carol = Keys::generate();
+    let a: pb::Ack = n.ok("rate", &pb::RateRequest { score: 1.0, target: carol.npub(), aspect: "human".into(), reason: "met at the lab".into(), ..Default::default() }).await;
+    assert!(a.rep > 0.0);
+    assert!(n.err("rate", &pb::RateRequest { score: 1.0, target: n.node.keys.npub(), aspect: "human".into(), ..Default::default() }).await.1.contains("yourself"));
+    assert!(n.err("rate", &pb::RateRequest { score: 1.0, event: "ab".repeat(32), aspect: "human".into(), ..Default::default() }).await.1.contains("person"));
+    // humanity is network-wide and separate from community reputation
+    let lb: pb::ReputationResponse = n.ok("reputation", &pb::ReputationRequest { community: "m".into(), pubkey: alice.npub() }).await;
+    assert_eq!(lb.entries[0].rep, 0.0);
+
+    // agents say so, and which model they run; items carry both
+    n.ok::<_, pb::Ack>("set_profile", &pb::Profile { name: "Analyst".into(), agent: true, model: " claude-opus-5-5 ".into(), ..Default::default() }).await;
+    let me: pb::ProfileResponse = n.ok("profile", &pb::ProfileRequest::default()).await;
+    assert_eq!(me.human_status, "agent");
+    assert_eq!(me.profile.unwrap().model, "claude-opus-5-5");
+    let mine: pb::Ack = n.ok("post", &post("m", "Hypothesis", "step 1")).await;
+    n.node.ingest(alice.sign(K_REPLY, tags(&[&["c", "m"], &["e", &mine.id, "", "root"], &["e", &mine.id, "", "reply"]]), "step 2".into()), 9, false).unwrap();
+    let t: pb::ThreadResponse = n.ok("thread", &id(&mine.id)).await;
+    let root = t.root.unwrap();
+    assert_eq!((root.author_human.as_str(), root.author_model.as_str()), ("agent", "claude-opus-5-5"));
+    assert_eq!(root.replies[0].author_human, "verified");
+    // a human profile never carries a model; NIP-24 `bot` from other clients counts as agent
+    n.ok::<_, pb::Ack>("set_profile", &pb::Profile { name: "Me again".into(), agent: false, model: "x".into(), ..Default::default() }).await;
+    let me: pb::ProfileResponse = n.ok("profile", &pb::ProfileRequest::default()).await;
+    assert!(me.profile.unwrap().model.is_empty());
+    let other_client = Keys::generate();
+    n.node.ingest(other_client.sign(K_PROFILE, vec![], r#"{"name":"relay bot","bot":true}"#.into()), 9, false).unwrap();
+    let o: pb::ProfileResponse = n.ok("profile", &prof(&other_client)).await;
+    assert_eq!(o.human_status, "agent");
 }

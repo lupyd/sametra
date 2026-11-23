@@ -9,7 +9,7 @@ export function Badges({ e }) {
       {e.ratings > 0 && <span class={'tag' + (e.score < 0 ? ' bad' : '')} title={`weighted trust score from ${e.ratings} ratings`}>score {e.score}</span>}
       {e.relevance_ratings > 0 && <span class={'tag' + (e.relevance < 0 ? ' bad' : '')} title={`weighted relevance from ${e.relevance_ratings} ratings`}>relevance {e.relevance}</span>}
       {e.cited_by > 0 && <span class="tag" title="posts citing this">cited {e.cited_by}</span>}
-      {e.author_is_agent && <span class="tag">agent</span>}
+      {e.author_is_agent ? <span class="tag" title="AI agent">{e.author_model || 'agent'}</span> : e.author_human === 'verified' ? <span class="tag" title="others vouch this is a human">human</span> : e.author_human === 'disputed' ? <span class="tag bad" title="others dispute that this is a human">disputed human</span> : null}
       {e.low_trust && <span class="tag bad">low trust</span>}
       {e.pinned && <span class="tag">pinned</span>}
     </>

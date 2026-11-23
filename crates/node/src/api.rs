@@ -68,14 +68,50 @@ fn profile_of(st: &Store, pk: &H32) -> Profile {
         return Profile::default();
     };
     let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").chars().take(2000).collect::<String>();
-    Profile { name: s("name").chars().take(64).collect(), about: s("about"), agent: v.get("agent").and_then(|x| x.as_bool()).unwrap_or(false) }
+    let flag = |k: &str| v.get(k).and_then(|x| x.as_bool()).unwrap_or(false);
+    Profile {
+        name: s("name").chars().take(64).collect(),
+        about: s("about"),
+        agent: flag("agent") || flag("bot"), // NIP-24 `bot` from other nostr clients
+        model: s("model").chars().take(100).collect(),
+    }
+}
+
+/// Per-request context for building items: who is asking, and humanity scores.
+pub struct Cx {
+    pub me: H32,
+    pub hum: Arc<RepTable>,
+}
+impl Cx {
+    /// Build before locking the store (computing humanity locks it).
+    fn of(node: &Arc<Node>) -> Cx {
+        Cx { me: node.keys.pubkey, hum: node.humanity() }
+    }
+}
+
+/// At or above this humanity a participant counts as a verified human; at or below
+/// minus this, their claim is disputed.
+pub const HUMAN_VERIFIED: f64 = 0.3;
+
+fn human_status(st: &Store, hum: &RepTable, pk: &H32) -> &'static str {
+    if profile_of(st, pk).agent {
+        return "agent";
+    }
+    let h = hum.user(pk);
+    if h >= HUMAN_VERIFIED {
+        "verified"
+    } else if h <= -HUMAN_VERIFIED {
+        "disputed"
+    } else {
+        "unverified"
+    }
 }
 fn name_of(st: &Store, pk: &H32) -> String {
     let n = profile_of(st, pk).name;
     if n.is_empty() { npub(pk)[..14].to_string() } else { n }
 }
 
-fn view(st: &Store, rep: &RepTable, e: &Event, full: bool, me: &H32) -> Item {
+fn view(st: &Store, rep: &RepTable, e: &Event, full: bool, cx: &Cx) -> Item {
     let author_rep = rep.user(&e.pubkey);
     let score = rep.event(&e.id);
     let content = if full || e.content.len() <= 600 {
@@ -93,6 +129,8 @@ fn view(st: &Store, rep: &RepTable, e: &Event, full: bool, me: &H32) -> Item {
         author: e.pubkey.hex(),
         author_name: name_of(st, &e.pubkey),
         author_is_agent: profile_of(st, &e.pubkey).agent,
+        author_model: profile_of(st, &e.pubkey).model,
+        author_human: human_status(st, &cx.hum, &e.pubkey).into(),
         author_rep: round2(author_rep),
         score: round2(score),
         ratings: rep.event.get(&e.id).map(|x| x.1 as u32).unwrap_or(0),
@@ -104,7 +142,7 @@ fn view(st: &Store, rep: &RepTable, e: &Event, full: bool, me: &H32) -> Item {
         parent: e.parent().filter(|_| e.kind == K_REPLY).map(|p| p.hex()).unwrap_or_default(),
         refs: e.tags_named("q").map(String::from).collect(),
         pinned: st.pinned.contains(&e.id),
-        mine: e.pubkey == *me,
+        mine: e.pubkey == cx.me,
         reply_count: 0,
         replies: vec![],
         relevance: round2(rep.relevance(&e.id)),
@@ -137,8 +175,8 @@ fn check_score(s: f64) -> R<()> {
     if s.is_finite() && (-1.0..=1.0).contains(&s) { Ok(()) } else { Err("score must be in -1..1".into()) }
 }
 
-fn tree(st: &Store, rep: &RepTable, e: &Ev, depth: usize, budget: &mut usize, me: &H32) -> Item {
-    let mut v = view(st, rep, e, true, me);
+fn tree(st: &Store, rep: &RepTable, e: &Ev, depth: usize, budget: &mut usize, cx: &Cx) -> Item {
+    let mut v = view(st, rep, e, true, cx);
     let mut kids = st.children(&e.id);
     kids.sort_by(|a, b| rank(rep, b, 0, st.cited_by(&b.id)).total_cmp(&rank(rep, a, 0, st.cited_by(&a.id))));
     for k in kids {
@@ -146,7 +184,7 @@ fn tree(st: &Store, rep: &RepTable, e: &Ev, depth: usize, budget: &mut usize, me
             break;
         }
         *budget -= 1;
-        v.replies.push(tree(st, rep, &k, depth + 1, budget, me));
+        v.replies.push(tree(st, rep, &k, depth + 1, budget, cx));
     }
     v.reply_count = v.replies.iter().map(|r| 1 + r.reply_count).sum();
     v
@@ -283,14 +321,14 @@ async fn feed(node: &Arc<Node>, r: FeedRequest) -> R<Items> {
     let c = slug(&r.community)?;
     let limit = if r.limit == 0 { 30 } else { r.limit.min(500) } as usize;
     let rep = node.reputation(&c);
-    let me = node.keys.pubkey;
+    let cx = Cx::of(node);
     let st = node.store.lock().unwrap();
     let mut items: Vec<(f64, Item)> = st
         .query(&c_filter(Some(vec![K_POST]), &c), 5000)
         .iter()
         .map(|e| {
             let n = st.descendant_count(&e.id, 10_000);
-            let mut v = view(&st, &rep, e, false, &me);
+            let mut v = view(&st, &rep, e, false, &cx);
             v.reply_count = n as u32;
             (if r.sort == "new" { e.created_at as f64 } else { rank(&rep, e, n, v.cited_by as usize) }, v)
         })
@@ -308,14 +346,14 @@ async fn thread(node: &Arc<Node>, r: IdRequest) -> R<ThreadResponse> {
         node.remote_fetch(vec![f], Duration::from_millis(1500)).await;
     }
     let rep = node.reputation(root.community().unwrap_or(""));
-    let me = node.keys.pubkey;
+    let cx = Cx::of(node);
     let st = node.store.lock().unwrap();
     let mut budget = 5000;
     let idh = id.hex();
     Ok(ThreadResponse {
-        root: Some(tree(&st, &rep, &root, 0, &mut budget, &me)),
-        quoted_by: st.referencing(&id).iter().filter(|e| e.tags_named("q").any(|q| q == idh)).map(|e| view(&st, &rep, e, false, &me)).collect(),
-        ref_events: root.tags_named("q").filter_map(H32::from_hex).filter_map(|r| st.get(&r).map(|e| view(&st, &rep, e, false, &me))).collect(),
+        root: Some(tree(&st, &rep, &root, 0, &mut budget, &cx)),
+        quoted_by: st.referencing(&id).iter().filter(|e| e.tags_named("q").any(|q| q == idh)).map(|e| view(&st, &rep, e, false, &cx)).collect(),
+        ref_events: root.tags_named("q").filter_map(H32::from_hex).filter_map(|r| st.get(&r).map(|e| view(&st, &rep, e, false, &cx))).collect(),
         thread_root: root.root().filter(|r| *r != root.id && root.kind == K_REPLY).map(|r| r.hex()).unwrap_or_default(),
     })
 }
@@ -325,8 +363,9 @@ async fn event(node: &Arc<Node>, r: IdRequest) -> R<EventResponse> {
     let e = get_or_fetch(node, &id).await.ok_or("event not found")?;
     node.store.lock().unwrap().bump(&id, 1.0); // viewed
     let rep = node.reputation(e.community().unwrap_or(""));
+    let cx = Cx::of(node);
     let st = node.store.lock().unwrap();
-    Ok(EventResponse { item: Some(view(&st, &rep, &e, true, &node.keys.pubkey)), raw_json: serde_json::to_string(&*e).unwrap() })
+    Ok(EventResponse { item: Some(view(&st, &rep, &e, true, &cx)), raw_json: serde_json::to_string(&*e).unwrap() })
 }
 
 /// Full-text search. `scope`: "node" (this node's cache, default), "community"
@@ -378,12 +417,13 @@ async fn search(node: &Arc<Node>, r: SearchRequest) -> R<Items> {
             v.insert(t);
         }
     }
+    let cx = Cx::of(node);
     let mut st = node.store.lock().unwrap();
     let mut items: Vec<(f64, Item)> = hits
         .iter()
         .map(|(e, m)| {
             let rep = &reps[e.community().unwrap_or("")];
-            let mut v = view(&st, rep, e, false, &node.keys.pubkey);
+            let mut v = view(&st, rep, e, false, &cx);
             let quality = (v.relevance + v.score + 0.5 * v.author_rep + 0.3 * (1.0 + v.cited_by as f64).ln() + 0.2 * (1.0 + v.popularity).ln()).max(0.0);
             let score = m * (1.0 + quality) * if v.low_trust { 0.5 } else { 1.0 };
             v.text_match = round2(*m);
@@ -442,7 +482,8 @@ async fn rate(node: &Arc<Node>, r: RateRequest) -> R<Ack> {
         "" | "trust" => "trust",
         "relevance" => "relevance",
         "capability" => return rate_capability(node, r).await,
-        other => return Err(format!("unknown aspect '{other}': use trust, relevance or capability")),
+        "human" => return rate_human(node, r).await,
+        other => return Err(format!("unknown aspect '{other}': use trust, relevance, human or capability")),
     };
     if aspect == "relevance" && opt_slug(&r.event).is_none() {
         return Err("relevance rates a message: give 'event'".into());
@@ -505,6 +546,7 @@ async fn profile(node: &Arc<Node>, r: ProfileRequest) -> R<ProfileResponse> {
             reputation.push(CommunityRep { rep: round2(t.user(&pk)), community: c });
         }
     }
+    let hum = node.humanity();
     let st = node.store.lock().unwrap();
     Ok(ProfileResponse {
         pubkey: pk.hex(),
@@ -512,6 +554,9 @@ async fn profile(node: &Arc<Node>, r: ProfileRequest) -> R<ProfileResponse> {
         profile: Some(profile_of(&st, &pk)),
         reputation,
         last_seen: st.last_seen.get(&pk).copied().unwrap_or(0),
+        humanity: round2(hum.user(&pk)),
+        humanity_raters: hum.raters.get(&pk).copied().unwrap_or(0) as u32,
+        human_status: human_status(&st, &hum, &pk).into(),
     })
 }
 
@@ -520,7 +565,14 @@ async fn set_profile(node: &Arc<Node>, p: Profile) -> R<Ack> {
         return Err("missing 'name'".into());
     }
     // kind 0 content stays NIP-01 JSON so other nostr clients can read it
-    let content = serde_json::json!({"name": p.name.trim(), "about": p.about, "agent": p.agent}).to_string();
+    let content = serde_json::json!({
+        "name": p.name.trim(),
+        "about": p.about,
+        "agent": p.agent,
+        "bot": p.agent, // NIP-24, so other nostr clients see it too
+        "model": if p.agent { p.model.trim().chars().take(100).collect::<String>() } else { String::new() },
+    })
+    .to_string();
     let e = node.publish(K_PROFILE, vec![], content)?;
     Ok(ack(Some(&e.id)))
 }
@@ -569,9 +621,10 @@ async fn delete(node: &Arc<Node>, r: IdRequest) -> R<Ack> {
 async fn fetch(node: &Arc<Node>, r: FetchRequest) -> R<Items> {
     let f = Filter::from_pb(&r.filter.ok_or("missing 'filter'")?);
     let evs = node.remote_fetch(vec![f], Duration::from_secs(4)).await;
+    let cx = Cx::of(node);
     let st = node.store.lock().unwrap();
     let empty = RepTable::default();
-    Ok(Items { items: evs.iter().take(500).map(|e| view(&st, &empty, e, false, &node.keys.pubkey)).collect() })
+    Ok(Items { items: evs.iter().take(500).map(|e| view(&st, &empty, e, false, &cx)).collect() })
 }
 
 async fn memory_get(node: &Arc<Node>, r: MemoryGetRequest) -> R<MemoryResponse> {
@@ -985,6 +1038,20 @@ async fn respond(node: &Arc<Node>, r: RespondRequest) -> R<Ack> {
     Ok(ack(Some(&e.id)))
 }
 
+/// Vouch (or not) that a participant is a human: network-wide, not per community.
+async fn rate_human(node: &Arc<Node>, r: RateRequest) -> R<Ack> {
+    if opt_slug(&r.event).is_some() {
+        return Err("humanity rates a person: give 'target', not 'event'".into());
+    }
+    let target = parse_pubkey(&r.target).ok_or("give 'target' (pubkey/npub) of the person")?;
+    if target == node.keys.pubkey {
+        return Err("you cannot rate yourself".into());
+    }
+    let tags = vec![t("d", format!("human:{}", target.hex())), t("p", target.hex()), t("score", score_tag(r.score)), t("aspect", "human")];
+    let e = node.publish(K_RATING, tags, r.reason)?;
+    Ok(Ack { rep: round2(node.humanity().user(&target)), ..ack(Some(&e.id)) })
+}
+
 /// Rate a capability after receiving its result: does it deliver what it claims?
 async fn rate_capability(node: &Arc<Node>, r: RateRequest) -> R<Ack> {
     check_score(r.score)?;
@@ -1022,6 +1089,10 @@ mod tests {
         let data = std::env::temp_dir().join(format!("sametra-api-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&data);
         Node::new(Config { data, ..Default::default() }, Keys::generate()).unwrap()
+    }
+
+    fn test_cx(n: &Arc<Node>) -> Cx {
+        Cx { me: n.keys.pubkey, hum: Default::default() }
     }
 
     #[test]
@@ -1074,18 +1145,18 @@ mod tests {
         let body = "é".repeat(400); // 800 bytes, 2 per char
         let e = k.sign(K_POST, vec![t("c", "m"), t("title", "T"), t("q", "ab".repeat(32))], body.clone());
         let st = n.store.lock().unwrap();
-        let short = view(&st, &RepTable::default(), &e, false, &n.keys.pubkey);
+        let short = view(&st, &RepTable::default(), &e, false, &test_cx(&n));
         assert!(short.content.ends_with('…') && short.content.len() <= 603);
-        assert_eq!(view(&st, &RepTable::default(), &e, true, &n.keys.pubkey).content, body);
+        assert_eq!(view(&st, &RepTable::default(), &e, true, &test_cx(&n)).content, body);
         assert_eq!((short.title.as_str(), short.community.as_str(), short.refs.len()), ("T", "m", 1));
         assert!(!short.mine && !short.low_trust && short.parent.is_empty());
         assert!(short.author_name.starts_with("npub1"), "falls back to a short npub");
         let mut rep = RepTable::default();
         rep.user.insert(k.pubkey, -0.4);
-        assert!(view(&st, &rep, &e, false, &n.keys.pubkey).low_trust);
+        assert!(view(&st, &rep, &e, false, &test_cx(&n)).low_trust);
         let mut rep = RepTable::default();
         rep.event.insert(e.id, (-0.5, 3));
-        let v = view(&st, &rep, &e, false, &n.keys.pubkey);
+        let v = view(&st, &rep, &e, false, &test_cx(&n));
         assert!(v.low_trust && v.ratings == 3 && v.score == -0.5);
     }
 

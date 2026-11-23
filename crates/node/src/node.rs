@@ -110,6 +110,8 @@ pub struct Node {
     search_slots: Arc<tokio::sync::Semaphore>,
     /// capability reputation table, rebuilt on demand (see api.rs)
     pub cap_cache: Mutex<Option<Arc<CapScores>>>,
+    /// humanity table (network-wide "human" ratings), rebuilt on demand
+    human_cache: Mutex<Option<Arc<RepTable>>>,
     tx: broadcast::Sender<(Ev, u64)>,
     next_conn: AtomicU64,
     dialer: Dialer,
@@ -171,6 +173,7 @@ impl Node {
             searches: Mutex::new(HashMap::new()),
             search_slots: Arc::new(tokio::sync::Semaphore::new(8)),
             cap_cache: Mutex::new(None),
+            human_cache: Mutex::new(None),
             tx,
             next_conn: AtomicU64::new(1),
             dialer,
@@ -265,6 +268,9 @@ impl Node {
         if matches!(e.kind, K_RATING | K_JOB_RESULT) {
             *self.cap_cache.lock().unwrap() = None;
         }
+        if e.kind == K_RATING && e.tag("aspect") == Some("human") {
+            *self.human_cache.lock().unwrap() = None;
+        }
         let r = self.store.lock().unwrap().insert(e);
         match r {
             Insert::Stored(e) => {
@@ -304,6 +310,21 @@ impl Node {
         };
         let t = Arc::new(rep::compute(&ratings));
         self.rep_cache.lock().unwrap().insert(community.to_string(), t.clone());
+        t
+    }
+
+    /// Who the network vouches is human (see rep::humanity), cached until a new
+    /// "human" rating arrives.
+    pub fn humanity(&self) -> Arc<RepTable> {
+        if let Some(t) = self.human_cache.lock().unwrap().clone() {
+            return t;
+        }
+        let ratings: Vec<Ev> = {
+            let st = self.store.lock().unwrap();
+            st.query(&Filter { kinds: Some(vec![K_RATING]), ..Default::default() }, usize::MAX).into_iter().filter(|e| e.tag("aspect") == Some("human")).collect()
+        };
+        let t = Arc::new(rep::humanity(&ratings));
+        *self.human_cache.lock().unwrap() = Some(t.clone());
         t
     }
 

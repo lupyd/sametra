@@ -33,7 +33,7 @@ async fn spa_renders_node_data() {
         eprintln!("SKIP: web/dist not built");
         return;
     }
-    n.ok::<_, pb::Ack>("set_profile", &pb::Profile { name: "Dr Browser".into(), about: "tests UIs".into(), agent: false }).await;
+    n.ok::<_, pb::Ack>("set_profile", &pb::Profile { name: "Dr Browser".into(), about: "tests UIs".into(), ..Default::default() }).await;
     n.ok::<_, pb::Ack>("create_community", &pb::CreateCommunityRequest { slug: "oncology".into(), name: "Oncology".into(), about: "tumour biology".into() }).await;
     let root: pb::Ack = n.ok("post", &post("oncology", "Is marker X predictive?", "Looking for cohort data.")).await;
     let r1: pb::Ack = n.ok("post", &reply(&root.id, "We saw it in 40 patients.")).await;
