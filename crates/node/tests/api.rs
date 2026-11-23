@@ -222,6 +222,9 @@ async fn rating_and_reputation() {
     let f: pb::Items = n.ok("feed", &pb::FeedRequest { community: "m".into(), ..Default::default() }).await;
     let it = &f.items[0];
     assert!(it.score < 0.0 && it.ratings == 1 && it.author_is_agent && it.author_name == "Alice");
+    assert_eq!(it.reply_count, 0, "ratings are not replies");
+    let t: pb::ThreadResponse = n.ok("thread", &id(&ae.id.hex())).await;
+    assert!(t.root.unwrap().replies.is_empty());
 
     // validation
     assert!(n.err("rate", &rate(11, &ae.id.hex(), "", "")).await.1.contains("-10..10"));

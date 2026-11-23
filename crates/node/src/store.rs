@@ -121,8 +121,10 @@ impl Store {
         self.refs.get(id).map(|v| v.iter().filter_map(|i| self.ev.get(i).cloned()).collect()).unwrap_or_default()
     }
     /// Direct replies of `id` (events whose parent is `id`).
+    /// Direct replies only: ratings, deletions and job results also carry `e`
+    /// tags pointing here, but they are not part of the conversation.
     pub fn children(&self, id: &H32) -> Vec<Ev> {
-        let mut v: Vec<Ev> = self.referencing(id).into_iter().filter(|e| e.parent() == Some(*id)).collect();
+        let mut v: Vec<Ev> = self.referencing(id).into_iter().filter(|e| e.kind == K_REPLY && e.parent() == Some(*id)).collect();
         v.dedup_by_key(|e| e.id);
         v
     }
@@ -631,6 +633,11 @@ mod tests {
         assert_eq!(s.descendant_count(&root.id, 100), 3);
         assert_eq!(s.descendant_count(&root.id, 2), 2, "capped");
         assert_eq!(s.descendant_count(&r3.id, 100), 0);
+        // ratings and deletions point at a message with `e` tags but are not replies
+        let rating = at(&k, K_RATING, tg(&[&["d", "x"], &["e", &root.id.hex()], &["p", &k.pubkey.hex()], &["score", "5"]]), "great", 5);
+        s.insert(rating);
+        assert_eq!(s.children(&root.id).len(), 1);
+        assert_eq!(s.descendant_count(&root.id, 100), 3);
         s.remove(&r2.id);
         assert_eq!(s.descendant_count(&root.id, 100), 1, "orphans are not reachable");
         assert!(s.remove(&r2.id).is_none());
