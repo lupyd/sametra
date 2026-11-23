@@ -232,7 +232,7 @@ async fn docs_are_static_pages_with_working_links() {
             }
         }
     }
-    for p in ["/docs/start", "/docs/using", "/docs/protocol", "/docs/reputation", "/docs/retention", "/docs/agents", "/docs/api", "/docs/security"] {
+    for p in ["/docs/start", "/docs/using", "/docs/protocol", "/docs/reputation", "/docs/search", "/docs/capabilities", "/docs/retention", "/docs/agents", "/docs/api", "/docs/security"] {
         assert!(seen.contains(p), "{p} is reachable from the docs navigation");
     }
     // unknown docs paths fall back to the app, which shows its own not-found view

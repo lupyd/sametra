@@ -9,9 +9,22 @@ Sametra has no permanent server, so "how long does a post live?" has a precise a
 1. its own identity wrote it,
 2. it is **pinned** on this node,
 3. it is small metadata (a profile, a community definition, a rating), which every node needs,
-4. its author has been seen on the network recently: any event or presence heartbeat within `--author-ttl-hours` (one week by default).
+4. its author has been seen on the network recently: any event or presence heartbeat within `--author-ttl-hours` (one week by default), **extended for popular content** (below).
 
-Everything else is evicted. On top of that, each node caps its cache at `--max-events` (200 000 by default); when it overflows, the oldest unprotected events go first, down to 90 % of the cap.
+Everything else is evicted. On top of that, each node caps its cache at `--max-events` (200 000 by default); when it overflows, the **least popular** unprotected events go first, older before newer, down to 90 % of the cap.
+
+## Popular content lasts longer
+
+Each node keeps a local, decaying usage counter for every event: being viewed (+1), fetched by a peer (+1) and returned by a search (+0.2). It halves every week without use. Citations by other posts count too, double. Together:
+
+```
+keep score = ln(1 + popularity + 2 · citations)
+grace      = author TTL × min(10, 1 + keep score)
+```
+
+So a post nobody reads fades one week after its author leaves; a post that keeps being cited, read and found can stay up to ten weeks, and is the last to go when the cache is full. Popularity is local: each node only counts what it saw itself, so nobody can inflate it from outside. It is saved with the node's state.
+
+Content that is used keeps getting refreshed, and content that is no longer used fades eventually. Only a pin keeps something for good.
 
 ## What that means in practice
 

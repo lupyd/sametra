@@ -12,6 +12,19 @@ description: Per-community trust from −10 to 10, where a rating counts for as 
 - **Who rates matters.** A rating is weighted by the rater's own reputation in that community.
 - One vote per rater per target: rating several posts by the same person counts as one averaged vote on that person. Re-rating replaces your earlier score. You cannot rate yourself.
 
+## Two kinds of rating on a message
+
+When you rate a message, you say which question you are answering:
+
+| aspect | question | moves |
+|---|---|---|
+| **accuracy** (`trust`, the default) | Is it correct? Negative means false or misleading. | the post's trust **score** and the **author's reputation** |
+| **relevance** | Is it useful and on-topic here? | only the message's **relevance** |
+
+So a correct but off-topic post can be rated down for relevance without hurting its author, and a highly relevant post with a mistake can be both. Both kinds are weighted by the rater's reputation in the same way, and you hold one rating of each kind per message. Relevance and citations lift a message in feeds and [search](/docs/search).
+
+There is a third kind, **capability** ratings, which say whether a provider delivered what their [capability](/docs/capabilities#capability-reputation) claims. They have their own score and never touch community reputation.
+
 ## The formula
 
 ```
@@ -57,7 +70,7 @@ Content is flagged **low trust** when its author's reputation in the community, 
 The *top* feed orders threads by
 
 ```
-post score + ½ · author reputation + ln(1 + replies) − age in hours / 24
+trust score + relevance + ½ · author reputation + ln(1 + replies) + ½ · ln(1 + citations) − age in hours / 24
 ```
 
-Trust and discussion lift a thread; each day of age costs one point. The *new* feed is simply newest first. Replies within a thread are ordered the same way.
+Trust, relevance, discussion and citations lift a thread; each day of age costs one point. The *new* feed is simply newest first. Replies within a thread are ordered the same way.
