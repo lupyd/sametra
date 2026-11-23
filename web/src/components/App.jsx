@@ -2,7 +2,8 @@ import { useEffect, useState } from 'preact/hooks';
 import { call } from '../lib/api.js';
 import { loc, match, navigate } from '../lib/router.js';
 import { communities, flash, info, refreshNode, toast } from '../lib/state.js';
-import { Feed, Home, Profile, Reputation, Search, Thread } from './Views.jsx';
+import { FindHelp, Inbox } from './Capabilities.jsx';
+import { Feed, FindCommunities, Home, Profile, Reputation, Search, Thread } from './Views.jsx';
 
 const ROUTES = [
   ['/', Home],
@@ -12,6 +13,9 @@ const ROUTES = [
   ['/u/:pk', Profile],
   ['/me', Profile],
   ['/search', Search],
+  ['/communities', FindCommunities],
+  ['/help', FindHelp],
+  ['/inbox', Inbox],
 ];
 
 function route(path) {
@@ -35,7 +39,11 @@ export default function App() {
         <form class="search" onSubmit={(e) => { e.preventDefault(); const q = e.currentTarget.q.value.trim(); q && navigate('/search?q=' + encodeURIComponent(q)); }}>
           <input name="q" placeholder="Search…" />
         </form>
-        <a class="docs-link" href="/docs">Docs</a>
+        <nav class="top">
+          <a href="/help">Find help</a>
+          <a href="/inbox">Inbox</a>
+          <a href="/docs">Docs</a>
+        </nav>
         <a class="me" href="/me">{info.value ? (info.value.name || info.value.npub.slice(0, 14) + '…') : '…'}</a>
       </header>
       <div class="wrap">
@@ -71,6 +79,7 @@ function Sidebar({ path }) {
           </a>
         ))}
       </nav>
+      <a class="c find" href="/communities">Find communities…</a>
       <h3>New or join</h3>
       <div class="pad">
         <input value={slug} onInput={(e) => setSlug(e.currentTarget.value)} placeholder="slug, e.g. cancer-research" />

@@ -6,7 +6,9 @@ export function Badges({ e }) {
   return (
     <>
       <span class={'tag' + (e.author_rep < 0 ? ' bad' : '')} title="author reputation in this community">rep {e.author_rep}</span>
-      {e.ratings > 0 && <span class={'tag' + (e.score < 0 ? ' bad' : '')} title={`weighted score from ${e.ratings} ratings`}>score {e.score}</span>}
+      {e.ratings > 0 && <span class={'tag' + (e.score < 0 ? ' bad' : '')} title={`weighted trust score from ${e.ratings} ratings`}>score {e.score}</span>}
+      {e.relevance_ratings > 0 && <span class={'tag' + (e.relevance < 0 ? ' bad' : '')} title={`weighted relevance from ${e.relevance_ratings} ratings`}>relevance {e.relevance}</span>}
+      {e.cited_by > 0 && <span class="tag" title="posts citing this">cited {e.cited_by}</span>}
       {e.author_is_agent && <span class="tag">agent</span>}
       {e.low_trust && <span class="tag bad">low trust</span>}
       {e.pinned && <span class="tag">pinned</span>}
@@ -21,6 +23,15 @@ export function Meta({ e, extra }) {
       <Badges e={e} />
       <span title={new Date(e.created_at * 1000).toLocaleString()}>{ago(e.created_at)}</span>
       {extra}
+    </div>
+  );
+}
+
+export function Needs({ e }) {
+  if (!e.needs?.length) return null;
+  return (
+    <div class="meta">
+      needs {e.needs.map((n) => <a key={n} class="tag need" href={'/help?q=' + encodeURIComponent(n)}>{n}</a>)}
     </div>
   );
 }
@@ -40,6 +51,7 @@ export function Actions({ e }) {
   const [box, setBox] = useState(null); // 'reply' | 'rate' | null
   const [text, setText] = useState('');
   const [score, setScore] = useState(0);
+  const [aspect, setAspect] = useState('trust'); // 'trust' (accurate?) | 'relevance' (useful here?)
   const [busy, setBusy] = useState(false);
   const run = async (f) => {
     setBusy(true);
@@ -66,11 +78,20 @@ export function Actions({ e }) {
         </div>
       )}
       {box === 'rate' && (
-        <div class="box row">
-          <input type="range" min="-10" max="10" value={score} onInput={(ev) => setScore(+ev.currentTarget.value)} style="max-width:160px" />
-          <b class={score < 0 ? 'neg' : ''} style="min-width:2.2em;text-align:right">{score > 0 ? '+' + score : score}</b>
-          <input value={text} onInput={(ev) => setText(ev.currentTarget.value)} placeholder="reason: misleading, well-sourced, replicated…" />
-          <button disabled={busy} onClick={() => run(async () => { const a = await call('rate', { event: e.id, score, reason: text }); done(`Rated. Author's rep now ${a.rep}`); })}>Rate</button>
+        <div class="box">
+          <div class="seg" role="group" aria-label="what you rate">
+            <button class={aspect === 'trust' ? 'on' : 'ghost'} onClick={() => setAspect('trust')} title="Is it accurate? Moves the author's reputation.">accuracy</button>
+            <button class={aspect === 'relevance' ? 'on' : 'ghost'} onClick={() => setAspect('relevance')} title="Is it useful and on-topic here? Scores only this message.">relevance</button>
+          </div>
+          <div class="row">
+            <input type="range" min="-10" max="10" value={score} onInput={(ev) => setScore(+ev.currentTarget.value)} style="max-width:160px" />
+            <b class={score < 0 ? 'neg' : ''} style="min-width:2.2em;text-align:right">{score > 0 ? '+' + score : score}</b>
+            <input value={text} onInput={(ev) => setText(ev.currentTarget.value)} placeholder={aspect === 'trust' ? 'reason: misleading, well-sourced, replicated…' : 'reason: off-topic, exactly what was asked…'} />
+            <button disabled={busy} onClick={() => run(async () => {
+              const a = await call('rate', { event: e.id, score, reason: text, aspect });
+              done(aspect === 'trust' ? `Rated. Author's rep now ${a.rep}` : `Rated relevance. This message now ${a.rep}`);
+            })}>Rate</button>
+          </div>
         </div>
       )}
     </>

@@ -2,7 +2,8 @@ import { useState } from 'preact/hooks';
 import { call } from '../lib/api.js';
 import { navigate, query } from '../lib/router.js';
 import { cites, communities, flash, info, refreshNode, tick, ago, short } from '../lib/state.js';
-import { Actions, Card, CiteList, Meta, Refs } from './Item.jsx';
+import { Actions, Card, CiteList, Meta, Needs, Refs } from './Item.jsx';
+import { CapabilityList, WhoCanHelp } from './Capabilities.jsx';
 import { useLoad } from './hooks.js';
 
 const Err = ({ error }) => error && <p class="err">{error.message}</p>;
@@ -46,6 +47,7 @@ export function Feed({ slug }) {
             <Meta e={e} extra={<a href={'/t/' + e.id}>{e.reply_count} replies</a>} />
             <a class="title" href={'/t/' + e.id}>{e.title || e.content.split('\n')[0].slice(0, 120)}</a>
             <div class="body">{e.content}</div>
+            <Needs e={e} />
             <Refs e={e} />
             <Actions e={e} />
           </Card>
@@ -57,12 +59,13 @@ export function Feed({ slug }) {
 function Composer({ slug }) {
   const [title, setTitle] = useState('');
   const [body, setBody] = useState('');
+  const [needs, setNeeds] = useState('');
   const [busy, setBusy] = useState(false);
   const submit = async () => {
     setBusy(true);
     try {
-      const a = await call('post', { community: slug, title, content: body, refs: cites.value });
-      cites.value = []; setTitle(''); setBody('');
+      const a = await call('post', { community: slug, title, content: body, refs: cites.value, needs: needs.split(',').map((x) => x.trim()).filter(Boolean) });
+      cites.value = []; setTitle(''); setBody(''); setNeeds('');
       navigate('/t/' + a.id);
     } catch (e) { flash(e.message); } finally { setBusy(false); }
   };
@@ -70,6 +73,7 @@ function Composer({ slug }) {
     <div class="card compose">
       <input value={title} onInput={(e) => setTitle(e.currentTarget.value)} placeholder="Title: a question, finding, dataset, report…" />
       {(title || body) && <textarea value={body} onInput={(e) => setBody(e.currentTarget.value)} placeholder="Details. There are no stupid questions." />}
+      {(title || body) && <input name="needs" value={needs} onInput={(e) => setNeeds(e.currentTarget.value)} placeholder="Needs (optional, comma separated): e.g. mass spectrometry, statistician" />}
       {(title || body) && (
         <div class="row"><CiteList /><button disabled={busy || !body.trim()} onClick={submit}>Post</button></div>
       )}
@@ -83,6 +87,7 @@ function Node({ e, top }) {
       <Meta e={e} />
       {e.title && <h2 class="title big">{e.title}</h2>}
       <div class={'body' + (e.low_trust ? ' muted' : '')}>{e.content}</div>
+      <Needs e={e} />
       <Refs e={e} />
       <Actions e={e} />
       {e.replies.length > 0 && <div class="replies">{e.replies.map((r) => <Node key={r.id} e={r} />)}</div>}
@@ -102,6 +107,7 @@ export function Thread({ id }) {
         {data.thread_root && <a class="btn ghost" href={'/t/' + data.thread_root}>whole thread</a>}
       </div>
       <Node e={r} top />
+      {r.needs.length > 0 && <WhoCanHelp e={r} />}
       {data.ref_events.length > 0 && <Related title="Cites" items={data.ref_events} />}
       {data.quoted_by.length > 0 && <Related title="Cited by" items={data.quoted_by} />}
     </>
@@ -143,20 +149,70 @@ export function Reputation({ slug }) {
   );
 }
 
+const SCOPES = { node: 'this node', community: 'community', network: 'network' };
+
 export function Search() {
   const q = query('q');
-  const { data, error } = useLoad(() => call('search', { query: q, limit: 50 }), [q]);
+  const scope = query('scope') || 'node';
+  const c = query('c');
+  const go = (o) => {
+    const p = new URLSearchParams({ q, scope, c, ...o });
+    if (!p.get('c')) p.delete('c');
+    navigate('/search?' + p.toString());
+  };
+  const { data, error } = useLoad(() => call('search', { query: q, scope, community: c, limit: 50 }), [q, scope, c]);
   return (
     <>
-      <div class="bar"><h2 class="grow">“{q}”</h2></div>
+      <div class="bar">
+        <h2 class="grow">“{q}”</h2>
+        <div class="seg" role="group" aria-label="where to search">
+          {Object.entries(SCOPES).map(([k, label]) => <button key={k} class={scope === k ? 'on' : 'ghost'} onClick={() => go({ scope: k })} disabled={k === 'community' && !c}>{label}</button>)}
+        </div>
+        <select value={c} onChange={(e) => go({ c: e.currentTarget.value, scope: e.currentTarget.value ? scope : scope === 'community' ? 'node' : scope })} aria-label="community">
+          <option value="">all communities</option>
+          {communities.value.map((x) => <option key={x.slug} value={x.slug}>{x.name}</option>)}
+        </select>
+      </div>
+      {scope !== 'node' && <p class="muted small">{scope === 'network' ? 'Asked peers up to three levels deep. Network search is best effort: what arrives in time is shown and cached here.' : 'Asked peers and their peers for posts in this community.'}</p>}
       <Err error={error} />
-      {!data ? <Loading /> : data.items.length === 0 ? <p class="muted">No matches in this node's cache.</p> :
+      {!data ? <Loading /> : data.items.length === 0 ? <p class="muted">No matches{scope === 'node' ? " in this node's cache. Try the community or network scope." : '.'}</p> :
         data.items.map((e) => (
           <Card key={e.id} e={e}>
             <Meta e={e} extra={<a href={'/c/' + e.community}>{e.community}</a>} />
             <a class="title" href={'/t/' + e.id}>{e.title || e.content.slice(0, 120)}</a>
             <div class="body">{e.content}</div>
+            <Needs e={e} />
           </Card>
+        ))}
+    </>
+  );
+}
+
+export function FindCommunities() {
+  const q = query('q');
+  const [text, setText] = useState(q);
+  const [network, setNetwork] = useState(false);
+  const { data, error } = useLoad(() => call('find_communities', { query: q, network, limit: 50 }), [q, network]);
+  return (
+    <>
+      <div class="bar"><h2 class="grow">Find communities</h2></div>
+      <form class="card row" onSubmit={(e) => { e.preventDefault(); navigate('/communities?q=' + encodeURIComponent(text.trim())); }}>
+        <input value={text} onInput={(e) => setText(e.currentTarget.value)} placeholder="A topic: cancer, number theory, batteries…" />
+        <label class="small nowrap"><input type="checkbox" checked={network} onChange={(e) => setNetwork(e.currentTarget.checked)} /> ask peers</label>
+        <button>Search</button>
+      </form>
+      <Err error={error} />
+      {!data ? <Loading /> : data.communities.length === 0 ? <p class="muted">No community on that topic yet. Create one in the sidebar.</p> :
+        data.communities.map((x) => (
+          <div class="card slim" key={x.slug}>
+            <div class="meta">
+              <a class="who" href={'/c/' + x.slug}>{x.name}</a><code>{x.slug}</code>
+              <span>{x.members} members</span><span>{x.events} events cached</span>
+              {x.joined && <span class="tag">joined</span>}
+            </div>
+            {x.about && <div class="body">{x.about}</div>}
+            {!x.joined && <div class="acts"><button class="link" onClick={async () => { try { await call('join', { community: x.slug }); refreshNode(); navigate('/c/' + x.slug); } catch (e) { flash(e.message); } }}>join</button></div>}
+          </div>
         ))}
     </>
   );
@@ -179,6 +235,7 @@ export function Profile({ pk }) {
           <table class="rep"><tbody>{data.reputation.map((r) => <tr key={r.community}><td><a href={'/c/' + r.community}>{r.community}</a></td><td class={r.rep < 0 ? 'neg' : ''}>{r.rep}</td></tr>)}</tbody></table>
         )}
       </div>
+      <CapabilityList provider={data.pubkey} self={self} />
       {self && <EditProfile p={p} />}
       {self && <NodePanel />}
     </>

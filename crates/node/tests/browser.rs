@@ -75,6 +75,33 @@ async fn spa_renders_node_data() {
     assert!(docs.contains("A node at a glance") && docs.contains("<svg class=\"dg\""), "docs render with diagrams");
     assert!(docs.contains("aria-current=\"page\">Architecture"));
 
+    // capabilities: offered on the profile, found by need, requested into the inbox
+    n.ok::<_, pb::Ack>("set_capability", &pb::CapabilitySpec { id: "assay".into(), name: "Plasma marker assay".into(), kind: "skill".into(), topics: vec!["proteomics".into()], ..Default::default() }).await;
+    let need: pb::Ack = n.ok("post", &pb::PostRequest { needs: vec!["proteomics".into()], ..post("oncology", "Who can quantify marker X?", "plasma samples") }).await;
+    let asker = sametra_node::event::Keys::generate();
+    let job = asker.sign(
+        sametra_node::event::K_JOB,
+        vec![
+            vec!["p".into(), n.node.keys.pubkey.hex()],
+            vec!["param".into(), "capability".into(), "assay".into()],
+            vec!["i".into(), "40 samples from cohort B".into(), "text".into()],
+        ],
+        String::new(),
+    );
+    n.node.ingest(job, 9, false).unwrap();
+    let me = run("/me").await.unwrap();
+    assert!(me.contains("Plasma marker assay") && me.contains("Offer a capability"));
+    let help = run("/help?q=proteomics").await.unwrap();
+    assert!(help.contains("Plasma marker assay"));
+    let thread = run(&format!("/t/{}", need.id)).await.unwrap();
+    assert!(thread.contains("Who can help") && thread.contains("proteomics"));
+    let inbox = run("/inbox").await.unwrap();
+    assert!(inbox.contains("40 samples from cohort B") && inbox.contains("Accept"));
+    let search = run("/search?q=marker&scope=network").await.unwrap();
+    assert!(search.contains("Who can quantify marker X?") && search.contains("best effort"));
+    let comms = run("/communities?q=tumour").await.unwrap();
+    assert!(comms.contains("tumour biology"));
+
     let missing = run("/nope/at/all").await.unwrap();
     assert!(missing.contains("Not found."));
 }

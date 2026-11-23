@@ -53,7 +53,8 @@ describe('shell', () => {
     expect(links[0].className).toContain('on');
     expect(links[1].textContent).toContain('○ Biology'); // not joined
     expect($('aside').textContent).toContain('1 peers · 7 cached');
-    expect($('header a.docs-link').getAttribute('href')).toBe('/docs');
+    expect($$('header nav.top a').map((a) => a.getAttribute('href'))).toEqual(['/help', '/inbox', '/docs']);
+    expect($('aside a[href="/communities"]')).not.toBeNull();
   });
 
   it('home redirects to the first joined community', async () => {
@@ -223,7 +224,7 @@ describe('thread', () => {
     expect($('.box b').textContent).toBe('-4');
     await type(byPlaceholder('reason'), 'not replicated');
     await click(button('Rate'));
-    expect(sent('rate')).toEqual([{ score: -4, event: R1, target: '', community: '', reason: 'not replicated', aspect: '', capability: '' }]);
+    expect(sent('rate')).toEqual([{ score: -4, event: R1, target: '', community: '', reason: 'not replicated', aspect: 'trust', capability: '' }]);
     expect(toast.value).toContain('-1.25');
   });
 
@@ -300,5 +301,145 @@ describe('other views', () => {
     expect(root.textContent).toContain('not seen recently');
     expect(button('Publish')).toBeUndefined();
     expect(root.textContent).not.toContain('This node');
+  });
+});
+
+describe('relevance, needs and search scopes', () => {
+  it('rates relevance separately from accuracy', async () => {
+    await mount('/t/' + ROOT, { thread: () => ({ root: item({ relevance: 2.5, relevance_ratings: 3, cited_by: 4 }), quoted_by: [], ref_events: [], thread_root: '' }), rate: () => ({ ok: true, rep: 3.1 }) });
+    const tags = $$('.tag').map((t) => t.textContent);
+    expect(tags).toEqual(expect.arrayContaining(['relevance 2.5', 'cited 4']));
+    await click(button('rate'));
+    await click(button('relevance'));
+    expect(byPlaceholder('reason').getAttribute('placeholder')).toContain('off-topic');
+    await type($('input[type=range]'), '6');
+    await click(button('Rate'));
+    expect(sent('rate')[0]).toMatchObject({ event: ROOT, score: 6, aspect: 'relevance' });
+    expect(toast.value).toContain('This message now 3.1');
+  });
+
+  it('posts needs and suggests who can help', async () => {
+    const helper = { provider: 'h'.repeat(64), provider_name: 'Lab agent', provider_is_agent: true, rep: 6.2, ratings: 3, requests: 4, completed: 3, declined: 0, spec: { id: 'assay', name: 'Plasma assay', kind: 'tool', about: '', input_schema: '{"type":"object"}', topics: [], communities: [] } };
+    await mount('/c/math', {
+      post: () => ({ ok: true, id: 'f'.repeat(64) }),
+      thread: () => ({ root: item({ id: 'f'.repeat(64), needs: ['plasma assay'] }), quoted_by: [], ref_events: [], thread_root: '' }),
+      capabilities: () => ({ capabilities: [helper] }),
+      request: () => ({ ok: true, id: 'r'.repeat(64) }),
+    });
+    await type(byPlaceholder('Title'), 'Need marker X');
+    await type(byPlaceholder('Details'), 'two samples');
+    await type(byPlaceholder('Needs'), 'plasma assay, statistician ,');
+    await click(button('Post'));
+    expect(sent('post')[0].needs).toEqual(['plasma assay', 'statistician']);
+    expect(loc.value).toBe('/t/' + 'f'.repeat(64));
+    await settle(); // thread, then its "who can help" suggestions
+    expect($('a.tag.need').getAttribute('href')).toBe('/help?q=plasma%20assay');
+    await settle();
+    expect($$('h3.section').map((h) => h.textContent)).toContain('Who can help');
+    expect(sent('capabilities').at(-1)).toMatchObject({ query: 'plasma assay', limit: 5 });
+    const card = $('.card.cap');
+    expect(card.textContent).toContain('Plasma assay');
+    expect(card.textContent).toContain('delivers 6.2');
+    await click(button('request', card));
+    expect($('pre.schema').textContent).toBe('{"type":"object"}');
+    await type(byPlaceholder('JSON input'), '{"sample":"S1"}');
+    await click(button('Send request', card));
+    expect(sent('request')).toEqual([{ provider: 'h'.repeat(64), capability: 'assay', input: '{"sample":"S1"}', post: 'f'.repeat(64), community: '' }]);
+  });
+
+  it('search scopes and community filter', async () => {
+    await mount('/search?q=marker', { search: () => ({ items: [item({ needs: ['assay'] })] }) });
+    expect(sent('search').at(-1)).toMatchObject({ query: 'marker', scope: 'node', community: '' });
+    expect(button('community').disabled).toBe(true);
+    await click(button('network'));
+    expect(loc.value).toBe('/search?q=marker&scope=network');
+    expect(sent('search').at(-1).scope).toBe('network');
+    expect(root.textContent).toContain('best effort');
+    const sel = $('select[aria-label=community]');
+    sel.value = 'math';
+    await act(() => sel.dispatchEvent(new Event('change', { bubbles: true })));
+    await settle();
+    expect(sent('search').at(-1)).toMatchObject({ scope: 'network', community: 'math' });
+    await click(button('community'));
+    expect(sent('search').at(-1)).toMatchObject({ scope: 'community', community: 'math' });
+  });
+
+  it('finds and joins communities', async () => {
+    await mount('/communities?q=cancer', {
+      find_communities: (r) => ({ communities: r.query === 'cancer' ? [{ slug: 'onco', name: 'Oncology', about: 'tumours', members: 12, events: 40, joined: false }] : [] }),
+      join: () => ({ ok: true, community: 'onco' }),
+    });
+    expect(sent('find_communities')[0]).toMatchObject({ query: 'cancer', network: false });
+    expect(root.textContent).toContain('12 members');
+    await click(button('join'));
+    expect(sent('join')).toEqual([{ community: 'onco' }]);
+    expect(loc.value).toBe('/c/onco');
+  });
+});
+
+describe('capabilities', () => {
+  const job = (o) => ({ id: 'j'.repeat(64), requester: 'r'.repeat(64), requester_name: 'Asker', provider: ME, provider_name: 'Me', capability: 'assay', input: '{"sample":"S1"}', post: '', community: 'onco', created_at: 1, status: 'pending', status_text: '', result: '', result_id: '', updated_at: Math.floor(Date.now() / 1e3), mine: false, rated: false, ...o });
+
+  it('find help searches capabilities', async () => {
+    await mount('/help?q=histology', { capabilities: () => ({ capabilities: [] }) });
+    expect(sent('capabilities')[0]).toMatchObject({ query: 'histology', network: false });
+    expect(root.textContent).toContain('Nobody offers that yet');
+    const cb = $('input[type=checkbox]');
+    cb.checked = true;
+    await act(() => cb.dispatchEvent(new Event('change', { bubbles: true })));
+    await settle();
+    expect(sent('capabilities').at(-1).network).toBe(true);
+  });
+
+  it('providers accept and deliver from the inbox', async () => {
+    let state = job({});
+    await mount('/inbox', {
+      inbox: (r) => ({ jobs: r.role === 'provider' ? [state] : [] }),
+      respond: (r) => { state = job({ status: r.action === 'accept' ? 'accepted' : 'done', result: r.content }); return { ok: true }; },
+    });
+    expect(sent('inbox')[0]).toMatchObject({ role: 'provider' });
+    expect($('.job pre.input').textContent).toBe('{"sample":"S1"}');
+    await click(button('Accept'));
+    expect(sent('respond')[0]).toEqual({ request: 'j'.repeat(64), action: 'accept', content: '' });
+    await type(byPlaceholder('Result'), '42 ng/ml');
+    await click(button('Deliver result'));
+    expect(sent('respond')[1]).toEqual({ request: 'j'.repeat(64), action: 'result', content: '42 ng/ml' });
+    await click(button('my requests'));
+    expect(sent('inbox').at(-1)).toMatchObject({ role: 'requester' });
+    expect(root.textContent).toContain('not requested anything yet');
+  });
+
+  it('requesters rate delivered results', async () => {
+    await mount('/inbox', { inbox: () => ({ jobs: [job({ mine: true, status: 'done', result: '42 ng/ml', result_id: 'x'.repeat(64) })] }), rate: () => ({ ok: true, rep: 7.4 }) });
+    expect($('.result').textContent).toBe('42 ng/ml');
+    expect(button('Accept')).toBeUndefined();
+    await type($('.job input[type=range]'), '8');
+    await click(button('Rate'));
+    expect(sent('rate')[0]).toMatchObject({ event: 'x'.repeat(64), score: 8, aspect: 'capability' });
+    expect(toast.value).toContain('assay now 7.4');
+  });
+
+  it('offers and withdraws capabilities from your profile', async () => {
+    const mineCap = { provider: ME, provider_name: 'Me', provider_is_agent: false, rep: 0, ratings: 0, requests: 0, completed: 0, declined: 0, spec: { id: 'stats', name: 'Survival analysis', kind: 'skill', about: '', input_schema: '', topics: [], communities: [] } };
+    await mount('/me', {
+      profile: () => ({ pubkey: ME, npub: 'npub1me', profile: { name: 'Me' }, reputation: [], last_seen: 0 }),
+      capabilities: (r) => ({ capabilities: r.provider === ME ? [mineCap] : [] }),
+      set_capability: () => ({ ok: true }),
+    });
+    await settle(); // capabilities load after the profile
+    expect(sent('capabilities')[0]).toMatchObject({ provider: ME });
+    expect(root.textContent).toContain('Survival analysis');
+    await click(button('withdraw stats'));
+    expect(sent('set_capability')[0]).toMatchObject({ id: 'stats', delete: true });
+    const kind = $('select[aria-label=kind]');
+    kind.value = 'tool';
+    await act(() => kind.dispatchEvent(new Event('change', { bubbles: true })));
+    await settle();
+    await type(byPlaceholder('id, e.g.'), 'assay');
+    await type(byPlaceholder('name'), 'Plasma assay');
+    await type(byPlaceholder('topics'), 'proteomics, plasma');
+    await type(byPlaceholder('input JSON Schema'), '{"type":"object"}');
+    await click(button('Offer capability'));
+    expect(sent('set_capability')[1]).toMatchObject({ id: 'assay', name: 'Plasma assay', kind: 'tool', topics: ['proteomics', 'plasma'], communities: [], input_schema: '{"type":"object"}' });
   });
 });
