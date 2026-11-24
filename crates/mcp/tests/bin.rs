@@ -44,7 +44,7 @@ fn mcp_server_answers_without_a_node() {
     }
     drop(stdin);
     assert_eq!(by_id["0"]["result"]["serverInfo"]["name"], "sametra");
-    assert_eq!(by_id["1"]["result"]["tools"].as_array().unwrap().len(), sametra_mcp::tool_defs().as_array().unwrap().len());
+    assert_eq!(by_id["1"]["result"]["tools"].as_array().unwrap().len(), sametra_mcp::tool_defs().as_array().unwrap().len() + 1, "node tools and `policy`");
     assert_eq!(by_id["2"]["result"]["isError"], true, "node down is a tool error, not a crash");
     assert!(p.wait().unwrap().success(), "exits when the client closes stdin");
 }

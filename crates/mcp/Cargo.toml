@@ -19,6 +19,8 @@ rmcp = { version = "3.11.0", default-features = false, features = ["server", "tr
 tokio = { workspace = true, features = ["io-std"] }
 hyper = { version = "1", features = ["server", "http1"], optional = true }
 hyper-util = { version = "0.1", features = ["tokio", "service", "server-auto", "http1"], optional = true }
+toml = "1.2"
+serde = { workspace = true, features = ["derive"] }
 
 [[bin]]
 name = "sametra-mcp"

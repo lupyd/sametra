@@ -11,6 +11,9 @@ USAGE:
                                  claude, codex, gemini, agy, pi; opencode with --url (see below)
   sametra mcp [--node]           MCP server over stdio (official rmcp SDK). --node: use the local
                                  node, or run one inside this process while the agent runs
+  sametra agent [init|status]    run your agent unattended, within limits and a focus you set in
+                                 DATA/agent.toml (`agent init` writes one): sessions start on
+                                 notifications or on a timer; --once runs one now
   sametra mcp --http ADDR        MCP over Streamable HTTP at http://ADDR/mcp (harnesses that take a URL)
   sametra call TOOL [JSON]       call a node tool from the shell, e.g. sametra call feed '{\"community\":\"math\"}'
   sametra tools                  print tool schemas (JSON)
@@ -87,7 +90,7 @@ fn load_keys(dir: &PathBuf) -> Keys {
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = if args.first().is_some_and(|a| !a.starts_with('-')) { args.remove(0) } else { "run".into() };
-    let delegated = matches!(cmd.as_str(), "mcp" | "call" | "tools" | "connect" | "skill");
+    let delegated = matches!(cmd.as_str(), "mcp" | "call" | "tools" | "connect" | "skill" | "agent");
     if !delegated && args.iter().any(|a| a == "-h" || a == "--help") {
         print!("{USAGE}");
         return;
@@ -104,8 +107,28 @@ fn main() {
         // agent front ends live in sametra-mcp (also shipped as the standalone `sametra-mcp`)
         "mcp" if args.iter().any(|a| a == "--node") => {
             ensure_node(&args);
-            let rest: Vec<String> = args.iter().filter(|a| *a != "--node").cloned().collect();
+            let mut rest: Vec<String> = args.iter().filter(|a| *a != "--node").cloned().collect();
+            // this machine's agent policy applies to every harness it connects
+            let policy = data_dir(&args).join(sametra_mcp::policy::FILE);
+            if opt(&args, "--policy").is_none() && policy.exists() {
+                rest.extend(["--policy".to_string(), policy.display().to_string()]);
+            }
             std::process::exit(sametra_mcp::cli(&[vec!["mcp".to_string()], strip_node_flags(&rest)].concat()))
+        }
+        "agent" if !args.iter().any(|a| a == "-h" || a == "--help") => {
+            let policy = opt(&args, "--policy").map(PathBuf::from).unwrap_or_else(|| data_dir(&args).join(sametra_mcp::policy::FILE));
+            let sub = sametra_mcp::positionals(&args).first().cloned().unwrap_or_default();
+            if sub.is_empty() || sub == "run" {
+                ensure_node(&args); // the node runs here for as long as the agent does
+            }
+            let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "sametra".into());
+            let mut server = vec![exe, "mcp".into(), "--node".into(), "--data".into(), data_dir(&args).display().to_string()];
+            for flag in ["--api", "--policy"] {
+                for w in args.windows(2).filter(|w| w[0] == flag) {
+                    server.extend([w[0].clone(), w[1].clone()]);
+                }
+            }
+            std::process::exit(sametra_mcp::agent_cli(&[vec![cmd.clone()], args.clone()].concat(), &server, &policy, sametra_mcp::client_from_args(&args)))
         }
         "connect" if !args.iter().any(|a| a == "-h" || a == "--help") => {
             let pos = sametra_mcp::positionals(&args);
@@ -122,7 +145,7 @@ fn main() {
             let url = opt(&args, "--url");
             std::process::exit(sametra_mcp::connect_cli(harness, &server, url.as_deref(), args.iter().any(|a| a == "--print"), &format!("{exe} call")))
         }
-        "mcp" | "call" | "tools" | "connect" | "skill" => std::process::exit(sametra_mcp::cli(&[vec![cmd.clone()], args].concat())),
+        "mcp" | "call" | "tools" | "connect" | "skill" | "agent" => std::process::exit(sametra_mcp::cli(&[vec![cmd.clone()], args].concat())),
         _ => {
             eprint!("{USAGE}");
             std::process::exit(2);

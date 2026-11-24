@@ -13,7 +13,9 @@ use std::net::TcpStream;
 use std::path::PathBuf;
 use std::time::Duration;
 
+pub mod agent;
 pub mod connect;
+pub mod policy;
 pub mod server;
 
 /// A connection target: node API base URL, optional bearer token, TLS trust.
@@ -210,6 +212,8 @@ USAGE:
   sametra-mcp connect HARNESS          register Sametra with a harness, in one line:
                                        claude, codex, gemini, agy, opencode (needs --url), pi
   sametra-mcp skill [--dir DIR]        write an Agent Skill (SKILL.md) for any other harness
+  sametra-mcp agent init|status|run --policy FILE
+                                       run a harness unattended within a policy (agent.toml)
   sametra-mcp call TOOL [JSON]         call one tool, print the JSON reply
   sametra-mcp tools                    print tool schemas (JSON)
 
@@ -218,11 +222,13 @@ OPTIONS:
   --token T      API token for remote write tools [default: $SAMETRA_TOKEN]
   --tls-ca FILE  extra CA certificate (PEM) to trust for https (repeatable; or $SAMETRA_TLS_CA)
   --url URL      connect: register a Streamable HTTP endpoint instead of launching a process
-  --print        connect: show the command instead of running it
+  --print        connect, agent: show the command instead of running it
+  --policy FILE  limits and focus (TOML; see `agent init`), for mcp and agent
+  --once         agent: run one session now, then exit
 ";
 
 /// Flags that take a value (everything else starting with `--` is a switch).
-pub const VALUE_FLAGS: &[&str] = &["--api", "--token", "--tls-ca", "--data", "--http", "--url", "--dir", "--listen", "--public", "--peer", "--join"];
+pub const VALUE_FLAGS: &[&str] = &["--api", "--token", "--tls-ca", "--data", "--http", "--url", "--dir", "--listen", "--public", "--peer", "--join", "--policy", "--harness"];
 
 /// Arguments that are not flags or flag values.
 pub fn positionals(args: &[String]) -> Vec<String> {
@@ -298,6 +304,50 @@ pub fn connect_cli(harness: &str, server: &[String], url: Option<&str>, print_on
     }
 }
 
+/// `agent [init | status | run] [--once] [--print]`, with the policy at `policy_path`.
+/// `server`: the argv that starts Sametra's MCP server for the harness.
+pub fn agent_cli(args: &[String], server: &[String], policy_path: &std::path::Path, client: Result<Client, String>) -> i32 {
+    let pos = positionals(args);
+    match pos.get(1).map(String::as_str).unwrap_or("run") {
+        "init" => {
+            if policy_path.exists() {
+                return fail(&format!("{} exists; edit it", policy_path.display()));
+            }
+            if let Some(d) = policy_path.parent() {
+                let _ = std::fs::create_dir_all(d);
+            }
+            match std::fs::write(policy_path, policy::EXAMPLE) {
+                Ok(()) => {
+                    println!("{}", policy_path.display());
+                    0
+                }
+                Err(e) => fail(&format!("{}: {e}", policy_path.display())),
+            }
+        }
+        sub @ ("status" | "run") => {
+            let p = match policy::Policy::load(policy_path) {
+                Ok(p) => p,
+                Err(e) if !policy_path.exists() => return fail(&format!("{e}\nwrite one with `agent init`")),
+                Err(e) => return fail(&e),
+            };
+            if sub == "status" {
+                let l = p.ledger();
+                println!("{}", serde_json::to_string_pretty(&json!({"policy": policy_path, "harness": p.agent.harness, "focus": p.focus, "budget": p.budget, "ledger": l, "exhausted": p.exhausted(&l)})).unwrap());
+                return 0;
+            }
+            let client = match client {
+                Ok(c) => c,
+                Err(e) => return fail(&e),
+            };
+            match agent::run(&p, server, &client, args.iter().any(|a| a == "--once"), args.iter().any(|a| a == "--print")) {
+                Ok(()) => 0,
+                Err(e) => fail(&e),
+            }
+        }
+        other => fail(&format!("unknown agent command '{other}': init, status, run")),
+    }
+}
+
 fn fail(m: &str) -> i32 {
     eprintln!("error: {m}");
     2
@@ -320,12 +370,16 @@ pub fn cli(args: &[String]) -> i32 {
                 Ok(c) => c,
                 Err(e) => return fail(&e),
             };
+            let policy = match opt(args, "--policy").map(|p| policy::Policy::load(std::path::Path::new(&p))).transpose() {
+                Ok(p) => p.unwrap_or_default(),
+                Err(e) => return fail(&e),
+            };
             let r = match opt(args, "--http") {
                 #[cfg(feature = "http")]
-                Some(addr) => server::run_http(client, &addr),
+                Some(addr) => server::run_http(client, policy, &addr),
                 #[cfg(not(feature = "http"))]
                 Some(_) => Err("this build has no HTTP transport (feature `http`)".into()),
-                None => server::run_stdio(client),
+                None => server::run_stdio(client, policy),
             };
             match r {
                 Ok(()) => 0,
@@ -349,6 +403,13 @@ pub fn cli(args: &[String]) -> i32 {
                 }
                 Err(e) => fail(&e),
             }
+        }
+        "agent" => {
+            let Some(path) = opt(args, "--policy") else { return fail("agent needs --policy FILE (sametra-mcp has no data directory)") };
+            let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "sametra-mcp".into());
+            let mut server = vec![exe, "mcp".to_string(), "--policy".to_string(), path.clone()];
+            server.extend(api_args(args));
+            agent_cli(args, &server, std::path::Path::new(&path), client_from_args(args))
         }
         "call" => {
             let Some(tool) = pos.get(1) else { return fail("usage: call TOOL [JSON]") };

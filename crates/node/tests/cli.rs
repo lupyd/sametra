@@ -217,7 +217,7 @@ fn mcp_stdio_server() {
 
     send(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}));
     let list = recv();
-    assert_eq!(list["result"]["tools"].as_array().unwrap().len(), sametra_mcp::tool_defs().as_array().unwrap().len());
+    assert_eq!(list["result"]["tools"].as_array().unwrap().len(), sametra_mcp::tool_defs().as_array().unwrap().len() + 1, "node tools and `policy`");
 
     let tool = |id: u32, name: &str, args: Value| json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": name, "arguments": args}});
     let text = |v: &Value| -> Value { serde_json::from_str(v["result"]["content"][0]["text"].as_str().unwrap()).unwrap_or(Value::Null) };
@@ -451,4 +451,89 @@ fn mcp_over_streamable_http() {
     let info = post(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "info", "arguments": {}}})).unwrap();
     let v: Value = serde_json::from_str(info["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
     assert!(v["npub"].as_str().unwrap().starts_with("npub1"));
+}
+
+/// The error text of a refused tool call, from [`mcp_session`].
+fn refusal(v: &Value) -> String {
+    assert_eq!(v["result"]["isError"], true, "expected a refusal, got {v}");
+    v["result"]["content"][0]["text"].as_str().unwrap().to_string()
+}
+
+#[test]
+fn agent_policy_limits_and_focus() {
+    let d = tempdir("policy");
+    let (_node, port) = run_node(&d.0, 0, &[]);
+    let api = format!("http://127.0.0.1:{port}");
+    let data = d.0.to_str().unwrap();
+    let topic = call(&d.0, port, "post", json!({"community": "math", "title": "Focus", "content": "here"})).unwrap()["id"].as_str().unwrap().to_string();
+    let elsewhere = call(&d.0, port, "post", json!({"community": "bio", "title": "Other", "content": "there"})).unwrap()["id"].as_str().unwrap().to_string();
+    let policy = format!("[budget]\nposts_per_day = 3\ntool_calls_per_session = 6\n[focus]\nmode = \"only\"\ntopics = [\"{topic}\"]\n");
+    std::fs::write(d.0.join("agent.toml"), policy).unwrap();
+    // `mcp --node` picks up DATA/agent.toml
+    let r = mcp_session(&d.0, &["--node", "--api", &api, "--data", data], &[
+        ("post", json!({"parent": topic, "content": "in scope"})),
+        ("post", json!({"topic": topic, "title": "Sub", "content": "a subtopic is in scope"})),
+        ("post", json!({"parent": elsewhere, "content": "out of scope"})),
+        ("post", json!({"community": "bio", "title": "New", "content": "new topic elsewhere"})),
+        ("rate", json!({"event": elsewhere, "score": 0.5})),
+        ("policy", json!({})),
+        ("info", json!({})),
+    ]);
+    assert_eq!(r[0]["ok"], true);
+    assert_eq!(r[1]["ok"], true);
+    // replies inside the subtopic are in scope too
+    let sub = r[1]["id"].as_str().unwrap();
+    assert!(refusal(&r[2]).contains("out of scope"));
+    assert!(refusal(&r[3]).contains("out of scope"));
+    assert!(refusal(&r[4]).contains("out of scope"));
+    assert_eq!(r[5]["spent_today"]["posts"], 2);
+    assert_eq!(r[5]["focus"]["mode"], "only");
+    assert!(refusal(&r[6]).contains("all 6 of its tool calls"));
+    // posts per day hold across sessions
+    let r = mcp_session(&d.0, &["--node", "--api", &api, "--data", data], &[
+        ("post", json!({"parent": sub, "content": "third"})),
+        ("post", json!({"parent": sub, "content": "fourth"})),
+    ]);
+    assert_eq!(r[0]["ok"], true);
+    assert!(refusal(&r[1]).contains("all 3 of today's posts"));
+}
+
+#[test]
+fn agent_runs_sessions_within_budget() {
+    let d = tempdir("agent");
+    let (_node, port) = run_node(&d.0, 0, &[]);
+    let api = format!("http://127.0.0.1:{port}");
+    let data = d.0.to_str().unwrap();
+    let agent = |args: &[&str]| out(cmd(&d.0).arg("agent").args(args).args(["--api", &api, "--data", data]).output().unwrap());
+    let (code, _, stderr) = agent(&["--once"]);
+    assert!(code == 2 && stderr.contains("agent init"), "{stderr}");
+    let (code, stdout, _) = agent(&["init"]);
+    assert_eq!(code, 0);
+    assert!(stdout.trim().ends_with("agent.toml"));
+    assert_eq!(agent(&["init"]).0, 2, "never overwrites a policy");
+    // a stand-in harness: records its prompt and reports usage the way Claude Code does
+    let fake = d.0.join("harness.sh");
+    std::fs::write(&fake, format!("#!/bin/sh\nprintf '%s' \"$1\" > {}\necho '{{\"total_cost_usd\": 0.6, \"usage\": {{\"input_tokens\": 1000, \"output_tokens\": 200}}}}'\n", d.0.join("prompt").display())).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let policy = format!("[agent]\nharness = \"command\"\ncommand = [\"{}\", \"{{prompt}}\"]\nprompt = \"Be brief.\"\n[budget]\nusd_per_day = 1.0\n[focus]\nmode = \"prefer\"\ncommunities = [\"math\"]\n", fake.display());
+    std::fs::write(d.0.join("agent.toml"), policy).unwrap();
+    let (code, _, stderr) = agent(&["--print"]);
+    assert_eq!(code, 0, "{stderr}");
+    let (code, _, stderr) = agent(&["--once"]);
+    assert_eq!(code, 0, "{stderr}");
+    let prompt = std::fs::read_to_string(d.0.join("prompt")).unwrap();
+    assert!(prompt.contains("notifications") && prompt.contains("Your priority is the communities math") && prompt.ends_with("Be brief."));
+    assert!(stderr.contains("1000 in / 200 out tokens, $0.6000"), "{stderr}");
+    assert_eq!(agent(&["--once"]).0, 0, "$0.60 of $1.00: one more session");
+    let (code, _, stderr) = agent(&["--once"]);
+    assert!(code == 2 && stderr.contains("daily limit reached"), "{stderr}");
+    let (_, status, stderr) = agent(&["status"]);
+    assert!(!stderr.contains("listening"), "status does not start a node");
+    let s: Value = serde_json::from_str(&status).unwrap();
+    assert_eq!(s["ledger"]["sessions"], 2);
+    assert!((s["ledger"]["usd_day"].as_f64().unwrap() - 1.2).abs() < 1e-9);
 }

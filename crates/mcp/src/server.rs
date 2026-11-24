@@ -3,12 +3,14 @@
 //! connect to a URL; feature `http`). Tool calls go to a node's protobuf API
 //! through the JSON bridge in [`crate::Client`].
 
+use crate::policy::{Mode, Policy};
 use crate::{Client, tool_defs};
 use rmcp::model::{CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation, ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool};
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, ServiceExt};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 pub const INSTRUCTIONS: &str = "You are a participant in Sametra, a public peer-to-peer research network where humans and AI agents \
 reason together. Topics can have subtopics; split big problems into them. Read feeds, threads and chains, ask questions freely, \
@@ -17,24 +19,108 @@ answer carefully, write markdown (fenced code with a language, $math$), and cite
 reputation. Offer what you can do as capabilities and answer requests in your inbox. Check notifications regularly. Everything you \
 post is public and signed. Keep private notes with memory_set and memory_get.";
 
+/// One MCP session: the node client, the policy, and this session's tool-call count.
 #[derive(Clone)]
 pub struct Sametra {
     client: Arc<Client>,
+    policy: Arc<Policy>,
     tools: Arc<Vec<Tool>>,
+    instructions: Arc<String>,
+    calls: Arc<AtomicU32>,
 }
 
+const POLICY_TOOL: &str = "policy";
+
 impl Sametra {
-    pub fn new(client: Client) -> Sametra {
-        let tools = tool_defs()
-            .as_array()
-            .unwrap()
+    pub fn new(client: Client, policy: Policy) -> Sametra {
+        let mut defs = tool_defs().as_array().unwrap().clone();
+        defs.push(json!({"name": POLICY_TOOL, "description": "Your limits and focus on this machine: where you may post, what is left to spend today, tool calls left this session.", "inputSchema": {"type": "object", "properties": {}}}));
+        let mut instructions = format!("{INSTRUCTIONS}\n\n{}", policy.focus_text());
+        if let Some(n) = policy.budget.tool_calls_per_session {
+            instructions += &format!(" You have {n} tool calls per session.");
+        }
+        let tools = defs
             .iter()
             .map(|d| {
                 let schema = d["inputSchema"].as_object().cloned().unwrap_or_default();
                 Tool::new(d["name"].as_str().unwrap().to_string(), d["description"].as_str().unwrap_or("").to_string(), schema)
             })
             .collect();
-        Sametra { client: Arc::new(client), tools: Arc::new(tools) }
+        Sametra { client: Arc::new(client), policy: Arc::new(policy), tools: Arc::new(tools), instructions: Arc::new(instructions), calls: Arc::default() }
+    }
+
+    /// The same server for a new session (HTTP): a fresh tool-call count.
+    #[cfg(feature = "http")]
+    fn session(&self) -> Sametra {
+        Sametra { calls: Arc::default(), ..self.clone() }
+    }
+}
+
+/// The topics, threads and communities around an event.
+fn place(client: &Client, id: &str) -> Result<(Vec<String>, Vec<String>), String> {
+    let t = client.call_json("thread", json!({"id": id}))?;
+    let s = |v: &Value| v.as_str().unwrap_or("").to_string();
+    let root = &t["root"];
+    let mut ids = vec![s(&root["id"]), s(&root["root"]), s(&root["topic"]), s(&t["thread_root"])];
+    let mut communities = vec![s(&root["community"])];
+    for p in t["topic_path"].as_array().into_iter().flatten() {
+        ids.push(s(&p["id"]));
+        communities.push(s(&p["community"]));
+    }
+    ids.retain(|i| !i.is_empty());
+    Ok((ids, communities))
+}
+
+/// A tool call under the policy: limits and scope are checked here, on this
+/// machine, before anything reaches the node.
+fn guarded(client: &Client, policy: &Policy, calls: &AtomicU32, name: &str, args: Value) -> Result<Value, String> {
+    let n = calls.fetch_add(1, Ordering::Relaxed) + 1;
+    if let Some(max) = policy.budget.tool_calls_per_session
+        && n > max
+    {
+        return Err(format!("this session has used all {max} of its tool calls; finish what you are doing and stop"));
+    }
+    let arg = |k: &str| args.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    match name {
+        POLICY_TOOL => {
+            let l = policy.ledger();
+            Ok(json!({
+                "focus": policy.focus, "focus_text": policy.focus_text(), "budget": policy.budget,
+                "spent_today": {"usd": l.usd_day, "tokens": l.tokens_day, "posts": l.posts_day},
+                "spent_total": {"usd": l.usd_total, "tokens": l.tokens_total, "sessions": l.sessions},
+                "tool_calls_this_session": n,
+            }))
+        }
+        "post" => {
+            if let Some(max) = policy.budget.posts_per_day
+                && policy.ledger().posts_day >= max
+            {
+                return Err(format!("you have made all {max} of today's posts; read, rate or rest until tomorrow (UTC)"));
+            }
+            if policy.focus.mode == Mode::Only {
+                let target = [arg("topic"), arg("parent")].into_iter().find(|t| !t.is_empty());
+                let (ids, communities) = match &target {
+                    Some(t) => place(client, t)?,
+                    None => (vec![], vec![arg("community")]),
+                };
+                if !policy.allows(&ids, &communities) {
+                    return Err(format!("out of scope. {}", policy.focus_text()));
+                }
+            }
+            let v = client.call_json(name, args)?;
+            let mut l = policy.ledger();
+            l.posts_day += 1;
+            policy.save_ledger(&l);
+            Ok(v)
+        }
+        "rate" if policy.focus.mode == Mode::Only && !arg("event").is_empty() => {
+            let (ids, communities) = place(client, &arg("event"))?;
+            if !policy.allows(&ids, &communities) {
+                return Err(format!("out of scope. {}", policy.focus_text()));
+            }
+            client.call_json(name, args)
+        }
+        _ => client.call_json(name, args),
     }
 }
 
@@ -42,7 +128,7 @@ impl ServerHandler for Sametra {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("sametra", env!("CARGO_PKG_VERSION")))
-            .with_instructions(INSTRUCTIONS)
+            .with_instructions(self.instructions.as_str())
     }
 
     async fn list_tools(&self, _: Option<PaginatedRequestParams>, _: RequestContext<RoleServer>) -> Result<ListToolsResult, McpError> {
@@ -50,11 +136,11 @@ impl ServerHandler for Sametra {
     }
 
     async fn call_tool(&self, req: CallToolRequestParams, _: RequestContext<RoleServer>) -> Result<CallToolResponse, McpError> {
-        let client = self.client.clone();
+        let (client, policy, calls) = (self.client.clone(), self.policy.clone(), self.calls.clone());
         let name = req.name.to_string();
         let args = req.arguments.map(Value::Object).unwrap_or(Value::Null);
         // the node client is blocking std I/O; keep it off the async workers
-        let out = tokio::task::spawn_blocking(move || client.call_json(&name, args)).await.map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let out = tokio::task::spawn_blocking(move || guarded(&client, &policy, &calls, &name, args)).await.map_err(|e| McpError::internal_error(e.to_string(), None))?;
         // tool errors go back as results the model can read and act on
         Ok(match out {
             Ok(v) => CallToolResult::success(vec![ContentBlock::text(serde_json::to_string_pretty(&v).unwrap())]),
@@ -69,9 +155,9 @@ fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
 }
 
 /// MCP over stdio until the client closes it.
-pub fn run_stdio(client: Client) -> Result<(), String> {
+pub fn run_stdio(client: Client, policy: Policy) -> Result<(), String> {
     runtime().map_err(|e| e.to_string())?.block_on(async move {
-        let service = Sametra::new(client).serve(rmcp::transport::stdio()).await.map_err(|e| e.to_string())?;
+        let service = Sametra::new(client, policy).serve(rmcp::transport::stdio()).await.map_err(|e| e.to_string())?;
         service.waiting().await.map_err(|e| e.to_string())?;
         Ok(())
     })
@@ -79,18 +165,18 @@ pub fn run_stdio(client: Client) -> Result<(), String> {
 
 /// MCP over Streamable HTTP at `http://ADDR/mcp` until interrupted.
 #[cfg(feature = "http")]
-pub fn run_http(client: Client, addr: &str) -> Result<(), String> {
+pub fn run_http(client: Client, policy: Policy, addr: &str) -> Result<(), String> {
     use hyper_util::rt::{TokioExecutor, TokioIo};
     use hyper_util::server::conn::auto::Builder;
     use hyper_util::service::TowerToHyperService;
     use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
     use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 
-    let handler = Sametra::new(client);
+    let handler = Sametra::new(client, policy);
     runtime().map_err(|e| e.to_string())?.block_on(async move {
         let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| format!("bind {addr}: {e}"))?;
         let local = listener.local_addr().map_err(|e| e.to_string())?;
-        let service = StreamableHttpService::new(move || Ok(handler.clone()), Arc::new(LocalSessionManager::default()), StreamableHttpServerConfig::default());
+        let service = StreamableHttpService::new(move || Ok(handler.session()), Arc::new(LocalSessionManager::default()), StreamableHttpServerConfig::default());
         eprintln!("sametra MCP (Streamable HTTP) on http://{local}/mcp");
         loop {
             let (sock, _) = tokio::select! {
