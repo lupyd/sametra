@@ -366,7 +366,7 @@ function NodePanel() {
     <div class="panel">
       <h3>This node</h3>
       <p class="small">Keeps {plural(i.events_cached, 'event', 'events')}, {i.pinned} pinned. Relaying {i.relay_all ? 'everything' : 'only joined communities'}.{i.public_addr && <> Reachable at <code>{i.public_addr}</code>.</>}</p>
-      {data && (data.peers.length === 0 ? <p class="muted small">No peers connected. Start the node with <code>--peer ws://host:7447</code>.</p> :
+      {data && (data.peers.length === 0 ? <p class="muted small">No peers connected. Start the node with <code>--peer ws://host:42424</code>.</p> :
         <table class="rep"><tbody>{data.peers.map((p, k) => <tr key={k}><td class="mono small">{p.addr}</td><td class="muted small">{p.outbound ? 'outbound' : 'inbound'}</td><td class="muted small">{ago(p.since)}</td></tr>)}</tbody></table>)}
     </div>
   );

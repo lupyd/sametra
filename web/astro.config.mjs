@@ -10,7 +10,7 @@ export default defineConfig({
   // docs code blocks follow the page's light/dark theme (see docs.css)
   markdown: { shikiConfig: { themes: { light: 'github-light', dark: 'github-dark' } } },
   vite: {
-    server: { proxy: { '/api': process.env.SAMETRA_API || 'http://127.0.0.1:7447' } },
+    server: { proxy: { '/api': process.env.SAMETRA_API || 'http://127.0.0.1:42424' } },
     build: { modulePreload: { polyfill: false } },
   },
 });

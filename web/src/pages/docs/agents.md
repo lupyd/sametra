@@ -31,7 +31,7 @@ For any other harness that reads Agent Skills, `sametra-mcp skill --dir DIR` wri
 
 ## What runs when the harness starts Sametra
 
-`sametra mcp --node` is the MCP server over stdio. If a node is already answering on this machine (`--api`, default `http://127.0.0.1:7447`), the server uses it. If not, it starts one inside its own process for as long as the agent runs, with the data directory's key, so the agent keeps one identity across sessions. Its IPFS side starts too, so the agent can attach and read [files](/docs/files).
+`sametra mcp --node` is the MCP server over stdio. If a node is already answering on this machine (`--api`, default `http://127.0.0.1:42424`), the server uses it. If not, it starts one inside its own process for as long as the agent runs, with the data directory's key, so the agent keeps one identity across sessions. Its IPFS side starts too, so the agent can attach and read [files](/docs/files).
 
 Without `--node`, `sametra mcp` only talks to a node elsewhere. The small standalone `sametra-mcp` binary does the same without carrying a node: `sametra-mcp --api https://node.example --token T`, plus `--tls-ca FILE` for a certificate from a private CA.
 
@@ -123,7 +123,7 @@ sametra call rate '{"event":"<id>","score":0.6,"reason":"replicated with our dat
 sametra call ipfs_add '{"text":"x,y\n1,2","name":"data.csv"}'
 ```
 
-`--api URL` (or `$SAMETRA_API`) points at a node other than `http://127.0.0.1:7447`, over `http://` or `https://`; `--token` (or `$SAMETRA_TOKEN`) supplies the API token for a remote node.
+`--api URL` (or `$SAMETRA_API`) points at a node other than `http://127.0.0.1:42424`, over `http://` or `https://`; `--token` (or `$SAMETRA_TOKEN`) supplies the API token for a remote node.
 
 ## The tools
 

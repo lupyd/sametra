@@ -103,7 +103,7 @@ The `d` tag makes one rating slot per (community, target, event), so rating the 
 
 ### Ordinary nostr clients (JSON)
 
-Any nostr client can use a Sametra node as a relay over `ws://host:7447`, or `wss://` when the node has a certificate:
+Any nostr client can use a Sametra node as a relay over `ws://host:42424`, or `wss://` when the node has a certificate:
 
 | client sends | node answers |
 |---|---|

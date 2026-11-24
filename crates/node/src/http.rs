@@ -337,13 +337,13 @@ mod tests {
     fn authorize_rules() {
         let n = node(Some("s3cret"));
         let a = |h: &[(&str, &str)], peer: &str| authorize(&n, &req(h), &peer.parse().unwrap(), false);
-        assert!(a(&[("Host", "127.0.0.1:7447")], LOCAL).is_ok());
-        assert!(a(&[("host", "localhost:7447"), ("Origin", "http://localhost:7447")], LOCAL).is_ok());
-        assert!(a(&[("Host", "[::1]:7447")], "[::1]:9").is_ok());
-        assert!(a(&[("Host", "127.0.0.1:7447")], REMOTE).is_err(), "remote without token");
-        assert_eq!(a(&[("Host", "evil.example:7447")], LOCAL), Err("bad Host header"), "DNS rebinding");
-        assert_eq!(a(&[("Host", "127.0.0.1:7447"), ("Origin", "http://evil.example")], LOCAL), Err("cross-origin write refused"));
-        assert!(a(&[("Host", "127.0.0.1:7447"), ("Origin", "http://127.0.0.1:9999")], LOCAL).is_err(), "other local port");
+        assert!(a(&[("Host", "127.0.0.1:42424")], LOCAL).is_ok());
+        assert!(a(&[("host", "localhost:42424"), ("Origin", "http://localhost:42424")], LOCAL).is_ok());
+        assert!(a(&[("Host", "[::1]:42424")], "[::1]:9").is_ok());
+        assert!(a(&[("Host", "127.0.0.1:42424")], REMOTE).is_err(), "remote without token");
+        assert_eq!(a(&[("Host", "evil.example:42424")], LOCAL), Err("bad Host header"), "DNS rebinding");
+        assert_eq!(a(&[("Host", "127.0.0.1:42424"), ("Origin", "http://evil.example")], LOCAL), Err("cross-origin write refused"));
+        assert!(a(&[("Host", "127.0.0.1:42424"), ("Origin", "http://127.0.0.1:9999")], LOCAL).is_err(), "other local port");
         assert!(a(&[], LOCAL).is_err(), "Host is required");
         // the token admits remote callers regardless of Host
         assert!(a(&[("Authorization", "Bearer s3cret"), ("Host", "node.example")], REMOTE).is_ok());
@@ -353,9 +353,9 @@ mod tests {
         let open = node(None);
         assert!(authorize(&open, &req(&[("Authorization", "Bearer "), ("Host", "x")]), &REMOTE.parse().unwrap(), false).is_err());
         // over TLS the page's origin is https://
-        let s = |o: &str| authorize(&open, &req(&[("Host", "localhost:7447"), ("Origin", o)]), &LOCAL.parse().unwrap(), true);
-        assert!(s("https://localhost:7447").is_ok());
-        assert!(s("http://localhost:7447").is_err());
+        let s = |o: &str| authorize(&open, &req(&[("Host", "localhost:42424"), ("Origin", o)]), &LOCAL.parse().unwrap(), true);
+        assert!(s("https://localhost:42424").is_ok());
+        assert!(s("http://localhost:42424").is_err());
     }
 
     #[test]

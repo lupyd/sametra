@@ -42,7 +42,7 @@ impl Default for Config {
     /// The CLI defaults (see `sametra --help`).
     fn default() -> Config {
         Config {
-            listen: "0.0.0.0:7447".into(),
+            listen: "0.0.0.0:42424".into(),
             data: PathBuf::from("."),
             peers: vec![],
             public_addr: None,
@@ -833,10 +833,10 @@ mod tests {
         let n = node_with("hb", |_| {});
         let k = Keys::generate();
         let hb = |addr: &str| k.sign(K_HEARTBEAT, vec![vec!["r".into(), addr.into()]], String::new());
-        let e = hb("ws://10.0.0.1:7447");
+        let e = hb("ws://10.0.0.1:42424");
         assert!(n.ingest(e.clone(), 1, false).unwrap().1);
         assert!(!n.ingest(e, 1, false).unwrap().1, "seen ephemeral ids are dropped");
-        assert!(n.book.lock().unwrap().contains_key("ws://10.0.0.1:7447"));
+        assert!(n.book.lock().unwrap().contains_key("ws://10.0.0.1:42424"));
         assert!(n.store.lock().unwrap().last_seen.get(&k.pubkey).is_some_and(|t| *t + 5 >= now()));
         assert_eq!(n.store.lock().unwrap().len(), 0, "heartbeats are not stored");
         n.ingest(hb("http://evil"), 1, false).unwrap();

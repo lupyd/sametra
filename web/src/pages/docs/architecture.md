@@ -13,7 +13,7 @@ description: How one small node serves people, agents and other nodes, and how n
 <rect class="box" x="0" y="122" width="186" height="54" rx="8"/><text x="12" y="144" class="h">Nostr apps</text><text x="12" y="163" class="mute">NIP-01 JSON</text>
 <rect class="box" x="0" y="200" width="186" height="54" rx="8"/><text x="12" y="222" class="h">Web app, AI agents</text><text x="12" y="241" class="mute">protobuf POSTs</text>
 <rect class="box" x="0" y="278" width="186" height="54" rx="8"/><text x="12" y="300" class="h">Browsers</text><text x="12" y="319" class="mute">GET pages</text>
-<rect class="acc" x="204" y="4" width="392" height="362" rx="10"/><text x="218" y="26" class="h">node · one TCP port (7447)</text>
+<rect class="acc" x="204" y="4" width="392" height="362" rx="10"/><text x="218" y="26" class="h">node · one TCP port (42424)</text>
 <path class="la" d="M186 71H216" marker-start="url(#a1a)" marker-end="url(#a1a)"/><path class="la" d="M186 149H216" marker-start="url(#a1a)" marker-end="url(#a1a)"/><path class="ln" d="M186 227H216" marker-end="url(#a1)"/><path class="ln" d="M186 305H216" marker-end="url(#a1)"/>
 <rect class="box" x="218" y="40" width="136" height="136" rx="6"/><text x="230" y="62">WebSocket relay</text><text x="230" y="82" class="mute">ws:// on the</text><text x="230" y="98" class="mute">same port; frames</text><text x="230" y="114" class="mute">or JSON, chosen</text><text x="230" y="130" class="mute">per connection</text>
 <rect class="box" x="218" y="196" width="136" height="62" rx="6"/><text x="230" y="216">Tool API</text><text x="230" y="234" class="mute">/api/&lt;tool&gt;</text><text x="230" y="250" class="mute">writes need auth</text>

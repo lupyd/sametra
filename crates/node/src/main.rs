@@ -21,7 +21,7 @@ USAGE:
    --print; see `sametra mcp --help`)
 
 RUN OPTIONS:
-  --listen ADDR          listen address              [default: 0.0.0.0:7447]
+  --listen ADDR          listen address              [default: 0.0.0.0:42424]
   --data DIR             data directory              [default: $SAMETRA_DATA or ~/.local/share/sametra]
   --peer URL             bootstrap peer, ws://host:port or wss://host (repeatable)
   --public URL           address others can dial you at (ws:// or wss://); announced to the network
@@ -177,7 +177,7 @@ fn main() {
 /// `--node`: make sure a node answers at the API address; if none does, start one
 /// in this process (in the background) with this data directory, and wait for it.
 fn ensure_node(args: &[String]) {
-    let api = opt(args, "--api").or(std::env::var("SAMETRA_API").ok()).unwrap_or_else(|| "http://127.0.0.1:7447".into());
+    let api = opt(args, "--api").or(std::env::var("SAMETRA_API").ok()).unwrap_or_else(|| "http://127.0.0.1:42424".into());
     let Some(addr) = api.strip_prefix("http://").map(|a| a.trim_end_matches('/').to_string()) else {
         die("--node needs an http:// API address on this machine")
     };
@@ -226,7 +226,7 @@ fn run(args: &[String]) {
     let data = data_dir(args);
     let keys = load_keys(&data);
     let cfg = node::Config {
-        listen: opt(args, "--listen").unwrap_or_else(|| "0.0.0.0:7447".into()),
+        listen: opt(args, "--listen").unwrap_or_else(|| "0.0.0.0:42424".into()),
         data,
         peers: opts(args, "--peer"),
         public_addr: opt(args, "--public"),
@@ -314,8 +314,8 @@ mod tests {
         assert_eq!(num(&args, "--max-events", 7usize), 7);
         assert_eq!(opt(&a(&["--data"]), "--data"), None, "flag without value");
         assert_eq!(url_host("wss://node.example.org/x").as_deref(), Some("node.example.org"));
-        assert_eq!(url_host("ws://1.2.3.4:7447").as_deref(), Some("1.2.3.4"));
-        assert_eq!(url_host("ws://[::1]:7447").as_deref(), Some("::1"));
+        assert_eq!(url_host("ws://1.2.3.4:42424").as_deref(), Some("1.2.3.4"));
+        assert_eq!(url_host("ws://[::1]:42424").as_deref(), Some("::1"));
     }
 
     #[test]

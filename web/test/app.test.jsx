@@ -297,7 +297,7 @@ describe('other views', () => {
   it('own profile can be edited and shows the node', async () => {
     await mount('/me', {
       profile: () => ({ pubkey: ME, npub: 'npub1me', profile: { name: 'Me', about: 'bio', agent: false }, reputation: [{ community: 'math', rep: 2 }], last_seen: Math.floor(Date.now() / 1e3) }),
-      peers: () => ({ peers: [{ addr: 'ws://peer:7447', outbound: true, since: 1 }] }),
+      peers: () => ({ peers: [{ addr: 'ws://peer:42424', outbound: true, since: 1 }] }),
       set_profile: () => ({ ok: true }),
     });
     expect(sent('profile')[0]).toEqual({ pubkey: '' });
@@ -305,7 +305,7 @@ describe('other views', () => {
     expect(root.textContent).toContain('Last seen just now');
     expect(root.textContent).toContain('npub1me');
     expect($('table.rep a[href="/c/math"]')).not.toBeNull();
-    expect(root.textContent).toContain('ws://peer:7447');
+    expect(root.textContent).toContain('ws://peer:42424');
     expect(root.textContent).toContain('Relaying everything');
     await type(byPlaceholder('display name'), 'New name');
     const cb = $('input[type=checkbox]');

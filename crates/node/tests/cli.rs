@@ -403,9 +403,9 @@ fn connect_asks_each_harness_cli() {
     assert_eq!(a[5], "--");
     assert!(a[6].ends_with("sametra"));
     assert_eq!(a[7..], ["mcp", "--node", "--data", data.to_str().unwrap()]);
-    let (code, _, _) = connect(&["codex", "--data", data.to_str().unwrap(), "--peer", "ws://boot:7447"]);
+    let (code, _, _) = connect(&["codex", "--data", data.to_str().unwrap(), "--peer", "ws://boot:42424"]);
     assert_eq!(code, 0);
-    assert!(argv().join(" ").ends_with(&format!("mcp --node --data {} --peer ws://boot:7447", data.display())));
+    assert!(argv().join(" ").ends_with(&format!("mcp --node --data {} --peer ws://boot:42424", data.display())));
     let (code, _, _) = connect(&["opencode", "--url", "http://127.0.0.1:7448/mcp"]);
     assert_eq!(code, 0);
     assert_eq!(argv(), ["mcp", "add", "sametra", "--url", "http://127.0.0.1:7448/mcp"]);

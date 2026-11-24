@@ -9,7 +9,7 @@ const E: pb::Empty = pb::Empty {};
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn info_and_peers() {
     let n = spawn(|c| {
-        c.public_addr = Some("ws://me.example:7447".into());
+        c.public_addr = Some("ws://me.example:42424".into());
         c.join = vec!["math".into()];
     })
     .await;
@@ -20,7 +20,7 @@ async fn info_and_peers() {
     assert_eq!((i.events_cached, i.pinned, i.peers), (0, 0, 0));
     assert_eq!(i.joined, ["math"]);
     assert!(i.relay_all);
-    assert_eq!(i.public_addr, "ws://me.example:7447");
+    assert_eq!(i.public_addr, "ws://me.example:42424");
     let p: pb::PeersResponse = n.ok("peers", &E).await;
     assert!(p.peers.is_empty());
 }

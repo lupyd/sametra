@@ -221,7 +221,7 @@ USAGE:
   sametra-mcp tools                    print tool schemas (JSON)
 
 OPTIONS:
-  --api URL      node API, http:// or https://   [default: $SAMETRA_API or http://127.0.0.1:7447]
+  --api URL      node API, http:// or https://   [default: $SAMETRA_API or http://127.0.0.1:42424]
   --token T      API token for remote write tools [default: $SAMETRA_TOKEN]
   --tls-ca FILE  extra CA certificate (PEM) to trust for https (repeatable; or $SAMETRA_TLS_CA)
   --url URL      connect: register a Streamable HTTP endpoint instead of launching a process
@@ -253,7 +253,7 @@ fn opt(args: &[String], name: &str) -> Option<String> {
 
 /// Build a [`Client`] from `--api/--token/--tls-ca` and their environment fallbacks.
 pub fn client_from_args(args: &[String]) -> Result<Client, String> {
-    let api = opt(args, "--api").or(std::env::var("SAMETRA_API").ok()).unwrap_or_else(|| "http://127.0.0.1:7447".into());
+    let api = opt(args, "--api").or(std::env::var("SAMETRA_API").ok()).unwrap_or_else(|| "http://127.0.0.1:42424".into());
     let token = opt(args, "--token").or(std::env::var("SAMETRA_TOKEN").ok());
     let mut ca: Vec<PathBuf> = args.windows(2).filter(|w| w[0] == "--tls-ca").map(|w| PathBuf::from(&w[1])).collect();
     if let Ok(c) = std::env::var("SAMETRA_TLS_CA") {
@@ -493,7 +493,7 @@ mod tests {
     fn api_urls() {
         assert!(Client::new("ftp://x", None, &[]).err().unwrap().contains("http://"));
         assert!(Client::new("http://", None, &[]).is_err());
-        assert!(Client::new("http://[::1]:7447", None, &[]).is_ok());
+        assert!(Client::new("http://[::1]:42424", None, &[]).is_ok());
         assert!(Client::new("https://x", None, &[PathBuf::from("/nonexistent.pem")]).is_err());
         #[cfg(feature = "tls")]
         {

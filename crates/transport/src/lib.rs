@@ -109,7 +109,7 @@ mod tests {
     #[test]
     fn urls() {
         let t = |s: &str| parse_url(s).unwrap();
-        assert_eq!(t("ws://a.example:7447"), Target { secure: false, host: "a.example".into(), port: 7447 });
+        assert_eq!(t("ws://a.example:42424"), Target { secure: false, host: "a.example".into(), port: 42424 });
         assert_eq!(t("wss://relay.example"), Target { secure: true, host: "relay.example".into(), port: 443 });
         assert_eq!(t("ws://host/path?x"), Target { secure: false, host: "host".into(), port: 80 });
         assert_eq!(t("wss://[::1]:9"), Target { secure: true, host: "::1".into(), port: 9 });

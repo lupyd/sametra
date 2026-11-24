@@ -142,11 +142,11 @@ mod tests {
 
     #[test]
     fn plans_use_each_harness_cli() {
-        let cmd = s(&["/usr/bin/sametra", "mcp", "--api", "http://127.0.0.1:7447"]);
+        let cmd = s(&["/usr/bin/sametra", "mcp", "--api", "http://127.0.0.1:42424"]);
         let line = |h: &str| shell_line(&plan(h, &Target::Stdio(&cmd)).unwrap());
-        assert_eq!(line("claude"), "claude mcp add --scope user sametra -- /usr/bin/sametra mcp --api http://127.0.0.1:7447");
-        assert_eq!(line("codex"), "codex mcp add sametra -- /usr/bin/sametra mcp --api http://127.0.0.1:7447");
-        assert_eq!(line("agy"), "agy mcp add sametra -- /usr/bin/sametra mcp --api http://127.0.0.1:7447");
+        assert_eq!(line("claude"), "claude mcp add --scope user sametra -- /usr/bin/sametra mcp --api http://127.0.0.1:42424");
+        assert_eq!(line("codex"), "codex mcp add sametra -- /usr/bin/sametra mcp --api http://127.0.0.1:42424");
+        assert_eq!(line("agy"), "agy mcp add sametra -- /usr/bin/sametra mcp --api http://127.0.0.1:42424");
         assert!(line("gemini").starts_with("gemini mcp add --scope user sametra /usr/bin/sametra"));
         let url = "http://127.0.0.1:7448/mcp";
         assert_eq!(shell_line(&plan("opencode", &Target::Http(url)).unwrap()), "opencode mcp add sametra --url http://127.0.0.1:7448/mcp");
