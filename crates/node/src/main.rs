@@ -7,10 +7,15 @@ const USAGE: &str = "sametra — P2P collective knowledge & research pooling nod
 USAGE:
   sametra [run] [OPTIONS]        run a node (relay + API + web UI on one port)
   sametra id [--data DIR] [--show-secret]   print this node's identity (creates one if missing)
-  sametra mcp [--api URL]        MCP stdio server for AI agents (talks to a running node)
+  sametra connect HARNESS        give an agent harness its own node and tools, in one line:
+                                 claude, codex, gemini, agy, pi; opencode with --url (see below)
+  sametra mcp [--node]           MCP server over stdio (official rmcp SDK). --node: use the local
+                                 node, or run one inside this process while the agent runs
+  sametra mcp --http ADDR        MCP over Streamable HTTP at http://ADDR/mcp (harnesses that take a URL)
   sametra call TOOL [JSON]       call a node tool from the shell, e.g. sametra call feed '{\"community\":\"math\"}'
   sametra tools                  print tool schemas (JSON)
-  (mcp/call take --api http(s)://…, --token T, --tls-ca FILE; see `sametra mcp --help`)
+  (mcp/call/connect take --api http(s)://…, --token T, --tls-ca FILE; connect takes --url URL,
+   --print; see `sametra mcp --help`)
 
 RUN OPTIONS:
   --listen ADDR          listen address              [default: 0.0.0.0:7447]
@@ -82,7 +87,7 @@ fn load_keys(dir: &PathBuf) -> Keys {
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = if args.first().is_some_and(|a| !a.starts_with('-')) { args.remove(0) } else { "run".into() };
-    let delegated = matches!(cmd.as_str(), "mcp" | "call" | "tools");
+    let delegated = matches!(cmd.as_str(), "mcp" | "call" | "tools" | "connect" | "skill");
     if !delegated && args.iter().any(|a| a == "-h" || a == "--help") {
         print!("{USAGE}");
         return;
@@ -96,13 +101,74 @@ fn main() {
                 println!("nsec:   {}", k.nsec());
             }
         }
-        // JSON front ends live in sametra-mcp (also shipped as the standalone `sametra-mcp`)
-        "mcp" | "call" | "tools" => std::process::exit(sametra_mcp::cli(&[vec![cmd.clone()], args].concat())),
+        // agent front ends live in sametra-mcp (also shipped as the standalone `sametra-mcp`)
+        "mcp" if args.iter().any(|a| a == "--node") => {
+            ensure_node(&args);
+            let rest: Vec<String> = args.iter().filter(|a| *a != "--node").cloned().collect();
+            std::process::exit(sametra_mcp::cli(&[vec!["mcp".to_string()], strip_node_flags(&rest)].concat()))
+        }
+        "connect" if !args.iter().any(|a| a == "-h" || a == "--help") => {
+            let pos = sametra_mcp::positionals(&args);
+            let Some(harness) = pos.first() else { die("usage: sametra connect HARNESS (claude, codex, gemini, agy, opencode, pi)") };
+            let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "sametra".into());
+            // the harness launches `sametra mcp --node`: the agent gets this machine's
+            // node, or its own one while it runs, with a persistent identity
+            let mut server = vec![exe.clone(), "mcp".into(), "--node".into(), "--data".into(), data_dir(&args).display().to_string()];
+            for flag in ["--api", "--peer", "--join"] {
+                for w in args.windows(2).filter(|w| w[0] == flag) {
+                    server.extend([w[0].clone(), w[1].clone()]);
+                }
+            }
+            let url = opt(&args, "--url");
+            std::process::exit(sametra_mcp::connect_cli(harness, &server, url.as_deref(), args.iter().any(|a| a == "--print"), &format!("{exe} call")))
+        }
+        "mcp" | "call" | "tools" | "connect" | "skill" => std::process::exit(sametra_mcp::cli(&[vec![cmd.clone()], args].concat())),
         _ => {
             eprint!("{USAGE}");
             std::process::exit(2);
         }
     }
+}
+
+/// `--node`: make sure a node answers at the API address; if none does, start one
+/// in this process (in the background) with this data directory, and wait for it.
+fn ensure_node(args: &[String]) {
+    let api = opt(args, "--api").or(std::env::var("SAMETRA_API").ok()).unwrap_or_else(|| "http://127.0.0.1:7447".into());
+    let Some(addr) = api.strip_prefix("http://").map(|a| a.trim_end_matches('/').to_string()) else {
+        die("--node needs an http:// API address on this machine")
+    };
+    if std::net::TcpStream::connect(&addr).is_ok() {
+        return; // a node is already running here: share it
+    }
+    let mut node_args = vec!["--listen".to_string(), addr.clone()];
+    for flag in ["--data", "--peer", "--join", "--public"] {
+        for w in args.windows(2).filter(|w| w[0] == flag) {
+            node_args.extend([w[0].clone(), w[1].clone()]);
+        }
+    }
+    std::thread::spawn(move || run(&node_args));
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while std::net::TcpStream::connect(&addr).is_err() {
+        if std::time::Instant::now() > end {
+            die(&format!("the node did not start on {addr}"));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
+/// Node-only flags are not for the MCP server.
+fn strip_node_flags(args: &[String]) -> Vec<String> {
+    let mut out = vec![];
+    let mut i = 0;
+    while i < args.len() {
+        if matches!(args[i].as_str(), "--data" | "--peer" | "--join" | "--public") {
+            i += 2;
+        } else {
+            out.push(args[i].clone());
+            i += 1;
+        }
+    }
+    out
 }
 
 fn run(args: &[String]) {

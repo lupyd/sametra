@@ -198,16 +198,20 @@ fn mcp_stdio_server() {
         stdout.read_line(&mut line).unwrap();
         serde_json::from_str(&line).unwrap()
     };
-    send(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-03-26"}}));
+    // incomplete initialize requests are refused, as the MCP spec requires
+    send(json!({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}}));
+    assert_eq!(recv()["error"]["code"], -32602);
+    send(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "1"}}}));
     let init = recv();
     assert_eq!(init["id"], 1);
-    assert_eq!(init["result"]["protocolVersion"], "2025-03-26", "echoes the client's version");
+    assert_eq!(init["result"]["protocolVersion"], "2025-06-18");
     assert_eq!(init["result"]["serverInfo"]["name"], "sametra");
     assert!(init["result"]["capabilities"]["tools"].is_object());
     assert!(init["result"]["instructions"].as_str().unwrap().contains("public"));
-    // notifications and junk lines get no reply: the next line answers the ping
+    // notifications get no reply; junk gets an "invalid request" error; then the ping
     send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
     send(json!("not an object"));
+    assert_eq!(recv()["error"]["code"], -32600);
     send(json!({"jsonrpc": "2.0", "id": "p", "method": "ping"}));
     assert_eq!(recv(), json!({"jsonrpc": "2.0", "id": "p", "result": {}}));
 
@@ -325,4 +329,126 @@ fn tls_node_and_https_calls() {
     // SAMETRA_TLS_CA works like --tls-ca, and so does the MCP server
     let o = cmd(&d.0).args(["call", "--api", &https, "info"]).env("SAMETRA_TLS_CA", &cert).output().unwrap();
     assert_eq!(out(o).0, 0);
+}
+
+/// One JSON-RPC session over the MCP stdio server of `sametra mcp ARGS...`.
+fn mcp_session(data: &Path, args: &[&str], calls: &[(&str, Value)]) -> Vec<Value> {
+    let mut p = cmd(data).arg("mcp").args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+    let mut stdin = p.stdin.take().unwrap();
+    let mut out = BufReader::new(p.stdout.take().unwrap());
+    let mut send = |v: Value| writeln!(stdin, "{v}").unwrap();
+    let mut recv = || -> Value {
+        let mut l = String::new();
+        out.read_line(&mut l).unwrap();
+        serde_json::from_str(&l).unwrap()
+    };
+    send(json!({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "1"}}}));
+    assert_eq!(recv()["result"]["serverInfo"]["name"], "sametra");
+    send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+    let mut res = vec![];
+    for (i, (name, a)) in calls.iter().enumerate() {
+        send(json!({"jsonrpc": "2.0", "id": i + 1, "method": "tools/call", "params": {"name": name, "arguments": a}}));
+        let r = recv();
+        res.push(serde_json::from_str(r["result"]["content"][0]["text"].as_str().unwrap()).unwrap_or(r));
+    }
+    drop(stdin); // EOF: the MCP server exits
+    let _ = p.wait();
+    res
+}
+
+#[test]
+fn mcp_node_runs_or_shares_a_node() {
+    let d = tempdir("mcp-node");
+    let api = format!("http://127.0.0.1:{}", free_port());
+    // no node at that address: the MCP server starts one, with this data directory's identity
+    let own = mcp_session(&d.0, &["--node", "--api", &api, "--data", d.0.to_str().unwrap()], &[("info", json!({})), ("set_profile", json!({"name": "Agent", "agent": true, "model": "x"}))]);
+    let (_, ident, _) = out(cmd(&d.0).args(["id", "--data", d.0.to_str().unwrap()]).output().unwrap());
+    assert!(ident.contains(own[0]["npub"].as_str().unwrap()), "embedded node uses the data directory's key");
+    assert_eq!(own[1]["ok"], true);
+    // a node already running there: the MCP server shares it instead
+    let other = tempdir("mcp-node-other");
+    let (_node, port) = run_node(&other.0, 0, &[]);
+    let shared = mcp_session(&d.0, &["--node", "--api", &format!("http://127.0.0.1:{port}"), "--data", d.0.to_str().unwrap()], &[("info", json!({}))]);
+    let (_, other_id, _) = out(cmd(&other.0).args(["id", "--data", other.0.to_str().unwrap()]).output().unwrap());
+    assert!(other_id.contains(shared[0]["npub"].as_str().unwrap()));
+}
+
+#[test]
+fn connect_asks_each_harness_cli() {
+    let d = tempdir("connect");
+    // a stand-in `claude` that records how it was called
+    let bin = d.0.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let log = d.0.join("argv");
+    let script = format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n", log.display());
+    for h in ["claude", "codex", "gemini", "agy", "opencode"] {
+        let f = bin.join(h);
+        std::fs::write(&f, &script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+    let data = d.0.join("agent");
+    let connect = |args: &[&str]| out(cmd(&d.0).arg("connect").args(args).env("PATH", &path).env("HOME", &d.0).output().unwrap());
+    let argv = || std::fs::read_to_string(&log).unwrap().lines().map(String::from).collect::<Vec<_>>();
+    let (code, stdout, _) = connect(&["claude", "--data", data.to_str().unwrap()]);
+    assert_eq!(code, 0, "{stdout}");
+    let a = argv();
+    assert_eq!(a[..5], ["mcp", "add", "--scope", "user", "sametra"]);
+    assert_eq!(a[5], "--");
+    assert!(a[6].ends_with("sametra"));
+    assert_eq!(a[7..], ["mcp", "--node", "--data", data.to_str().unwrap()]);
+    let (code, _, _) = connect(&["codex", "--data", data.to_str().unwrap(), "--peer", "ws://boot:7447"]);
+    assert_eq!(code, 0);
+    assert!(argv().join(" ").ends_with(&format!("mcp --node --data {} --peer ws://boot:7447", data.display())));
+    let (code, _, _) = connect(&["opencode", "--url", "http://127.0.0.1:7448/mcp"]);
+    assert_eq!(code, 0);
+    assert_eq!(argv(), ["mcp", "add", "sametra", "--url", "http://127.0.0.1:7448/mcp"]);
+    // --print shows the command without running it
+    std::fs::remove_file(&log).unwrap();
+    let (code, stdout, _) = connect(&["gemini", "--print"]);
+    assert_eq!(code, 0);
+    assert!(stdout.starts_with("gemini mcp add --scope user sametra "));
+    assert!(!log.exists());
+    // pi has no MCP: it gets an Agent Skill
+    let (code, stdout, _) = connect(&["pi"]);
+    assert_eq!(code, 0, "{stdout}");
+    let skill = std::fs::read_to_string(d.0.join(".pi/agent/skills/sametra/SKILL.md")).unwrap();
+    assert!(skill.starts_with("---\nname: sametra\n") && skill.contains(" call notifications"));
+    let (code, _, stderr) = connect(&["emacs"]);
+    assert!(code == 2 && stderr.contains("unknown harness"));
+    let (code, _, stderr) = connect(&["opencode"]);
+    assert!(code == 2 && stderr.contains("--url"));
+}
+
+#[test]
+fn mcp_over_streamable_http() {
+    use std::io::Read;
+    let d = tempdir("mcp-http");
+    let (_node, port) = run_node(&d.0, 0, &[]);
+    let mcp_port = free_port();
+    let _mcp = Proc(cmd(&d.0).args(["mcp", "--http", &format!("127.0.0.1:{mcp_port}"), "--api", &format!("http://127.0.0.1:{port}")]).stderr(Stdio::null()).spawn().unwrap());
+    assert!(wait(Duration::from_secs(10), || std::net::TcpStream::connect(("127.0.0.1", mcp_port)).is_ok()));
+    let mut session = String::new();
+    let mut post = |body: Value| -> Option<Value> {
+        let b = body.to_string();
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", mcp_port)).unwrap();
+        let sid = if session.is_empty() { String::new() } else { format!("Mcp-Session-Id: {session}\r\n") };
+        write!(s, "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{mcp_port}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nMCP-Protocol-Version: 2025-06-18\r\n{sid}Content-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len()).unwrap();
+        let mut resp = String::new();
+        s.read_to_string(&mut resp).unwrap();
+        if let Some(h) = resp.lines().find(|l| l.to_ascii_lowercase().starts_with("mcp-session-id:")) {
+            session = h.split_once(':').unwrap().1.trim().to_string();
+        }
+        resp.lines().filter_map(|l| l.strip_prefix("data:")).map(str::trim).rfind(|l| l.starts_with('{')).map(|l| serde_json::from_str(l).unwrap())
+    };
+    let init = post(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "1"}}})).unwrap();
+    assert_eq!(init["result"]["serverInfo"]["name"], "sametra");
+    post(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+    let info = post(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "info", "arguments": {}}})).unwrap();
+    let v: Value = serde_json::from_str(info["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert!(v["npub"].as_str().unwrap().starts_with("npub1"));
 }

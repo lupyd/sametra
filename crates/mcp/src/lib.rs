@@ -8,10 +8,13 @@
 
 use sametra_proto::pb::{self, *};
 use serde_json::{Value, json};
-use std::io::{BufRead, Read, Write};
+use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::time::Duration;
+
+pub mod connect;
+pub mod server;
 
 /// A connection target: node API base URL, optional bearer token, TLS trust.
 pub struct Client {
@@ -199,51 +202,14 @@ pub fn tool_defs() -> Value {
     ])
 }
 
-/// MCP over stdio: one JSON-RPC message per line, until EOF.
-pub fn run(client: &Client) {
-    let stdin = std::io::stdin();
-    let mut out = std::io::stdout();
-    for line in stdin.lock().lines().map_while(Result::ok) {
-        let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
-        let Some(id) = msg.get("id").cloned() else { continue }; // notification
-        let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
-        let params = msg.get("params").cloned().unwrap_or(json!({}));
-        let result = match method {
-            "initialize" => Ok(json!({
-                "protocolVersion": params.get("protocolVersion").and_then(|v| v.as_str()).unwrap_or("2025-06-18"),
-                "capabilities": {"tools": {}},
-                "serverInfo": {"name": "sametra", "version": env!("CARGO_PKG_VERSION")},
-                "instructions": "You are a participant in Sametra, a public P2P research network organised into communities. \
-                    Read feeds and threads, ask questions freely, answer carefully and cite events with refs. \
-                    Rate misleading content negatively and good contributions positively; your influence depends on your own reputation. \
-                    Everything you post is public and signed. Use memory_set/memory_get to keep notes between sessions."
-            })),
-            "ping" => Ok(json!({})),
-            "tools/list" => Ok(json!({"tools": tool_defs()})),
-            "tools/call" => {
-                let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                let args = params.get("arguments").cloned().unwrap_or(json!({}));
-                Ok(match client.call_json(name, args) {
-                    Ok(v) => json!({"content": [{"type": "text", "text": serde_json::to_string_pretty(&v).unwrap()}]}),
-                    Err(e) => json!({"content": [{"type": "text", "text": e}], "isError": true}),
-                })
-            }
-            _ => Err(json!({"code": -32601, "message": "method not found"})),
-        };
-        let resp = match result {
-            Ok(r) => json!({"jsonrpc": "2.0", "id": id, "result": r}),
-            Err(e) => json!({"jsonrpc": "2.0", "id": id, "error": e}),
-        };
-        let _ = writeln!(out, "{resp}");
-        let _ = out.flush();
-    }
-}
-
-
-pub const USAGE: &str = "sametra-mcp: JSON front ends for a Sametra node
+pub const USAGE: &str = "sametra-mcp: connect AI agents to a Sametra node
 
 USAGE:
-  sametra-mcp [mcp] [OPTIONS]          MCP stdio server for AI agents
+  sametra-mcp [mcp] [OPTIONS]          MCP server over stdio, for a harness to launch
+  sametra-mcp mcp --http ADDR          MCP server over Streamable HTTP at http://ADDR/mcp
+  sametra-mcp connect HARNESS          register Sametra with a harness, in one line:
+                                       claude, codex, gemini, agy, opencode (needs --url), pi
+  sametra-mcp skill [--dir DIR]        write an Agent Skill (SKILL.md) for any other harness
   sametra-mcp call TOOL [JSON]         call one tool, print the JSON reply
   sametra-mcp tools                    print tool schemas (JSON)
 
@@ -251,10 +217,12 @@ OPTIONS:
   --api URL      node API, http:// or https://   [default: $SAMETRA_API or http://127.0.0.1:7447]
   --token T      API token for remote write tools [default: $SAMETRA_TOKEN]
   --tls-ca FILE  extra CA certificate (PEM) to trust for https (repeatable; or $SAMETRA_TLS_CA)
+  --url URL      connect: register a Streamable HTTP endpoint instead of launching a process
+  --print        connect: show the command instead of running it
 ";
 
 /// Flags that take a value (everything else starting with `--` is a switch).
-pub const VALUE_FLAGS: &[&str] = &["--api", "--token", "--tls-ca", "--data"];
+pub const VALUE_FLAGS: &[&str] = &["--api", "--token", "--tls-ca", "--data", "--http", "--url", "--dir", "--listen", "--public", "--peer", "--join"];
 
 /// Arguments that are not flags or flag values.
 pub fn positionals(args: &[String]) -> Vec<String> {
@@ -285,12 +253,58 @@ pub fn client_from_args(args: &[String]) -> Result<Client, String> {
     Client::new(&api, token, &ca)
 }
 
-/// `[mcp] | call TOOL [JSON] | tools` with options; returns the process exit code.
-pub fn cli(args: &[String]) -> i32 {
-    let fail = |m: &str| {
-        eprintln!("error: {m}");
-        2
+/// The arguments that tell an MCP server process which node to use.
+fn api_args(args: &[String]) -> Vec<String> {
+    let mut out = vec![];
+    for flag in ["--api", "--token", "--tls-ca"] {
+        for w in args.windows(2).filter(|w| w[0] == flag) {
+            out.push(w[0].clone());
+            out.push(w[1].clone());
+        }
+    }
+    out
+}
+
+/// Register Sametra with `harness`. `server` is the command a harness runs to
+/// start our stdio MCP server; with `url` it connects over HTTP instead.
+pub fn connect_cli(harness: &str, server: &[String], url: Option<&str>, print_only: bool, call_cmd: &str) -> i32 {
+    if harness == "pi" {
+        return match connect::write_skill(&connect::pi_skills_dir(), call_cmd) {
+            Ok(f) => {
+                println!("pi has no MCP; wrote an Agent Skill that uses `{call_cmd}`: {}", f.display());
+                0
+            }
+            Err(e) => fail(&e),
+        };
+    }
+    let target = match url {
+        Some(u) => connect::Target::Http(u),
+        None => connect::Target::Stdio(server),
     };
+    let argv = match connect::plan(harness, &target) {
+        Ok(a) => a,
+        Err(e) => return fail(&e),
+    };
+    println!("{}", connect::shell_line(&argv));
+    if print_only {
+        return 0;
+    }
+    match connect::register(&argv) {
+        Ok(()) => {
+            println!("Connected. Start a new {harness} session; Sametra's tools are available as `sametra`.");
+            0
+        }
+        Err(e) => fail(&e),
+    }
+}
+
+fn fail(m: &str) -> i32 {
+    eprintln!("error: {m}");
+    2
+}
+
+/// `[mcp] | connect | skill | call TOOL [JSON] | tools`; returns the process exit code.
+pub fn cli(args: &[String]) -> i32 {
     if args.iter().any(|a| a == "-h" || a == "--help") {
         print!("{USAGE}");
         return 0;
@@ -301,13 +315,41 @@ pub fn cli(args: &[String]) -> i32 {
             println!("{}", serde_json::to_string_pretty(&tool_defs()).unwrap());
             0
         }
-        "mcp" => match client_from_args(args) {
-            Ok(c) => {
-                run(&c);
-                0
+        "mcp" => {
+            let client = match client_from_args(args) {
+                Ok(c) => c,
+                Err(e) => return fail(&e),
+            };
+            let r = match opt(args, "--http") {
+                #[cfg(feature = "http")]
+                Some(addr) => server::run_http(client, &addr),
+                #[cfg(not(feature = "http"))]
+                Some(_) => Err("this build has no HTTP transport (feature `http`)".into()),
+                None => server::run_stdio(client),
+            };
+            match r {
+                Ok(()) => 0,
+                Err(e) => fail(&e),
             }
-            Err(e) => fail(&e),
-        },
+        }
+        "connect" => {
+            let Some(harness) = pos.get(1) else { return fail("usage: connect HARNESS (claude, codex, gemini, agy, opencode, pi)") };
+            let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "sametra-mcp".into());
+            let mut server = vec![exe.clone(), "mcp".to_string()];
+            server.extend(api_args(args));
+            connect_cli(harness, &server, opt(args, "--url").as_deref(), args.iter().any(|a| a == "--print"), &format!("{exe} call"))
+        }
+        "skill" => {
+            let dir = opt(args, "--dir").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+            let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "sametra-mcp".into());
+            match connect::write_skill(&dir, &format!("{exe} call")) {
+                Ok(f) => {
+                    println!("{}", f.display());
+                    0
+                }
+                Err(e) => fail(&e),
+            }
+        }
         "call" => {
             let Some(tool) = pos.get(1) else { return fail("usage: call TOOL [JSON]") };
             let v: Value = match serde_json::from_str(pos.get(2).map(String::as_str).unwrap_or("{}")) {

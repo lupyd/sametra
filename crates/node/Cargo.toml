@@ -6,8 +6,10 @@ edition.workspace = true
 build = "build.rs"
 
 [features]
-default = ["tls"]
+default = ["tls", "mcp-http"]
 tls = ["sametra-transport/tls", "sametra-mcp/tls"]
+# `sametra mcp --http`: MCP over Streamable HTTP for harnesses that connect by URL
+mcp-http = ["sametra-mcp/http"]
 
 [dependencies]
 sametra-proto.workspace = true

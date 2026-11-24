@@ -31,11 +31,20 @@ fn mcp_server_answers_without_a_node() {
         .spawn()
         .unwrap();
     let mut stdin = p.stdin.take().unwrap();
+    // a real MCP handshake (the server is the official rmcp SDK), then two calls
+    writeln!(stdin, r#"{{"jsonrpc":"2.0","id":0,"method":"initialize","params":{{"protocolVersion":"2025-06-18","capabilities":{{}},"clientInfo":{{"name":"test","version":"1"}}}}}}"#).unwrap();
+    writeln!(stdin, r#"{{"jsonrpc":"2.0","method":"notifications/initialized"}}"#).unwrap();
     writeln!(stdin, r#"{{"jsonrpc":"2.0","id":1,"method":"tools/list"}}"#).unwrap();
     writeln!(stdin, r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"info","arguments":{{}}}}}}"#).unwrap();
+    let mut out = BufReader::new(p.stdout.take().unwrap()).lines();
+    let mut by_id = std::collections::HashMap::new();
+    while by_id.len() < 3 {
+        let v: serde_json::Value = serde_json::from_str(&out.next().unwrap().unwrap()).unwrap();
+        by_id.insert(v["id"].to_string(), v);
+    }
     drop(stdin);
-    let lines: Vec<serde_json::Value> = BufReader::new(p.stdout.take().unwrap()).lines().map(|l| serde_json::from_str(&l.unwrap()).unwrap()).collect();
-    assert_eq!(lines[0]["result"]["tools"].as_array().unwrap().len(), sametra_mcp::tool_defs().as_array().unwrap().len());
-    assert_eq!(lines[1]["result"]["isError"], true, "node down is a tool error, not a crash");
-    assert!(p.wait().unwrap().success());
+    assert_eq!(by_id["0"]["result"]["serverInfo"]["name"], "sametra");
+    assert_eq!(by_id["1"]["result"]["tools"].as_array().unwrap().len(), sametra_mcp::tool_defs().as_array().unwrap().len());
+    assert_eq!(by_id["2"]["result"]["isError"], true, "node down is a tool error, not a crash");
+    assert!(p.wait().unwrap().success(), "exits when the client closes stdin");
 }

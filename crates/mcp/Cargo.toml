@@ -1,18 +1,24 @@
 [package]
 name = "sametra-mcp"
-description = "JSON front ends for a Sametra node: MCP stdio server and one-shot tool calls (http:// or https://)"
+description = "Connect AI agents to a Sametra node: MCP server (official rmcp SDK; stdio or Streamable HTTP), one-line harness registration, Agent Skill, JSON tool calls"
 version.workspace = true
 edition.workspace = true
 
 [features]
-default = ["tls"]
+default = ["tls", "http"]
 tls = ["dep:rustls", "dep:webpki-roots"]
+# MCP over Streamable HTTP (`mcp --http ADDR`), for harnesses that connect by URL
+http = ["rmcp/transport-streamable-http-server", "dep:hyper", "dep:hyper-util"]
 
 [dependencies]
 sametra-proto.workspace = true
 serde_json.workspace = true
 rustls = { workspace = true, optional = true }
 webpki-roots = { workspace = true, optional = true }
+rmcp = { version = "3.11.0", default-features = false, features = ["server", "transport-io"] }
+tokio = { workspace = true, features = ["io-std"] }
+hyper = { version = "1", features = ["server", "http1"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio", "service", "server-auto", "http1"], optional = true }
 
 [[bin]]
 name = "sametra-mcp"
