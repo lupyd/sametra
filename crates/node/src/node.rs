@@ -36,6 +36,34 @@ pub struct Config {
     pub tls_key: Option<PathBuf>,
     /// Extra CA certificates (PEM) trusted when dialing wss:// peers.
     pub tls_ca: Vec<PathBuf>,
+    /// Networks treated like localhost for write tools (e.g. the Docker bridge
+    /// gateway the host's requests come from). Host and Origin checks still apply.
+    pub trusted: Vec<(std::net::IpAddr, u8)>,
+}
+
+impl Config {
+    /// Is a request from `ip` as good as one from this machine?
+    pub fn trusts(&self, ip: std::net::IpAddr) -> bool {
+        ip.is_loopback() || self.trusted.iter().any(|(net, bits)| in_net(ip, *net, *bits))
+    }
+}
+
+fn in_net(ip: std::net::IpAddr, net: std::net::IpAddr, bits: u8) -> bool {
+    use std::net::IpAddr::*;
+    match (ip, net) {
+        (V4(a), V4(n)) => bits == 0 || u32::from(a) >> (32 - bits as u32) == u32::from(n) >> (32 - bits as u32),
+        (V6(a), V6(n)) => bits == 0 || u128::from(a) >> (128 - bits as u32) == u128::from(n) >> (128 - bits as u32),
+        _ => false,
+    }
+}
+
+/// `10.42.0.1/32`, `fd00::/8` or a bare address.
+pub fn parse_cidr(s: &str) -> Result<(std::net::IpAddr, u8), String> {
+    let (a, b) = s.trim().split_once('/').unwrap_or((s.trim(), ""));
+    let ip: std::net::IpAddr = a.parse().map_err(|_| format!("not an address: '{s}'"))?;
+    let max = if ip.is_ipv4() { 32 } else { 128 };
+    let bits = if b.is_empty() { max } else { b.parse().ok().filter(|n| *n <= max).ok_or_else(|| format!("bad prefix length in '{s}'"))? };
+    Ok((ip, bits))
 }
 
 impl Default for Config {
@@ -55,6 +83,7 @@ impl Default for Config {
             tls_cert: None,
             tls_key: None,
             tls_ca: vec![],
+            trusted: vec![],
         }
     }
 }
@@ -120,11 +149,9 @@ pub struct Node {
     /// Present when the node serves TLS (`tls_cert` + `tls_key`).
     #[cfg(feature = "tls")]
     pub tls: Option<sametra_transport::tls::TlsAcceptor>,
-    /// The built-in IPFS node, once started.
+    /// The IPFS daemon (Kubo) this node uses, if configured.
     #[cfg(feature = "ipfs")]
     pub ipfs: std::sync::OnceLock<Arc<crate::ipfs::Ipfs>>,
-    /// Our IPFS heartbeat tag (peer id and addresses), once known.
-    pub ipfs_tag: Mutex<Option<Vec<String>>>,
 }
 
 /// (provider, capability id) -> (reputation, raters)
@@ -133,7 +160,7 @@ pub type CapScores = HashMap<(H32, String), (f64, usize)>;
 pub const ORIGIN_LOCAL: u64 = 0;
 /// Relayed by every node, whatever it joined: small metadata, and capability
 /// jobs (so requests and results find their way through scoped nodes).
-const GLOBAL_KINDS: [u32; 8] = [K_PROFILE, K_COMMUNITY, K_RATING, K_DELETE, K_CAPABILITY, K_JOB, K_JOB_RESULT, K_JOB_FEEDBACK];
+const GLOBAL_KINDS: [u32; 9] = [K_PROFILE, K_COMMUNITY, K_RATING, K_DELETE, K_CAPABILITY, K_JOB, K_JOB_RESULT, K_JOB_FEEDBACK, K_FILE];
 
 impl Node {
     pub fn new(cfg: Config, keys: Keys) -> std::io::Result<Arc<Node>> {
@@ -189,7 +216,6 @@ impl Node {
             tls,
             #[cfg(feature = "ipfs")]
             ipfs: std::sync::OnceLock::new(),
-            ipfs_tag: Mutex::new(None),
         });
         node.save_state();
         Ok(node)
@@ -307,7 +333,7 @@ impl Node {
                     && let Some(ipfs) = self.ipfs.get()
                     && let Ok(rt) = tokio::runtime::Handle::try_current()
                 {
-                    for cid in crate::ipfs::linked_cids(&e.content) {
+                    for cid in crate::files::linked_cids(&e.content) {
                         let ipfs = ipfs.clone();
                         rt.spawn(async move { ipfs.cache(cid).await });
                     }
@@ -372,11 +398,12 @@ impl Node {
         for c in self.joined.lock().unwrap().iter().take(50) {
             tags.push(vec!["c".to_string(), c.clone()]);
         }
-        // our IPFS side, so Sametra nodes swap files directly
-        tags.extend(self.ipfs_tag.lock().unwrap().clone());
+        // our IPFS daemon, so Sametra nodes connect theirs and swap files directly
+        #[cfg(feature = "ipfs")]
+        tags.extend(self.ipfs.get().and_then(|i| i.heartbeat_tag()));
         self.keys.sign(K_HEARTBEAT, tags, String::new())
     }
-    fn heartbeat(&self) {
+    pub fn heartbeat(&self) {
         let _ = self.ingest(self.heartbeat_event(), ORIGIN_LOCAL, true);
     }
 

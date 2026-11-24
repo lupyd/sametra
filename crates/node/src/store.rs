@@ -3,7 +3,7 @@
 //! Retention model (see README): an event lives on this node while
 //!  * it was authored by this node's identity, or
 //!  * it is pinned here, or
-//!  * it is small metadata (profiles, community definitions, ratings, capabilities), or
+//!  * it is small metadata (profiles, community definitions, ratings, capabilities, file metadata), or
 //!  * its author has been seen on the network within `author_ttl`, extended for
 //!    popular content (cited, viewed, fetched, found by searches) by up to 10x
 //!
@@ -44,7 +44,7 @@ pub struct Store {
 }
 
 fn is_metadata(kind: u32) -> bool {
-    matches!(kind, K_PROFILE | K_COMMUNITY | K_RATING | K_CAPABILITY | 3)
+    matches!(kind, K_PROFILE | K_COMMUNITY | K_RATING | K_CAPABILITY | K_FILE | 3)
 }
 
 /// Popularity halves every week without new use.

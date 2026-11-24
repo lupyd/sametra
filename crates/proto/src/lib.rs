@@ -50,6 +50,7 @@ macro_rules! tools {
             ipfs_add: IpfsAddRequest => IpfsAddResponse, true;
             ipfs_get: IpfsGetRequest => IpfsGetResponse, true;
             ipfs_pin: IpfsPinRequest => Ack, true;
+            files: FilesRequest => FilesResponse, false;
         }
     };
 }

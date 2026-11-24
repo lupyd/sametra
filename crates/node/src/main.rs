@@ -31,6 +31,8 @@ RUN OPTIONS:
   --max-peers N          outbound connections         [default: 8]
   --author-ttl-hours N   drop unpinned content of authors unseen this long [default: 168]
   --api-token TOKEN      allow write tools from non-localhost with 'Authorization: Bearer TOKEN'
+  --trust-net CIDR       treat requests from this network like localhost for write tools, e.g.
+                         a Docker bridge gateway (repeatable; or $SAMETRA_TRUST_NET, comma-separated)
   --threads N            worker threads               [default: 2]
   --log FILTER           what to log: a level (debug) or an EnvFilter (warn,sametra_node=debug)
                          [default: $SAMETRA_LOG, $RUST_LOG, or info for sametra, warn for the rest]
@@ -41,30 +43,17 @@ TLS (optional; the port then serves both plain and TLS connections):
   --tls-key FILE         private key (PEM)
   --tls-ca FILE          extra CA (PEM) to trust when dialing wss:// peers (repeatable)
 
-IPFS (a built-in IPFS node; files at /ipfs/CID on the same port as the UI):
-  --no-ipfs              no IPFS node
-  --ipfs-port N          libp2p port, TCP and UDP/QUIC [default: 7449; any free port if taken]
-  --ipfs-private         stay off the public IPFS network (Sametra peers only)
-  --ipfs-cache-mb N      room for files that posts link to   [default: 1024]
-  --ipfs-max-file-mb N   largest such file to fetch and keep [default: 32]
-  --ipfs-open-gateway    fetch from the network for anyone over HTTP (default: only for
-                         the operator; others get files this node already has)
+IPFS (files, through a Kubo daemon running beside the node; see docker-compose.yml):
+  --ipfs-api URL         Kubo's RPC API      [default: $SAMETRA_IPFS_API or http://127.0.0.1:5001]
+  --ipfs-api-auth VALUE  Authorization header for it, e.g. \"Bearer T\" [or $SAMETRA_IPFS_API_AUTH]
+  --no-ipfs              no files
+  --ipfs-max-file-mb N   largest file a post links to that the node fetches and keeps [default: 32]
+  --ipfs-open-gateway    /ipfs/ fetches from the network for anyone (default: only for the
+                         operator; others get what the daemon already has)
 
 IDENTITY:
   Key is read from $SAMETRA_KEY (nsec or hex) or DATA/key; generated on first run.
 ";
-
-/// `ws://host:port/x` -> `host`.
-#[cfg_attr(not(feature = "ipfs"), allow(dead_code))]
-fn url_host(url: &str) -> Option<String> {
-    let rest = url.split_once("://").map(|x| x.1).unwrap_or(url);
-    let authority = rest.split('/').next()?;
-    let host = match authority.strip_prefix('[') {
-        Some(v6) => v6.split(']').next()?,
-        None => authority.rsplit_once(':').map(|x| x.0).unwrap_or(authority),
-    };
-    (!host.is_empty()).then(|| host.to_string())
-}
 
 fn data_dir(args: &[String]) -> PathBuf {
     if let Some(d) = opt(args, "--data") {
@@ -208,8 +197,8 @@ fn ensure_node(args: &[String]) {
 }
 
 /// Node flags `mcp --node` and `agent` pass on to the node they start.
-const NODE_FLAGS: &[&str] = &["--data", "--peer", "--join", "--public", "--ipfs-port", "--ipfs-cache-mb", "--ipfs-max-file-mb"];
-const NODE_SWITCHES: &[&str] = &["--no-ipfs", "--ipfs-private", "--no-relay-all"];
+const NODE_FLAGS: &[&str] = &["--data", "--peer", "--join", "--public", "--ipfs-api", "--ipfs-api-auth", "--ipfs-max-file-mb"];
+const NODE_SWITCHES: &[&str] = &["--no-ipfs", "--ipfs-open-gateway", "--no-relay-all"];
 
 /// Node-only flags are not for the MCP server.
 fn strip_node_flags(args: &[String]) -> Vec<String> {
@@ -245,22 +234,19 @@ fn run(args: &[String]) {
         tls_cert: opt(args, "--tls-cert").map(PathBuf::from),
         tls_key: opt(args, "--tls-key").map(PathBuf::from),
         tls_ca: opts(args, "--tls-ca").into_iter().map(PathBuf::from).collect(),
+        trusted: opts(args, "--trust-net")
+            .into_iter()
+            .chain(std::env::var("SAMETRA_TRUST_NET").unwrap_or_default().split(',').filter(|s| !s.trim().is_empty()).map(String::from))
+            .map(|c| node::parse_cidr(&c).unwrap_or_else(|e| die(&format!("--trust-net: {e}"))))
+            .collect(),
     };
     #[cfg(feature = "ipfs")]
-    let ipfs_cfg = (!args.iter().any(|a| a == "--no-ipfs")).then(|| {
-        let mut port = num(args, "--ipfs-port", 7449u16);
-        // a second node on this machine: take any free port rather than fail
-        if port != 0 && std::net::TcpListener::bind(("0.0.0.0", port)).is_err() {
-            port = 0;
-        }
-        sametra_node::ipfs::Config {
-            port,
-            public: !args.iter().any(|a| a == "--ipfs-private"),
-            cache_mb: num(args, "--ipfs-cache-mb", 1024usize),
-            max_file: num(args, "--ipfs-max-file-mb", 32usize) << 20,
-            announce_host: cfg.public_addr.as_deref().and_then(url_host),
-            open_gateway: args.iter().any(|a| a == "--ipfs-open-gateway"),
-        }
+    let ipfs_cfg = (!args.iter().any(|a| a == "--no-ipfs")).then(|| sametra_node::ipfs::Config {
+        api: opt(args, "--ipfs-api").or(std::env::var("SAMETRA_IPFS_API").ok()).unwrap_or_else(|| "http://127.0.0.1:5001".into()),
+        auth: opt(args, "--ipfs-api-auth").or(std::env::var("SAMETRA_IPFS_API_AUTH").ok()),
+        max_file: num(args, "--ipfs-max-file-mb", 32u64) << 20,
+        open_gateway: args.iter().any(|a| a == "--ipfs-open-gateway"),
+        public: cfg.public_addr.is_some(),
     });
     let json_logs = sametra_mcp::logging::json(args);
     let threads = num(args, "--threads", 2usize).max(1);
@@ -289,23 +275,29 @@ fn run(args: &[String]) {
         tracing::info!(version = env!("CARGO_PKG_VERSION"), npub = %node.keys.npub(), %local, tls, cached, relay_all = node.cfg.relay_all, "node started");
         #[cfg(feature = "ipfs")]
         if let Some(c) = ipfs_cfg {
-            match sametra_node::ipfs::Ipfs::start(&node.cfg.data.join("ipfs"), c).await {
-                Ok(i) => {
-                    let tag = i.heartbeat_tag().await;
-                    if !json_logs {
-                        eprintln!("  ipfs      {} on {}", i.peer_id, tag[2..].join(" "));
-                    }
-                    tracing::info!(peer_id = %i.peer_id, addrs = ?&tag[2..], public = i.cfg.public, "IPFS node started");
-                    *node.ipfs_tag.lock().unwrap() = Some(tag);
-                    let _ = node.ipfs.set(std::sync::Arc::new(i));
-                }
-                Err(e) => {
-                    if !json_logs {
-                        eprintln!("  ipfs      off: {e}");
-                    }
-                    tracing::warn!(error = %e, "IPFS node did not start; running without it");
-                }
+            let ipfs = std::sync::Arc::new(sametra_node::ipfs::Ipfs::new(c).unwrap_or_else(|e| die(&e)));
+            let api = ipfs.cfg.api.clone();
+            let line = match ipfs.refresh().await {
+                Some(id) => format!("{} at {api} (peer {})", id.agent, id.peer_id),
+                None => format!("no daemon at {api} yet; start Kubo (`ipfs daemon`), the node will notice"),
+            };
+            if !json_logs {
+                eprintln!("  ipfs      {line}");
             }
+            let _ = node.ipfs.set(ipfs.clone());
+            // keep watching the daemon; announce it as soon as it (re)appears
+            let n = node.clone();
+            tokio::spawn(async move {
+                let mut up = ipfs.peer_id().is_some();
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(if up { 60 } else { 10 })).await;
+                    let now_up = ipfs.refresh().await.is_some();
+                    if now_up && !up {
+                        n.heartbeat();
+                    }
+                    up = now_up;
+                }
+            });
         }
         node::spawn_background(node.clone());
         tokio::select! {
@@ -333,9 +325,6 @@ mod tests {
         assert_eq!(num(&args, "--max-peers", 8usize), 3);
         assert_eq!(num(&args, "--max-events", 7usize), 7);
         assert_eq!(opt(&a(&["--data"]), "--data"), None, "flag without value");
-        assert_eq!(url_host("wss://node.example.org/x").as_deref(), Some("node.example.org"));
-        assert_eq!(url_host("ws://1.2.3.4:42424").as_deref(), Some("1.2.3.4"));
-        assert_eq!(url_host("ws://[::1]:42424").as_deref(), Some("::1"));
     }
 
     #[test]

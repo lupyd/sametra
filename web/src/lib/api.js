@@ -37,6 +37,7 @@ export const TOOLS = {
   ipfs_add: ['IpfsAddRequest', 'IpfsAddResponse'],
   ipfs_get: ['IpfsGetRequest', 'IpfsGetResponse'],
   ipfs_pin: ['IpfsPinRequest', 'Ack'],
+  files: ['FilesRequest', 'FilesResponse'],
 };
 
 export async function call(tool, req = {}) {

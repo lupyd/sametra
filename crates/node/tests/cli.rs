@@ -569,40 +569,76 @@ fn http_get(port: u16, path: &str, host: &str) -> (u16, String, Vec<u8>) {
 }
 
 #[test]
-fn ipfs_files_move_between_nodes() {
+fn files_through_kubo_move_between_nodes() {
+    use common::kubo::{Kubo, Swarm, cid_of};
+    let swarm = Swarm::default();
+    let (ka, kb) = (Kubo::start(&swarm), Kubo::start(&swarm));
     let (a, b) = (tempdir("ipfs-a"), tempdir("ipfs-b"));
-    let ipfs = ["--ipfs-private", "--ipfs-port", "0"];
-    let (_na, pa) = run_node(&a.0, 0, &ipfs);
-    let (_nb, pb) = run_node(&b.0, 0, &[&ipfs[..], &["--peer", &format!("ws://127.0.0.1:{pa}")]].concat());
+    let (_na, pa) = run_node(&a.0, 0, &["--ipfs-api", &ka.api()]);
+    let (_nb, pb) = run_node(&b.0, 0, &["--ipfs-api", &kb.api(), "--peer", &format!("ws://127.0.0.1:{pa}")]);
     let info = call(&a.0, pa, "info", json!({})).unwrap();
-    assert!(info["ipfs_peer"].as_str().unwrap().starts_with("12D3Koo"));
-    // the nodes find each other's IPFS side through their heartbeats
-    assert!(wait(Duration::from_secs(15), || call(&b.0, pb, "info", json!({})).unwrap()["ipfs_peers"].as_u64() > Some(0)));
-    let added = call(&a.0, pa, "ipfs_add", json!({"text": "# Lemma\n\nEvery group of prime order is cyclic.", "name": "lemma.md"})).unwrap();
+    assert_eq!(info["ipfs_peer"], ka.peer_id.as_str());
+    assert_eq!(info["ipfs_api"], ka.api());
+    // the nodes connect their daemons through their heartbeats
+    assert!(wait(Duration::from_secs(15), || kb.connected.lock().unwrap().contains(&ka.peer_id) || ka.connected.lock().unwrap().contains(&kb.peer_id)));
+    let text = "# Lemma\n\nEvery group of prime order is cyclic.";
+    let added = call(&a.0, pa, "ipfs_add", json!({"text": text, "name": "lemma.md", "description": "the key step"})).unwrap();
     let cid = added["cid"].as_str().unwrap().to_string();
+    assert_eq!(cid, cid_of(text.as_bytes()));
     assert_eq!(added["link"], format!("[lemma.md](ipfs://{cid})"));
-    // B's gateway fetches it from A for its operator
+    assert_eq!(added["media_type"], "text/markdown; charset=utf-8");
+    assert!(ka.pins.lock().unwrap().contains(&cid), "pinned by default");
+    // the file is tied to A's identity by a signed NIP-94 event, which travels like any other
+    let ev = call(&a.0, pa, "event", json!({"id": added["event"]})).unwrap();
+    let raw: Value = serde_json::from_str(ev["raw_json"].as_str().unwrap()).unwrap();
+    assert_eq!(raw["kind"], 1063);
+    assert_eq!(raw["pubkey"], info["pubkey"]);
+    let tags = raw["tags"].as_array().unwrap();
+    assert!(tags.contains(&json!(["url", format!("ipfs://{cid}")])) && tags.contains(&json!(["alt", "lemma.md"])));
+    assert!(tags.contains(&json!(["x", added["sha256"]])) && tags.contains(&json!(["size", text.len().to_string()])));
+    assert!(wait(Duration::from_secs(10), || call(&b.0, pb, "files", json!({"author": info["npub"]})).unwrap()["files"].as_array().is_some_and(|f| f.len() == 1)));
+    let listed = &call(&b.0, pb, "files", json!({"query": "lemma"})).unwrap()["files"][0];
+    assert_eq!((listed["cid"].as_str(), listed["name"].as_str(), listed["description"].as_str()), (Some(cid.as_str()), Some("lemma.md"), Some("the key step")));
+    // B's gateway fetches it through B's daemon for its operator
     let (code, head, body) = http_get(pb, &format!("/ipfs/{cid}"), &format!("127.0.0.1:{pb}"));
     assert_eq!(code, 200, "{head}");
-    assert_eq!(body, b"# Lemma\n\nEvery group of prime order is cyclic.");
+    assert_eq!(body, text.as_bytes());
     assert!(head.contains("Content-Security-Policy: sandbox") && head.contains("immutable"));
     let (code, head, raw) = http_get(pb, &format!("/ipfs/{cid}?format=raw"), "localhost");
     assert!(code == 200 && head.contains("application/vnd.ipld.raw"));
-    assert_eq!(raw, body, "small files are one raw block");
-    // anyone else only gets what B already has
+    assert_eq!(raw, body);
+    // anyone else only gets what B's daemon already has
     let other = call(&a.0, pa, "ipfs_add", json!({"text": "only on A"})).unwrap()["cid"].as_str().unwrap().to_string();
     let (code, _, body) = http_get(pb, &format!("/ipfs/{other}"), "example.org");
     assert_eq!(code, 404);
     assert!(String::from_utf8_lossy(&body).contains("not on this node"));
     assert_eq!(http_get(pb, &format!("/ipfs/{cid}"), "example.org").0, 200);
-    // a file a post links to is fetched and kept by the nodes that carry the post
+    // a post linking a file carries its metadata (NIP-92 imeta), and other nodes keep the file
     let data = call(&a.0, pa, "ipfs_add", json!({"text": "x,y\n1,2", "name": "d.csv"})).unwrap()["cid"].as_str().unwrap().to_string();
-    call(&a.0, pa, "post", json!({"community": "math", "title": "Data", "content": format!("see [d.csv](ipfs://{data})")})).unwrap();
-    assert!(wait(Duration::from_secs(15), || call(&b.0, pb, "ipfs_get", json!({"path": format!("ipfs://{data}"), "local": true})).is_ok_and(|v| v["text"] == "x,y\n1,2")));
-    // pin and unpin
+    let post = call(&a.0, pa, "post", json!({"community": "math", "title": "Data", "content": format!("see [d.csv](ipfs://{data})")})).unwrap();
+    let raw: Value = serde_json::from_str(call(&a.0, pa, "event", json!({"id": post["id"]})).unwrap()["raw_json"].as_str().unwrap()).unwrap();
+    let imeta = raw["tags"].as_array().unwrap().iter().find(|t| t[0] == "imeta").expect("imeta tag").clone();
+    assert_eq!(imeta[1], format!("url ipfs://{data}"));
+    assert!(imeta.as_array().unwrap().contains(&json!("alt d.csv")));
+    assert!(wait(Duration::from_secs(15), || kb.has(&data)), "B's daemon fetched the linked file");
+    // pin and unpin through B
     assert_eq!(call(&b.0, pb, "ipfs_pin", json!({"path": data})).unwrap()["ok"], true);
     assert_eq!(call(&b.0, pb, "ipfs_get", json!({"path": data, "local": true})).unwrap()["pinned"], true);
+    assert_eq!(call(&b.0, pb, "ipfs_get", json!({"path": format!("ipfs://{data}")})).unwrap()["text"], "x,y\n1,2");
     assert!(call(&a.0, pa, "ipfs_get", json!({"path": "ipfs://nope"})).is_err());
+}
+
+#[test]
+fn runs_without_an_ipfs_daemon() {
+    let d = tempdir("no-kubo");
+    // nothing listens on port 1: the node starts anyway and says what is missing
+    let (_n, port) = run_node(&d.0, 0, &["--ipfs-api", "http://127.0.0.1:1"]);
+    let info = call(&d.0, port, "info", json!({})).unwrap();
+    assert_eq!(info["ipfs_peer"], "");
+    assert_eq!(info["ipfs_api"], "http://127.0.0.1:1");
+    let e = call(&d.0, port, "ipfs_add", json!({"text": "x"})).unwrap_err();
+    assert!(e.contains("no IPFS daemon at http://127.0.0.1:1"), "{e}");
+    assert_eq!(http_get(port, "/ipfs/bafkreihkavvxs6g6cxquciaqbiih52zd6fom6azpioa6a3fanh5kja6hni", "localhost").0, 404);
 }
 
 #[test]

@@ -245,9 +245,11 @@ async fn info(node: &Arc<Node>, _: Empty) -> R<InfoResponse> {
 
 #[cfg(feature = "ipfs")]
 async fn ipfs_info(node: &Arc<Node>) -> InfoResponse {
-    match node.ipfs.get() {
-        Some(i) => InfoResponse { ipfs_peer: i.peer_id.to_string(), ipfs_addrs: i.listening().await, ipfs_peers: i.connected().await as u32, ..Default::default() },
-        None => InfoResponse::default(),
+    let Some(i) = node.ipfs.get() else { return InfoResponse::default() };
+    let id = i.identity.lock().unwrap().clone();
+    match id {
+        Some(id) => InfoResponse { ipfs_peer: id.peer_id, ipfs_addrs: id.addrs, ipfs_peers: i.connected().await as u32, ipfs_api: i.cfg.api.clone(), ..Default::default() },
+        None => InfoResponse { ipfs_api: i.cfg.api.clone(), ..Default::default() },
     }
 }
 #[cfg(not(feature = "ipfs"))]
@@ -255,31 +257,40 @@ async fn ipfs_info(_: &Arc<Node>) -> InfoResponse {
     InfoResponse::default()
 }
 
-// ---- files (the built-in IPFS node) ------------------------------------------
+// ---- files (IPFS through Kubo; NIP-94 metadata) --------------------------------
 
 #[cfg(feature = "ipfs")]
 fn ipfs_node(node: &Arc<Node>) -> R<Arc<crate::ipfs::Ipfs>> {
-    node.ipfs.get().cloned().ok_or_else(|| "IPFS is off on this node (started with --no-ipfs, or it failed to start)".into())
+    node.ipfs.get().cloned().ok_or_else(|| "IPFS is off on this node (started with --no-ipfs)".into())
 }
 
 #[cfg(feature = "ipfs")]
 async fn ipfs_add(node: &Arc<Node>, r: IpfsAddRequest) -> R<IpfsAddResponse> {
+    use sha2::Digest;
     let ipfs = ipfs_node(node)?;
     let data = if r.data.is_empty() { r.text.into_bytes() } else { r.data };
     if data.is_empty() {
         return Err("nothing to add: give text or data".into());
     }
     let size = data.len() as u64;
-    let cid = ipfs.add(data, !r.unpinned).await?;
-    let name = r.name.trim().replace(['[', ']', '(', ')', '\n'], "");
-    let image = matches!(crate::ipfs::content_type(&name, b""), t if t.starts_with("image/"));
-    let label = if name.is_empty() { cid.to_string() } else { name };
+    let name: String = r.name.trim().replace(['[', ']', '(', ')', '\n'], "").chars().take(200).collect();
+    let media_type = crate::files::content_type(&name, &data[..data.len().min(512)]).to_string();
+    let sha = hex::encode(sha2::Sha256::digest(&data));
+    let cid = ipfs.add(data, &name, !r.unpinned).await?;
+    // the file's metadata, signed: it is yours, findable, and anyone can check the bytes
+    let fallback = node.cfg.public_addr.as_deref().and_then(crate::files::http_base);
+    let tags = crate::files::nip94_tags(&cid, &name, &media_type, &sha, size, fallback.as_deref());
+    let meta = node.publish(K_FILE, tags, r.description.trim().chars().take(2000).collect())?;
+    let label = if name.is_empty() { cid.clone() } else { name };
     Ok(IpfsAddResponse {
         url: format!("ipfs://{cid}"),
         gateway: format!("/ipfs/{cid}"),
-        link: format!("{}[{label}](ipfs://{cid})", if image { "!" } else { "" }),
-        cid: cid.to_string(),
+        link: format!("{}[{label}](ipfs://{cid})", if media_type.starts_with("image/") { "!" } else { "" }),
+        event: meta.id.hex(),
+        sha256: sha,
+        cid,
         size,
+        media_type,
     })
 }
 
@@ -287,11 +298,11 @@ async fn ipfs_add(node: &Arc<Node>, r: IpfsAddRequest) -> R<IpfsAddResponse> {
 async fn ipfs_get(node: &Arc<Node>, r: IpfsGetRequest) -> R<IpfsGetResponse> {
     let ipfs = ipfs_node(node)?;
     let max = if r.max_bytes == 0 { 256 << 10 } else { (r.max_bytes as usize).min(16 << 20) };
-    let path = crate::ipfs::parse_path(&r.path)?;
-    let cid = *path.root().cid().ok_or("not a CID path")?;
-    let (data, truncated) = ipfs.cat(&r.path, max, r.local, std::time::Duration::from_secs(60)).await?;
-    let name = path.iter().last().unwrap_or("").to_string();
-    let media_type = crate::ipfs::content_type(&name, &data).to_string();
+    let (cid, path) = crate::files::parse_path(&r.path)?;
+    let (data, truncated) = ipfs.cat(&path, max, r.local, Duration::from_secs(60)).await?;
+    // a name from the path, else from the file's metadata
+    let name = path.rsplit('/').next().filter(|n| *n != cid).map(String::from).unwrap_or_else(|| file_meta(node, &cid).and_then(|e| e.tag("alt").map(String::from)).unwrap_or_default());
+    let media_type = crate::files::content_type(&name, &data).to_string();
     let (text, data) = match String::from_utf8(data) {
         Ok(t) if media_type.starts_with("text/") || media_type.contains("json") => (t, vec![]),
         Ok(t) => (String::new(), t.into_bytes()),
@@ -304,13 +315,13 @@ async fn ipfs_get(node: &Arc<Node>, r: IpfsGetRequest) -> R<IpfsGetResponse> {
         }
         Err(e) => (String::new(), e.into_bytes()),
     };
-    Ok(IpfsGetResponse { cid: cid.to_string(), size: (text.len() + data.len()) as u64, media_type, text, data, truncated, pinned: ipfs.is_pinned(&cid).await })
+    Ok(IpfsGetResponse { size: (text.len() + data.len()) as u64, media_type, text, data, truncated, pinned: ipfs.is_pinned(&cid).await, cid })
 }
 
 #[cfg(feature = "ipfs")]
 async fn ipfs_pin(node: &Arc<Node>, r: IpfsPinRequest) -> R<Ack> {
     let cid = ipfs_node(node)?.pin(&r.path, !r.unpin).await?;
-    Ok(Ack { ok: true, id: cid.to_string(), ..Default::default() })
+    Ok(Ack { ok: true, id: cid, ..Default::default() })
 }
 
 #[cfg(not(feature = "ipfs"))]
@@ -324,6 +335,45 @@ async fn ipfs_get(_: &Arc<Node>, _: IpfsGetRequest) -> R<IpfsGetResponse> {
 #[cfg(not(feature = "ipfs"))]
 async fn ipfs_pin(_: &Arc<Node>, _: IpfsPinRequest) -> R<Ack> {
     Err("this build has no IPFS (feature `ipfs`)".into())
+}
+
+/// The newest metadata event describing `cid`, from anyone.
+fn file_meta(node: &Arc<Node>, cid: &str) -> Option<Ev> {
+    let st = node.store.lock().unwrap();
+    st.query(&Filter { kinds: Some(vec![K_FILE]), ..Default::default() }, 100_000).into_iter().find(|e| crate::files::nip94_cid(e) == Some(cid))
+}
+
+async fn files(node: &Arc<Node>, r: FilesRequest) -> R<FilesResponse> {
+    let limit = if r.limit == 0 { 50 } else { r.limit.min(500) } as usize;
+    let author = if r.author.trim().is_empty() { (r.query.trim().is_empty()).then_some(node.keys.pubkey) } else { Some(parse_pubkey(r.author.trim()).ok_or("'author' must be a hex pubkey or npub")?) };
+    let st = node.store.lock().unwrap();
+    let mut evs: Vec<Ev> = if r.query.trim().is_empty() {
+        st.query(&Filter { kinds: Some(vec![K_FILE]), authors: author.map(|a| vec![a.hex()]), ..Default::default() }, limit)
+    } else {
+        st.search(r.query.trim(), 2000).into_iter().filter_map(|h| st.get(&h.id).cloned()).filter(|e| e.kind == K_FILE && author.is_none_or(|a| e.pubkey == a)).take(limit).collect()
+    };
+    evs.retain(|e| crate::files::nip94_cid(e).is_some());
+    let files = evs
+        .iter()
+        .map(|e| {
+            let tag = |k: &str| e.tag(k).unwrap_or("").to_string();
+            let cid = crate::files::nip94_cid(e).unwrap_or("").to_string();
+            FileInfo {
+                url: format!("ipfs://{cid}"),
+                cid,
+                name: tag("alt"),
+                media_type: tag("m"),
+                size: tag("size").parse().unwrap_or(0),
+                sha256: tag("x"),
+                description: e.content.clone(),
+                created_at: e.created_at,
+                author: e.pubkey.hex(),
+                author_name: name_of(&st, &e.pubkey),
+                event: e.id.hex(),
+            }
+        })
+        .collect();
+    Ok(FilesResponse { files })
 }
 
 async fn peers(node: &Arc<Node>, _: Empty) -> R<PeersResponse> {
@@ -756,6 +806,12 @@ async fn post(node: &Arc<Node>, r: PostRequest) -> R<Ack> {
         tags.push(t("accept", a));
     }
     let (content, mentioned, unresolved) = resolve_mentions(&node.store.lock().unwrap(), &node.keys.pubkey, &r.content);
+    // NIP-92: describe the files the post links to, from their metadata events
+    for cid in crate::files::linked_cids(&content) {
+        if let Some(im) = file_meta(node, &cid).and_then(|m| crate::files::imeta(&m)) {
+            tags.push(im);
+        }
+    }
     for pk in &mentioned {
         tags.push(vec!["p".into(), pk.hex(), "".into(), "mention".into()]);
     }
@@ -1114,12 +1170,14 @@ async fn pin_impl(node: &Arc<Node>, r: IdRequest, on: bool) -> R<Ack> {
             let st = node.store.lock().unwrap();
             ids.iter().filter_map(|i| st.get(i)).map(|e| e.content.clone()).collect()
         };
-        let cids: Vec<_> = texts.iter().flat_map(|t| crate::ipfs::linked_cids(t)).collect();
+        let cids: Vec<_> = texts.iter().flat_map(|t| crate::files::linked_cids(t)).collect();
         if !cids.is_empty() {
             let ipfs = ipfs.clone();
             tokio::spawn(async move {
                 for cid in cids {
-                    let _ = ipfs.pin(&cid.to_string(), on).await;
+                    if let Err(e) = ipfs.pin(&cid, on).await {
+                        tracing::debug!(%cid, error = %e, "pinning a linked file failed");
+                    }
                 }
             });
         }

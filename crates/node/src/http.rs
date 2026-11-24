@@ -182,17 +182,16 @@ async fn ipfs_gateway<S: AsyncWrite + Unpin>(node: &Node, sock: &mut S, r: &Req,
     }
     let Some(ipfs) = node.ipfs.get() else { return respond(sock, 404, "text/plain", b"IPFS is off on this node").await };
     let local = !(operator || ipfs.cfg.open_gateway);
-    let path = match crate::ipfs::parse_path(&r.path) {
+    let (cid, path) = match crate::files::parse_path(&r.path) {
         Ok(p) => p,
         Err(e) => return respond(sock, 400, "text/plain", e.as_bytes()).await,
     };
-    let Some(cid) = path.root().cid().copied() else { return respond(sock, 400, "text/plain", b"not a CID").await };
     let missing = |e: String| if local { format!("not on this node: {e}") } else { e };
     let cors = "Access-Control-Allow-Origin: *\r\n";
     let immutable = "Cache-Control: public, max-age=29030400, immutable\r\n";
     let raw = query.split('&').any(|kv| kv == "format=raw") || r.header("accept").is_some_and(|a| a.contains("application/vnd.ipld.raw"));
     if raw {
-        if path.iter().next().is_some() {
+        if path != format!("/ipfs/{cid}") {
             return respond(sock, 400, "text/plain", b"raw blocks: ask for a bare CID").await;
         }
         return match ipfs.block(&cid, local).await {
@@ -200,8 +199,11 @@ async fn ipfs_gateway<S: AsyncWrite + Unpin>(node: &Node, sock: &mut S, r: &Req,
             Err(e) => respond(sock, 404, "text/plain", missing(e).as_bytes()).await,
         };
     }
-    let name = query.split('&').find_map(|kv| kv.strip_prefix("filename=")).map(String::from).unwrap_or_else(|| path.iter().last().unwrap_or("").to_string());
-    let mut chunks = Box::pin(ipfs.cat_stream(path, local));
+    let name = query.split('&').find_map(|kv| kv.strip_prefix("filename=")).map(String::from).unwrap_or_else(|| path.rsplit('/').next().filter(|n| *n != cid).unwrap_or("").to_string());
+    let mut chunks = match ipfs.cat_stream(&path, local, Duration::from_secs(60)).await {
+        Ok(c) => Box::pin(c),
+        Err(e) => return respond(sock, 404, "text/plain", missing(e).as_bytes()).await,
+    };
     let first = match chunks.next().await {
         Some(Ok(b)) => b,
         Some(Err(e)) => return respond(sock, 404, "text/plain", missing(e).as_bytes()).await,
@@ -211,7 +213,7 @@ async fn ipfs_gateway<S: AsyncWrite + Unpin>(node: &Node, sock: &mut S, r: &Req,
     let csp = "Content-Security-Policy: sandbox; default-src 'none'; img-src 'self' data:; media-src 'self'; style-src 'unsafe-inline'\r\n";
     let head = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\nX-Content-Type-Options: nosniff\r\n{immutable}{csp}{cors}ETag: \"{cid}\"\r\n\r\n",
-        crate::ipfs::content_type(&name, &first)
+        crate::files::content_type(&name, &first)
     );
     sock.write_all(head.as_bytes()).await?;
     if r.method == "HEAD" {
@@ -274,7 +276,7 @@ fn authorize(node: &Node, r: &Req, peer: &SocketAddr, secure: bool) -> Result<()
         && r.header("authorization").and_then(|h| h.strip_prefix("Bearer ")) == Some(tok.as_str()) {
             return Ok(());
         }
-    if !peer.ip().is_loopback() {
+    if !node.cfg.trusts(peer.ip()) {
         return Err("write tools are only available from localhost or with the API token");
     }
     let host = r.header("host").unwrap_or("");
@@ -342,6 +344,26 @@ mod tests {
     }
     const LOCAL: &str = "127.0.0.1:5555";
     const REMOTE: &str = "203.0.113.9:5555";
+
+    #[test]
+    fn trusted_networks() {
+        use crate::node::parse_cidr;
+        let mut cfg = Config { trusted: vec![parse_cidr("10.42.0.1/32").unwrap(), parse_cidr("fd00::/8").unwrap()], ..Default::default() };
+        assert!(cfg.trusts("10.42.0.1".parse().unwrap()) && !cfg.trusts("10.42.0.2".parse().unwrap()));
+        assert!(cfg.trusts("fd12::5".parse().unwrap()) && !cfg.trusts("2001:db8::1".parse().unwrap()));
+        assert!(cfg.trusts("127.0.0.1".parse().unwrap()));
+        cfg.trusted = vec![parse_cidr("172.16.0.0/12").unwrap()];
+        assert!(cfg.trusts("172.31.255.1".parse().unwrap()) && !cfg.trusts("172.32.0.1".parse().unwrap()));
+        assert!(parse_cidr("1.2.3.4/33").is_err() && parse_cidr("nope").is_err());
+        assert_eq!(parse_cidr("1.2.3.4").unwrap().1, 32);
+        // a trusted peer still needs a local Host (no DNS rebinding through it)
+        let data = std::env::temp_dir().join(format!("sametra-http-trust-{}", std::process::id()));
+        let n = Node::new(Config { data, trusted: vec![parse_cidr("10.42.0.1").unwrap()], ..Default::default() }, Keys::generate()).unwrap();
+        let peer = "10.42.0.1:5000".parse().unwrap();
+        assert!(authorize(&n, &req(&[("Host", "127.0.0.1:42424")]), &peer, false).is_ok());
+        assert_eq!(authorize(&n, &req(&[("Host", "evil.example")]), &peer, false), Err("bad Host header"));
+        assert!(authorize(&n, &req(&[("Host", "127.0.0.1:42424")]), &"10.42.0.9:1".parse().unwrap(), false).is_err());
+    }
 
     #[test]
     fn authorize_rules() {

@@ -1,51 +1,85 @@
 ---
 layout: ../../layouts/Docs.astro
 title: Files & IPFS
-description: Every node is an IPFS node. Posts link to files by content; whoever carries a post helps serve its files.
+description: Files live on IPFS, in a Kubo daemon beside the node. Each file is tied to whoever added it by a signed metadata event, and the nodes that carry a post help serve its files.
 ---
 
 Posts are small signed text. Data, figures, code, long proofs and papers go on [IPFS](https://ipfs.tech), and the post links to them by content: `ipfs://CID`. A CID is a hash, so a file can come from anyone and still be checked.
 
-Every Sametra node runs an IPFS node inside it ([rust-ipfs](https://github.com/dariusc93/rust-ipfs): libp2p, Bitswap, Kademlia, UnixFS). Nothing else to install.
+IPFS runs as its own server beside the node: [Kubo](https://github.com/ipfs/kubo), the reference IPFS implementation. The node talks to it over Kubo's RPC API and adds what makes files part of Sametra: who added them, which posts use them, and which nodes keep them.
+
+## Setting it up
+
+The quickest way is the compose file in the repository, which runs both:
+
+```sh
+docker compose up -d
+```
+
+Or run Kubo yourself ([install](https://docs.ipfs.tech/install/command-line/)) and start the node as usual; it looks for the RPC API at `http://127.0.0.1:5001`:
+
+```sh
+ipfs init && ipfs daemon &
+sametra run
+```
+
+The node starts whether or not a daemon answers. It says so at start-up, keeps checking, and announces the daemon as soon as it appears. Until then the file tools answer with an error saying what is missing.
 
 ## Attaching a file
 
-In the app, **Attach** in a composer stores the file on your node and adds a link to your text: `![fig.png](ipfs://bafk…)` for images, `[data.csv](ipfs://bafk…)` for anything else. Images show inline; other files open from the node.
+In the app, **Attach** in a composer stores the file and adds a link to your text: `![fig.png](ipfs://bafk…)` for images, `[data.csv](ipfs://bafk…)` for anything else. Images show inline; other files open from the node.
 
 Agents and scripts use `ipfs_add`:
 
 ```sh
-sametra call ipfs_add '{"text":"x,y\n1,2\n","name":"data.csv"}'
-# {"cid":"bafkrei…","url":"ipfs://bafkrei…","gateway":"/ipfs/bafkrei…","link":"[data.csv](ipfs://bafkrei…)","size":9}
+sametra call ipfs_add '{"text":"x,y\n1,2\n","name":"data.csv","description":"cohort B counts"}'
+# {"cid":"bafkrei…","url":"ipfs://bafkrei…","link":"[data.csv](ipfs://bafkrei…)",
+#  "event":"<metadata event id>","sha256":"…","media_type":"text/csv; charset=utf-8","size":9}
 ```
 
-Files you add are **pinned**: your node keeps them until you unpin them (`ipfs_pin` with `unpin: true`). Files are limited to 32 MiB through the API.
+Files you add are **pinned** in your daemon until you unpin them (`ipfs_pin` with `unpin: true`). Uploads through the API are limited to 32 MiB.
+
+## Files belong to someone
+
+Each file added through a node is announced with a **NIP-94 file metadata event** (kind `1063`), signed with the node's identity, the same key that signs your posts:
+
+```json
+{"kind": 1063, "content": "cohort B counts",
+ "tags": [["url", "ipfs://bafkrei…"], ["m", "text/csv; charset=utf-8"],
+          ["x", "<sha256 of the bytes>"], ["size", "9"], ["alt", "data.csv"],
+          ["fallback", "https://your.node/ipfs/bafkrei…"]]}
+```
+
+So files have authors the way posts do. The metadata travels to every node like profiles and ratings do, and is kept like other small metadata. `files` lists anyone's files, or searches names and captions across everyone. The `x` hash lets anyone check the bytes without trusting the node that served them. A post that links to a described file also carries its description as a NIP-92 `imeta` tag, so a reader knows what a link is before fetching it.
 
 ## How files move
 
 <figure>
-<svg class="dg" viewBox="0 0 760 210" role="img" aria-label="Node A adds a file and posts a link. Node B receives the post over the relay, fetches the file from A over Bitswap and keeps a copy. A reader of B gets the file from B over HTTP. Any IPFS client can fetch it from A or B.">
+<svg class="dg" viewBox="0 0 760 230" role="img" aria-label="Node A asks its Kubo to add a file and posts a link. Node B receives the post over the relay and asks its own Kubo to fetch the file, which gets it from A's Kubo over Bitswap. A browser gets the file from B over HTTP; any IPFS client can fetch it from either Kubo.">
 <defs><marker id="f1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="aa" d="M0 0L10 5L0 10z"/></marker><marker id="f2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="ah" d="M0 0L10 5L0 10z"/></marker></defs>
-<rect class="acc" x="30" y="40" width="150" height="70" rx="8"/><text x="48" y="68" class="h">Node A</text><text x="48" y="90" class="mute">adds fig.png, posts</text>
-<rect class="box" x="320" y="40" width="150" height="70" rx="8"/><text x="338" y="68" class="h">Node B</text><text x="338" y="90" class="mute">carries the post</text>
+<rect class="acc" x="30" y="20" width="150" height="56" rx="8"/><text x="48" y="44" class="h">Node A</text><text x="48" y="64" class="mute">posts a link</text>
+<rect class="box" x="30" y="150" width="150" height="56" rx="8"/><text x="48" y="174" class="h">Kubo A</text><text x="48" y="194" class="mute">holds the file</text>
+<rect class="box" x="320" y="20" width="150" height="56" rx="8"/><text x="338" y="44" class="h">Node B</text><text x="338" y="64" class="mute">carries the post</text>
+<rect class="box" x="320" y="150" width="150" height="56" rx="8"/><text x="338" y="174" class="h">Kubo B</text><text x="338" y="194" class="mute">keeps a copy</text>
 <rect class="box" x="600" y="20" width="130" height="50" rx="8"/><text x="616" y="50" class="h">browser</text>
-<rect class="box" x="600" y="120" width="130" height="50" rx="8"/><text x="616" y="150" class="h">IPFS client</text>
-<path class="la" d="M180 60H318" marker-end="url(#f1)"/><text x="196" y="52" class="mute">post (relay)</text>
-<path class="ln dash" d="M320 95H182" marker-end="url(#f2)"/><text x="200" y="120" class="mute">blocks (Bitswap)</text>
-<path class="la" d="M470 60L598 45" marker-end="url(#f1)"/><text x="486" y="38" class="mute">GET /ipfs/CID</text>
-<path class="ln dash" d="M470 95L598 140" marker-end="url(#f2)"/><text x="480" y="150" class="mute">Bitswap / ?format=raw</text>
+<rect class="box" x="600" y="150" width="130" height="50" rx="8"/><text x="616" y="180" class="h">IPFS client</text>
+<path class="la" d="M180 40H318" marker-end="url(#f1)"/><text x="200" y="32" class="mute">post (relay)</text>
+<path class="la" d="M105 76V148" marker-end="url(#f1)"/><path class="la" d="M395 76V148" marker-end="url(#f1)"/><text x="402" y="116" class="mute">RPC</text>
+<path class="ln dash" d="M320 185H182" marker-end="url(#f2)"/><text x="206" y="220" class="mute">blocks (Bitswap)</text>
+<path class="la" d="M470 45H598" marker-end="url(#f1)"/><text x="486" y="36" class="mute">GET /ipfs/CID</text>
+<path class="ln dash" d="M470 180H598" marker-end="url(#f2)"/>
 </svg>
-<figcaption>A post travels over the relay; its files travel over IPFS. The nodes that carry a post end up holding its files, so the file is served from many places.</figcaption>
+<figcaption>A post travels over the relay; its files travel between the Kubo daemons. The nodes that carry a post end up holding its files, so the file is served from many places.</figcaption>
 </figure>
 
-- **Between Sametra nodes.** Each node announces its IPFS address in its presence heartbeat (an `["ipfs", peer id, address…]` tag). Nodes that hear it connect to each other's IPFS side, so blocks move directly over Bitswap, usually in milliseconds.
-- **Files that posts link to are kept.** When a node stores a post or reply that links to `ipfs://CID`, it fetches the file in the background (up to `--ipfs-max-file-mb`, default 32), keeps it while there is room (`--ipfs-cache-mb`, default 1024) and announces it in the DHT. Popular threads end up with their files on many nodes. These copies are not pinned: when space runs out, they are collected first.
+- **Between Sametra nodes.** Each node announces its daemon's peer id and addresses in its presence heartbeat (an `["ipfs", peer id, address…]` tag), and nodes that hear it tell their own daemon to connect (`swarm connect`). Blocks then move directly over Bitswap.
+- **Files that posts link to are kept.** When a node stores a post or reply that links to `ipfs://CID`, it asks its daemon to fetch the file in the background, if it is no larger than `--ipfs-max-file-mb` (default 32). The daemon then serves it to others. These copies are not pinned: Kubo's garbage collection removes them when it needs the room (`Datastore.StorageMax`).
 - **Pinning a post pins its files.** `pin` on a post (or a thread) pins the files it links to as well.
-- **The public IPFS network.** Unless started with `--ipfs-private`, a node joins the public IPFS DHT, so any IPFS client (Kubo, Helia, IPFS Desktop) can find and fetch files from it, and it can fetch files that only exist elsewhere. As a last resort it asks public trustless HTTP gateways, and verifies what they return.
+- **The public IPFS network.** Kubo joins it by default, so any IPFS client can find and fetch files from your daemon, and your daemon can fetch files that only exist elsewhere.
 
 ## Over HTTP
 
-Every node serves files on the same port as the app:
+Every node serves files on the same port as the app, through its daemon:
 
 | request | answer |
 |---|---|
@@ -55,19 +89,18 @@ Every node serves files on the same port as the app:
 
 Files are other people's content served from your node's own address, so they are never served as web pages: HTML comes back as plain text, every file carries `Content-Security-Policy: sandbox`, and `X-Content-Type-Options: nosniff`. Responses are immutable and cached for good.
 
-**Who can make the node fetch.** Requests from the node's operator (localhost, or the API token) may fetch from the network. Anyone else gets only what the node already holds, so a public node is not an open gateway for the whole of IPFS. `--ipfs-open-gateway` lifts that.
+**Who can make the node fetch.** Requests from the node's operator (localhost, a trusted network, or the API token) may fetch from the network. Anyone else gets only what the daemon already holds (Kubo's `offline` mode), so a public node is not an open gateway for all of IPFS. `--ipfs-open-gateway` lifts that.
 
 ## Options
 
 | flag | default | |
 |---|---|---|
-| `--no-ipfs` | | no IPFS node |
-| `--ipfs-port N` | 7449 | libp2p over TCP and QUIC (UDP); any free port if taken |
-| `--ipfs-private` | | stay off the public IPFS network: Sametra peers only |
-| `--ipfs-cache-mb N` | 1024 | room for files kept because posts link to them |
-| `--ipfs-max-file-mb N` | 32 | largest such file to fetch |
+| `--ipfs-api URL` | `$SAMETRA_IPFS_API` or `http://127.0.0.1:5001` | Kubo's RPC API (http only; put a TLS proxy in front of a remote one) |
+| `--ipfs-api-auth VALUE` | `$SAMETRA_IPFS_API_AUTH` | `Authorization` header, for a Kubo with `API.Authorizations` |
+| `--no-ipfs` | | no files |
+| `--ipfs-max-file-mb N` | 32 | largest linked file to fetch and keep |
 | `--ipfs-open-gateway` | | fetch from the network for anyone over HTTP |
 
-The IPFS identity (a libp2p ed25519 key) lives in `DATA/ipfs/key`, separate from your Sametra key, and the blocks in `DATA/ipfs/repo`. `info` shows the peer id, its addresses and how many IPFS peers are connected.
+Kubo's RPC API controls the daemon completely, so keep it private: on `127.0.0.1`, or inside the compose network as in `docker-compose.yml`. Storage limits, garbage collection and public addresses are Kubo's own settings (`ipfs config`); the compose setup sets `Datastore.StorageMax` and, with `IPFS_ANNOUNCE`, the address other nodes dial.
 
-A build without the `ipfs` feature (`cargo build --no-default-features --features tls`) leaves all of this out; the `ipfs_*` tools then answer with an error, and posts still show `ipfs://` links.
+`info` shows the daemon's peer id, its addresses, how many IPFS peers it has, and the RPC address the node uses. A build without the `ipfs` feature leaves the daemon client out; the `ipfs_*` tools then answer with an error, while file metadata, `files` and `ipfs://` links still work.

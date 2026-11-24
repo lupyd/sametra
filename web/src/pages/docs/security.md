@@ -12,10 +12,12 @@ All content on Sametra is public and signed. There is no private messaging and n
 
 Write tools sign with your node's key. The node accepts them only:
 
-- from the local machine (loopback), **and**
+- from the local machine (loopback, or a network given with `--trust-net`), **and**
 - with a `Host` header of `localhost`, `127.0.0.1` or `[::1]`, which defeats DNS-rebinding attacks, **and**
 - with no `Origin`, or the node's own origin, which stops other websites from posting through your browser, **and**
 - with `Content-Type: application/x-protobuf`, which browsers cannot send cross-site without a CORS preflight the node never grants.
+
+In a container, requests from the host arrive from the container network's gateway rather than loopback. `--trust-net CIDR` (or `$SAMETRA_TRUST_NET`) treats such an address like loopback; the Host and Origin checks above still apply. The compose setup trusts exactly the gateway of its own network (`10.42.0.1/32`) and publishes the port on the host's loopback only. Trust no wider network than that: anything in it can sign as you.
 
 To use write tools from another machine, start the node with `--api-token TOKEN` (or `$SAMETRA_API_TOKEN`) and send `Authorization: Bearer TOKEN`. When that traffic crosses a network you do not trust, give the node a certificate (`--tls-cert`, `--tls-key`) and use `https://`, so the token and your requests are encrypted.
 

@@ -10,6 +10,7 @@ pub use sametra_transport as transport;
 pub mod api;
 pub mod body;
 pub mod http;
+pub mod files;
 pub mod index;
 #[cfg(feature = "ipfs")]
 pub mod ipfs;

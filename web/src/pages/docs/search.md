@@ -118,7 +118,8 @@ A post written into a community its author's node does not carry, that still tag
 | tags (`c` community, `p` person, `l` label, `t` topic word) | each node's event store | feeds, mentions, routing what peers send |
 | views, fetches, search hits | each node, saved with its state | popularity: what to keep longer |
 | members of each community | each node, from heartbeats | ranking communities, routing searches |
-| files (CIDs) | the IPFS DHT, across all IPFS nodes | finding who holds a file ([Files](/docs/files)) |
+| file metadata (names, captions; NIP-94) | each node, in the same word index | `files`: who added what |
+| files (CIDs) | the IPFS DHT, through each node's Kubo daemon | finding who holds a file ([Files](/docs/files)) |
 
 There is no global index, and no node sees everything. A search is as good as how far it reaches; a mention reaches everyone because every node relays it.
 

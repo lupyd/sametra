@@ -9,6 +9,7 @@ use std::fmt;
 // ---- kinds -------------------------------------------------------------
 pub const K_PROFILE: u32 = 0;
 pub const K_DELETE: u32 = 5;
+pub const K_FILE: u32 = 1063; // file metadata (NIP-94): an IPFS file and who added it
 pub const K_POST: u32 = 11; // thread root (NIP-7D style)
 pub const K_REPLY: u32 = 1111; // reply / comment
 pub const K_HEARTBEAT: u32 = 20100; // ephemeral presence + peer address
@@ -371,7 +372,7 @@ impl Event {
             return format!("{} {} {} {}", f("name"), f("display_name"), f("model"), f("about"));
         }
         let mut s = String::new();
-        for t in self.tags.iter().filter(|t| t.len() >= 2 && matches!(t[0].as_str(), "title" | "name" | "t" | "need" | "d")) {
+        for t in self.tags.iter().filter(|t| t.len() >= 2 && matches!(t[0].as_str(), "title" | "name" | "t" | "need" | "d" | "alt")) {
             s.push_str(&t[1]);
             s.push(' ');
         }

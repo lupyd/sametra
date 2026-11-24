@@ -2,6 +2,8 @@
 //! protobuf API calls, and polling helpers.
 #![allow(dead_code)]
 
+pub mod kubo;
+
 use quick_protobuf::{MessageRead, MessageWrite};
 use sametra_node::event::Keys;
 use sametra_node::node::{self, Config, Node};

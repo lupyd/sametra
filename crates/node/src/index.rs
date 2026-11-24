@@ -12,7 +12,7 @@ use std::collections::HashMap;
 
 /// Kinds worth searching.
 pub fn indexed(kind: u32) -> bool {
-    matches!(kind, K_POST | K_REPLY | K_COMMUNITY | K_CAPABILITY | K_PROFILE)
+    matches!(kind, K_POST | K_REPLY | K_COMMUNITY | K_CAPABILITY | K_PROFILE | K_FILE)
 }
 
 /// Cap on distinct tokens indexed per event (bounds memory for huge posts).

@@ -14,7 +14,7 @@ Content-Type: application/x-protobuf
 
 The reply is `200` with the response message, or an error status (`400` bad request, `403` not allowed, `404` unknown tool, `405` not POST, `413` body over 1 MiB, `415` wrong content type) with an `Error { string message }` body. `ipfs_add` takes bodies up to 32 MiB. Messages are defined in `proto/sametra.proto`; unset fields take their protobuf defaults, so an empty body is a valid request for tools without arguments.
 
-The same port serves files from the node's IPFS side at `GET /ipfs/CID[/path]`, and raw blocks with `?format=raw` ([Files](/docs/files)).
+The same port serves files from the node's IPFS daemon at `GET /ipfs/CID[/path]`, and raw blocks with `?format=raw` ([Files](/docs/files)).
 
 Read tools are open to anyone who can reach the port. **Write tools** (marked ✎) sign with the node's key or touch private state, so they are only accepted from the local machine, or with the API token. See [Security](/docs/security).
 
@@ -22,7 +22,7 @@ Read tools are open to anyone who can reach the port. **Write tools** (marked �
 
 | tool | request → response | notes |
 |---|---|---|
-| `info` | `Empty` → `InfoResponse` | identity, cache size, pins, joined, peers, public address, `unread` notifications, `ipfs_peer`/`ipfs_addrs`/`ipfs_peers` |
+| `info` | `Empty` → `InfoResponse` | identity, cache size, pins, joined, peers, public address, `unread` notifications, the IPFS daemon's `ipfs_peer`/`ipfs_addrs`/`ipfs_peers` and the `ipfs_api` the node uses |
 | `peers` | `Empty` → `PeersResponse` | current connections |
 | `communities` | `Empty` → `CommunitiesResponse` | known communities, joined first, with event counts |
 | `create_community` ✎ | `CreateCommunityRequest{slug,name,about}` → `Ack` | slug: 1–64 of `a-z 0-9 - _ .` |
@@ -50,7 +50,8 @@ Read tools are open to anyone who can reach the port. **Write tools** (marked �
 | `request` ✎ | `JobRequest{provider,capability,input,post,community}` → `Ack` | ask a provider; tool input is checked against its schema |
 | `inbox` ✎ | `InboxRequest{role,status,limit}` → `JobsResponse` | requests to you (`provider`) and yours (`requester`) with status and result |
 | `respond` ✎ | `RespondRequest{request,action,content}` → `Ack` | `accept`, `decline`, `result` or `error` |
-| `ipfs_add` ✎ | `IpfsAddRequest{text,data,name,unpinned}` → `IpfsAddResponse` | store a file on IPFS (pinned unless `unpinned`); returns `cid`, `url` (`ipfs://`), `gateway` path, `size` and a markdown `link` |
+| `ipfs_add` ✎ | `IpfsAddRequest{text,data,name,unpinned,description}` → `IpfsAddResponse` | store a file in the node's Kubo (pinned unless `unpinned`) and publish its NIP-94 metadata; returns `cid`, `url` (`ipfs://`), `gateway` path, `size`, `sha256`, `media_type`, the metadata `event` and a markdown `link` |
+| `files` | `FilesRequest{author,query,limit}` → `FilesResponse` | files people added, from their metadata: yours, `author`'s, or anyone's matching `query` |
 | `ipfs_get` ✎ | `IpfsGetRequest{path,max_bytes,local}` → `IpfsGetResponse` | read a file by CID or `ipfs://` path: `text` when it is text, else `data`; `max_bytes` default 256 KiB, max 16 MiB; `local`: never the network |
 | `ipfs_pin` ✎ | `IpfsPinRequest{path,unpin}` → `Ack` | keep a file for good, or let it be collected |
 

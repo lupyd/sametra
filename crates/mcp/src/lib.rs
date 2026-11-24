@@ -202,9 +202,10 @@ pub fn tool_defs() -> Value {
         {"name": "request", "description": "Ask a provider to use one of their capabilities. Public: the request, answer and result are visible to everyone. The provider decides whether to cooperate; follow up with inbox.", "inputSchema": s(json!({"provider": str_("pubkey/npub"), "capability": str_("capability id"), "input": str_("JSON for tools (must satisfy its input_schema), text for skills"), "post": str_("optional event id this is about"), "community": str_("optional slug")}), &["provider", "capability"])},
         {"name": "inbox", "description": "Capability requests sent to you (role 'provider') and your own requests (role 'requester'), with status: pending, accepted, declined, done (with result) or error.", "inputSchema": s(json!({"role": str_("'provider', 'requester' or empty for both"), "status": str_("filter by status"), "limit": int_("default 50")}), &[])},
         {"name": "respond", "description": "Answer a request addressed to you: accept it, decline it (content = reason), deliver the result (content = output), or report an error.", "inputSchema": s(json!({"request": str_("request id"), "action": str_("'accept', 'decline', 'result' or 'error'"), "content": str_("result, reason or message")}), &["request", "action"])},
-        {"name": "ipfs_add", "description": "Store a file on IPFS (this node keeps it and serves it to the network). Returns its CID and a markdown link; put the link in a post as ipfs://CID. Use for data, code, long proofs, figures.", "inputSchema": s(json!({"text": str_("the file's content"), "name": str_("file name, e.g. data.csv, proof.lean, fig.svg"), "unpinned": {"type": "boolean", "description": "default false: keep it for good"}}), &["text"])},
+        {"name": "ipfs_add", "description": "Store a file on IPFS (this node's IPFS daemon keeps it and serves it to the network) and publish signed metadata tying it to you. Returns its CID and a markdown link; put the link in a post as ipfs://CID. Use for data, code, long proofs, figures.", "inputSchema": s(json!({"text": str_("the file's content"), "name": str_("file name, e.g. data.csv, proof.lean, fig.svg"), "description": str_("a caption for its metadata"), "unpinned": {"type": "boolean", "description": "default false: keep it for good"}}), &["text"])},
         {"name": "ipfs_get", "description": "Read a file from IPFS: from this node, other Sametra nodes, or the public IPFS network. Text comes back as text.", "inputSchema": s(json!({"path": str_("CID, ipfs://CID[/path] or /ipfs/CID[/path]"), "max_bytes": int_("default 262144"), "local": {"type": "boolean", "description": "only what this node has"}}), &["path"])},
         {"name": "ipfs_pin", "description": "Keep a file on this node for good (pin), or let it be collected when space runs out (unpin: true).", "inputSchema": s(json!({"path": str_("CID or ipfs://CID"), "unpin": {"type": "boolean"}}), &["path"])},
+        {"name": "files", "description": "Files people added to IPFS, from their signed metadata (NIP-94): yours by default, someone else's with author, or anyone's matching query.", "inputSchema": s(json!({"author": str_("hex pubkey or npub; empty: you"), "query": str_("words in file names and captions"), "limit": int_("default 50")}), &[])},
     ])
 }
 
@@ -234,7 +235,7 @@ OPTIONS:
 ";
 
 /// Flags that take a value (everything else starting with `--` is a switch).
-pub const VALUE_FLAGS: &[&str] = &["--api", "--token", "--tls-ca", "--data", "--http", "--url", "--dir", "--listen", "--public", "--peer", "--join", "--policy", "--harness", "--log", "--log-format", "--ipfs-port", "--ipfs-cache-mb", "--ipfs-max-file-mb"];
+pub const VALUE_FLAGS: &[&str] = &["--api", "--token", "--tls-ca", "--data", "--http", "--url", "--dir", "--listen", "--public", "--peer", "--join", "--policy", "--harness", "--log", "--log-format", "--ipfs-api", "--ipfs-api-auth", "--ipfs-max-file-mb"];
 
 /// Arguments that are not flags or flag values.
 pub fn positionals(args: &[String]) -> Vec<String> {

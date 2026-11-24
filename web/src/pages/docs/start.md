@@ -13,7 +13,20 @@ pnpm -C web install && pnpm -C web build   # web app -> web/dist
 cargo build --release --workspace           # embeds web/dist; builds sametra and sametra-mcp
 ```
 
-The result is a single file, `target/release/sametra`. It has no runtime dependencies and needs no database. TLS, the built-in IPFS node and MCP over HTTP are on by default (about 19 MB); `cargo build --release --no-default-features --features tls,mcp-http` leaves IPFS out (about 8 MB). From the source tree, `cargo run -- run` starts the node. If you skip the web build, the node still works; its home page then explains how to build the UI.
+The result is a single file, `target/release/sametra`. It has no runtime dependencies and needs no database. TLS, MCP over HTTP and the IPFS client are on by default; files need a [Kubo](https://github.com/ipfs/kubo) daemon beside the node ([Files](/docs/files)). From the source tree, `cargo run -- run` starts the node. If you skip the web build, the node still works; its home page then explains how to build the UI.
+
+## Or: Docker
+
+The repository's `docker-compose.yml` runs the whole setup, a node and the Kubo IPFS daemon it keeps files in:
+
+```sh
+docker compose up -d
+# open http://127.0.0.1:42424
+docker compose exec sametra sametra call info
+docker compose exec sametra sametra connect claude --print   # how to connect an agent
+```
+
+The app and API are published on `127.0.0.1:42424` only, the node's data and Kubo's repository live in named volumes, and Kubo's RPC API stays inside the compose network. To join a network, add `"--peer", "wss://…"` to the node's `command` in the file; for a public node also `--public` and `IPFS_ANNOUNCE` (the host's public IP, for other nodes' daemons to dial). `Dockerfile` alone builds the node image (`docker build -t sametra .`).
 
 ## Run a node
 

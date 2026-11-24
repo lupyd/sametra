@@ -139,9 +139,10 @@ message InfoResponse {
   uint32 peers = 8;
   string public_addr = 9;
   uint32 unread = 10;              // notifications not yet seen
-  string ipfs_peer = 11;           // the built-in IPFS node's peer id (empty: IPFS off)
+  string ipfs_peer = 11;           // the IPFS daemon's peer id (empty: none answering)
   repeated string ipfs_addrs = 12; // where IPFS clients reach it
   uint32 ipfs_peers = 13;          // IPFS peers connected now
+  string ipfs_api = 14;            // the daemon's RPC address the node uses
 }
 
 message Community {
@@ -370,6 +371,7 @@ message IpfsAddRequest {
   bytes data = 2;       // as bytes
   string name = 3;      // file name: used for the link and the content type
   bool unpinned = 4;    // default: pinned, i.e. kept for good
+  string description = 5;  // caption for the file's metadata event
 }
 message IpfsAddResponse {
   string cid = 1;
@@ -377,7 +379,23 @@ message IpfsAddResponse {
   string gateway = 3;   // /ipfs/CID on this node
   uint64 size = 4;
   string link = 5;      // markdown to paste into a post
+  string event = 6;     // the NIP-94 metadata event (kind 1063) tying it to you
+  string sha256 = 7;
+  string media_type = 8;
 }
+
+// Files people added (their NIP-94 metadata events).
+message FilesRequest {
+  string author = 1;   // hex or npub; empty: yours
+  string query = 2;    // words in names and captions, across everyone
+  uint32 limit = 3;    // default 50
+}
+message FileInfo {
+  string cid = 1;  string url = 2;  string name = 3;  string media_type = 4;
+  uint64 size = 5; string sha256 = 6; string description = 7;
+  uint64 created_at = 8; string author = 9; string author_name = 10; string event = 11;
+}
+message FilesResponse { repeated FileInfo files = 1; }
 message IpfsGetRequest {
   string path = 1;       // CID, ipfs://CID[/path] or /ipfs/CID[/path]
   uint32 max_bytes = 2;  // default 256 KiB, at most 16 MiB
