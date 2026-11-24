@@ -338,7 +338,7 @@ async fn ipfs_pin(_: &Arc<Node>, _: IpfsPinRequest) -> R<Ack> {
 }
 
 /// The newest metadata event describing `cid`, from anyone.
-fn file_meta(node: &Arc<Node>, cid: &str) -> Option<Ev> {
+pub(crate) fn file_meta(node: &Arc<Node>, cid: &str) -> Option<Ev> {
     let st = node.store.lock().unwrap();
     st.query(&Filter { kinds: Some(vec![K_FILE]), ..Default::default() }, 100_000).into_iter().find(|e| crate::files::nip94_cid(e) == Some(cid))
 }

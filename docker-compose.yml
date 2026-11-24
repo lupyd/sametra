@@ -1,0 +1,63 @@
+# The full setup: a Sametra node and the Kubo IPFS daemon it keeps files in.
+#
+#   docker compose up -d            # build and start both
+#   open http://127.0.0.1:42424
+#   docker compose exec sametra sametra call info
+#
+# To join a network, add peers to the node's command, e.g.
+#   command: ["run", "--listen", "0.0.0.0:42424", "--peer", "wss://node.example"]
+# and for a public node also "--public", "wss://your.host" and IPFS_ANNOUNCE below.
+
+services:
+  kubo:
+    image: ipfs/kubo:v0.43.1
+    restart: unless-stopped
+    environment:
+      # IPFS_ANNOUNCE: 203.0.113.7     # this host's public IP, for other nodes to dial
+      SAMETRA_IPFS_STORAGE: 20GB
+    volumes:
+      - kubo:/data/ipfs
+      - ./docker/kubo-init.sh:/container-init.d/010-sametra.sh:ro
+    ports:
+      # libp2p: Bitswap with other nodes and the public IPFS network.
+      # The RPC API (5001) is deliberately not published.
+      - "4001:4001/tcp"
+      - "4001:4001/udp"
+    healthcheck:
+      test: ["CMD", "ipfs", "id"]
+      interval: 15s
+      timeout: 5s
+      start_period: 20s
+
+  sametra:
+    build: .
+    image: sametra:latest
+    restart: unless-stopped
+    depends_on:
+      kubo:
+        condition: service_healthy
+    environment:
+      SAMETRA_IPFS_API: http://kubo:5001
+      SAMETRA_LOG: info
+      # requests from this host reach the container from the network's gateway:
+      # treat it like localhost, so the web app can post (Host/Origin checks still apply)
+      SAMETRA_TRUST_NET: 10.42.0.1/32
+      # SAMETRA_API_TOKEN: change-me    # allow write tools from outside the container
+    command: ["run", "--listen", "0.0.0.0:42424"]
+    ports:
+      # the app, the API, the nostr relay and /ipfs/ on one port; only on this
+      # machine by default (write tools trust localhost; see the docs on security)
+      - "127.0.0.1:42424:42424"
+    volumes:
+      - sametra:/data
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 10.42.0.0/24
+          gateway: 10.42.0.1
+
+volumes:
+  kubo:
+  sametra:

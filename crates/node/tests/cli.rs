@@ -604,6 +604,7 @@ fn files_through_kubo_move_between_nodes() {
     assert_eq!(code, 200, "{head}");
     assert_eq!(body, text.as_bytes());
     assert!(head.contains("Content-Security-Policy: sandbox") && head.contains("immutable"));
+    assert!(head.contains("Content-Type: text/markdown"), "a bare CID is typed by its metadata's name: {head}");
     let (code, head, raw) = http_get(pb, &format!("/ipfs/{cid}?format=raw"), "localhost");
     assert!(code == 200 && head.contains("application/vnd.ipld.raw"));
     assert_eq!(raw, body);

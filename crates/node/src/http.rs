@@ -175,7 +175,7 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin + Send>(node: Arc<Node>, mut s
 /// The operator's requests may fetch from the network; others get what this node
 /// has, unless the gateway is open.
 #[cfg(feature = "ipfs")]
-async fn ipfs_gateway<S: AsyncWrite + Unpin>(node: &Node, sock: &mut S, r: &Req, query: &str, operator: bool) -> std::io::Result<()> {
+async fn ipfs_gateway<S: AsyncWrite + Unpin>(node: &Arc<Node>, sock: &mut S, r: &Req, query: &str, operator: bool) -> std::io::Result<()> {
     use futures_util::StreamExt;
     if r.method != "GET" && r.method != "HEAD" {
         return respond(sock, 405, "text/plain", b"method not allowed").await;
@@ -200,6 +200,8 @@ async fn ipfs_gateway<S: AsyncWrite + Unpin>(node: &Node, sock: &mut S, r: &Req,
         };
     }
     let name = query.split('&').find_map(|kv| kv.strip_prefix("filename=")).map(String::from).unwrap_or_else(|| path.rsplit('/').next().filter(|n| *n != cid).unwrap_or("").to_string());
+    // a bare CID has no name: take it from the file's signed metadata, if known
+    let name = if name.is_empty() { api::file_meta(node, &cid).and_then(|e| e.tag("alt").map(String::from)).unwrap_or_default() } else { name };
     let mut chunks = match ipfs.cat_stream(&path, local, Duration::from_secs(60)).await {
         Ok(c) => Box::pin(c),
         Err(e) => return respond(sock, 404, "text/plain", missing(e).as_bytes()).await,
