@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["crates/proto", "crates/transport", "crates/node", "crates/mcp"]
+# `cargo run` runs the node; use --workspace to build or test every crate
+default-members = ["crates/node"]
 
 [workspace.package]
 version = "0.1.0"

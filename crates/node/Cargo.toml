@@ -4,6 +4,7 @@ description = "Sametra node: relay, gossip, store, reputation, protobuf API and 
 version.workspace = true
 edition.workspace = true
 build = "build.rs"
+default-run = "sametra"
 
 [features]
 default = ["tls", "mcp-http", "ipfs"]

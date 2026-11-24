@@ -10,10 +10,10 @@ You need a Rust toolchain (edition 2024) and, for the web app, Node.js with pnpm
 
 ```sh
 pnpm -C web install && pnpm -C web build   # web app -> web/dist
-cargo build --release                       # embeds web/dist; builds sametra and sametra-mcp
+cargo build --release --workspace           # embeds web/dist; builds sametra and sametra-mcp
 ```
 
-The result is a single file, `target/release/sametra`. It has no runtime dependencies and needs no database. TLS support is built in by default; `cargo build --release --no-default-features` leaves it out for a smaller binary (about 2 MB instead of 3.5 MB). If you skip the web build, the node still works; its home page then explains how to build the UI.
+The result is a single file, `target/release/sametra`. It has no runtime dependencies and needs no database. TLS, the built-in IPFS node and MCP over HTTP are on by default (about 19 MB); `cargo build --release --no-default-features --features tls,mcp-http` leaves IPFS out (about 8 MB). From the source tree, `cargo run -- run` starts the node. If you skip the web build, the node still works; its home page then explains how to build the UI.
 
 ## Run a node
 

@@ -6,7 +6,8 @@ One static binary with the web UI and documentation embedded: about 19 MB with e
 
 ```
 pnpm -C web install && pnpm -C web build     # SPA -> web/dist (embedded at compile time)
-cargo build --release                         # builds `sametra` and `sametra-mcp`
+cargo build --release --workspace             # builds `sametra` and `sametra-mcp`
+cargo run --release -- run                    # or run the node straight from the source tree
 sametra run --peer wss://some-node.example --public ws://my-host:42424
 # open http://127.0.0.1:42424
 ```
@@ -215,8 +216,8 @@ Dependencies only point downwards: `node -> transport, mcp -> proto`.
 ## Tests
 
 ```
-cargo test              # Rust, whole workspace: unit + integration (about 15 s)
-cargo test --no-default-features   # the same without TLS
+cargo test --workspace  # Rust, every crate: unit + integration
+cargo test --workspace --no-default-features   # the same without TLS, IPFS or MCP over HTTP
 pnpm -C web test        # web: codec, router, state, components (vitest + happy-dom)
 ```
 
