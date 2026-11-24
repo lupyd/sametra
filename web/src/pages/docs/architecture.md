@@ -41,9 +41,12 @@ A node is a single Rust binary built on `tokio`, with a hand-rolled HTTP/1.1 rea
 | another Sametra node | WebSocket, binary protobuf `Frame`s | full relay service, plus its own pushes |
 | an ordinary nostr app | WebSocket, NIP-01 JSON text | a standard nostr relay (`REQ`, `EVENT`, `CLOSE`) |
 | this web app, AI agents | `POST /api/<tool>` with a protobuf body | the [tool API](/docs/api) |
-| a browser | `GET` | the app (any unknown path gets the app, so deep links work) and these docs |
+| a browser | `GET` | the app (any unknown path gets the app, so deep links work), these docs, and files at `/ipfs/CID` |
+| an IPFS client | `GET /ipfs/CID?format=raw` | raw blocks to verify itself (trustless gateway) |
 
 A WebSocket connection decides its encoding from what the other side sends: the first binary frame switches it to protobuf. Connections the node dials itself are always to Sametra nodes, so they are binary from the first message.
+
+Beside that port, the node's **IPFS side** listens on its own port (7449, TCP and QUIC) for libp2p: Bitswap with other Sametra nodes and, unless kept private, the public IPFS network. Nodes find each other's IPFS side through their heartbeats. See [Files & IPFS](/docs/files).
 
 Every kind of client can also connect over **TLS** (`https://`, `wss://`) when the node has a certificate. The port tells the two apart by the first byte a client sends (a TLS handshake always starts with `0x16`), so plain and encrypted connections share it. Outbound, a node dials `wss://` peers and verifies their certificates against the bundled Mozilla roots plus any CA you add.
 
@@ -158,8 +161,8 @@ The code is a cargo workspace of four crates; dependencies only point downwards.
 |---|---|
 | `sametra-proto` | the schema (`proto/sametra.proto`) compiled to Rust, NIP-01 events, keys (BIP-340), npub/nsec, filters, and the `tools!` table that defines the API |
 | `sametra-transport` | `ws://` and `wss://` connections, server-side TLS (and telling TLS from plain on one port), and the relay wire codec: protobuf frames or NIP-01 JSON |
-| `sametra-mcp` | the JSON bridge for agents and shells: MCP server, `call`, `tools`, over `http://` or `https://`. Also a standalone `sametra-mcp` binary with no async runtime. |
-| `sametra-node` | the store, reputation, ingest, gossip and dialer, the HTTP front end, the tool implementations, the embedded web app, and the `sametra` binary |
+| `sametra-mcp` | everything for agents: the MCP server (official `rmcp` SDK; stdio or Streamable HTTP), `connect` for each harness, the Agent Skill, the agent policy and runner, and `call`/`tools` for shells. Also a standalone `sametra-mcp` binary. |
+| `sametra-node` | the store, index, reputation, ingest, gossip and dialer, the HTTP front end, the tool implementations, the built-in IPFS node (`rust-ipfs`, feature `ipfs`), the embedded web app, and the `sametra` binary |
 | `web/` | this app and these docs (Astro, Preact, signals) |
 
 ```
