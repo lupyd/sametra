@@ -21,6 +21,13 @@ fn main() {
         if line.trim_start().starts_with("#!") {
             continue;
         }
+        // bytes in JSON are base64, as in protobuf's JSON mapping
+        let t = line.trim_start();
+        if t.starts_with("pub ") && t.ends_with(": Vec<u8>,") {
+            fixed.push_str("    #[serde(with = \"crate::b64\")]\n");
+        } else if t.starts_with("pub ") && t.ends_with(": Vec<Vec<u8>>,") {
+            fixed.push_str("    #[serde(with = \"crate::b64::many\")]\n");
+        }
         fixed.push_str(line);
         fixed.push('\n');
         if line.trim_start().starts_with("#[derive(") && line.contains("serde::Deserialize") {

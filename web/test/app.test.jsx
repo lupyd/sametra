@@ -343,7 +343,7 @@ describe('relevance, needs and search scopes', () => {
   });
 
   it('posts needs and suggests who can help', async () => {
-    const helper = { provider: 'h'.repeat(64), provider_name: 'Lab agent', provider_is_agent: true, rep: 0.62, ratings: 3, requests: 4, completed: 3, declined: 0, spec: { id: 'assay', name: 'Plasma assay', kind: 'tool', about: '', input_schema: '{"type":"object"}', topics: [], communities: [] } };
+    const helper = { provider: 'h'.repeat(64), provider_name: 'Lab agent', provider_is_agent: true, rep: 0.62, ratings: 3, requests: 4, completed: 3, declined: 0, spec: { id: 'assay', name: 'Plasma assay', kind: 'tool', about: '', input_proto: 'syntax = "proto3"; message Sample { string sample = 1; }', input_message: 'Sample', topics: [], communities: [] } };
     await mount('/c/math', {
       post: () => ({ ok: true, id: 'f'.repeat(64) }),
       thread: () => ({ root: item({ id: 'f'.repeat(64), needs: ['plasma assay'] }), quoted_by: [], ref_events: [], thread_root: '' }),
@@ -365,10 +365,10 @@ describe('relevance, needs and search scopes', () => {
     expect(card.textContent).toContain('Plasma assay');
     expect(card.querySelector('.meter').textContent).toBe('delivers+0.6');
     await click(button('request', card));
-    expect($('pre.schema').textContent).toBe('{"type":"object"}');
-    await type(byPlaceholder('JSON input'), '{"sample":"S1"}');
+    expect($('pre.schema').textContent).toBe('syntax = "proto3"; message Sample { string sample = 1; }');
+    await type(byPlaceholder('Sample as JSON'), '{"sample":"S1"}');
     await click(button('Send request', card));
-    expect(sent('request')).toEqual([{ provider: 'h'.repeat(64), capability: 'assay', input: '{"sample":"S1"}', post: 'f'.repeat(64), community: '' }]);
+    expect(sent('request')).toMatchObject([{ provider: 'h'.repeat(64), capability: 'assay', input_json: '{"sample":"S1"}', input_text: '', post: 'f'.repeat(64), community: '' }]);
   });
 
   it('search scopes and community filter', async () => {
@@ -425,10 +425,10 @@ describe('capabilities', () => {
     expect(sent('inbox')[0]).toMatchObject({ role: 'provider' });
     expect($('.job pre.input').textContent).toBe('{"sample":"S1"}');
     await click(button('Accept'));
-    expect(sent('respond')[0]).toEqual({ request: 'j'.repeat(64), action: 'accept', content: '' });
+    expect(sent('respond')[0]).toMatchObject({ request: 'j'.repeat(64), action: 'accept', content: '' });
     await type(byPlaceholder('Result'), '42 ng/ml');
     await click(button('Deliver result'));
-    expect(sent('respond')[1]).toEqual({ request: 'j'.repeat(64), action: 'result', content: '42 ng/ml' });
+    expect(sent('respond')[1]).toMatchObject({ request: 'j'.repeat(64), action: 'result', content: '42 ng/ml' });
     await click(button('my requests'));
     expect(sent('inbox').at(-1)).toMatchObject({ role: 'requester' });
     expect(root.textContent).toContain('not requested anything yet');
@@ -446,7 +446,7 @@ describe('capabilities', () => {
   });
 
   it('offers and withdraws capabilities from your profile', async () => {
-    const mineCap = { provider: ME, provider_name: 'Me', provider_is_agent: false, rep: 0, ratings: 0, requests: 0, completed: 0, declined: 0, spec: { id: 'stats', name: 'Survival analysis', kind: 'skill', about: '', input_schema: '', topics: [], communities: [] } };
+    const mineCap = { provider: ME, provider_name: 'Me', provider_is_agent: false, rep: 0, ratings: 0, requests: 0, completed: 0, declined: 0, spec: { id: 'stats', name: 'Survival analysis', kind: 'skill', about: '', topics: [], communities: [] } };
     await mount('/me', {
       profile: () => ({ pubkey: ME, npub: 'npub1me', profile: { name: 'Me' }, reputation: [], last_seen: 0 }),
       capabilities: (r) => ({ capabilities: r.provider === ME ? [mineCap] : [] }),
@@ -464,9 +464,10 @@ describe('capabilities', () => {
     await type(byPlaceholder('id, e.g.'), 'assay');
     await type(byPlaceholder('name'), 'Plasma assay');
     await type(byPlaceholder('topics'), 'proteomics, plasma');
-    await type(byPlaceholder('input JSON Schema'), '{"type":"object"}');
+    await type(byPlaceholder('input as .proto'), 'syntax = "proto3"; message Sample { string sample = 1; }');
+    await type(byPlaceholder('input message'), 'Sample');
     await click(button('Offer capability'));
-    expect(sent('set_capability')[1]).toMatchObject({ id: 'assay', name: 'Plasma assay', kind: 'tool', topics: ['proteomics', 'plasma'], communities: [], input_schema: '{"type":"object"}' });
+    expect(sent('set_capability')[1]).toMatchObject({ id: 'assay', name: 'Plasma assay', kind: 'tool', topics: ['proteomics', 'plasma'], communities: [], input_proto: 'syntax = "proto3"; message Sample { string sample = 1; }', input_message: 'Sample' });
   });
 });
 

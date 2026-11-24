@@ -589,13 +589,12 @@ fn files_through_kubo_move_between_nodes() {
     assert_eq!(added["media_type"], "text/markdown; charset=utf-8");
     assert!(ka.pins.lock().unwrap().contains(&cid), "pinned by default");
     // the file is tied to A's identity by a signed NIP-94 event, which travels like any other
-    let ev = call(&a.0, pa, "event", json!({"id": added["event"]})).unwrap();
-    let raw: Value = serde_json::from_str(ev["raw_json"].as_str().unwrap()).unwrap();
-    assert_eq!(raw["kind"], 1063);
-    assert_eq!(raw["pubkey"], info["pubkey"]);
-    let tags = raw["tags"].as_array().unwrap();
-    assert!(tags.contains(&json!(["url", format!("ipfs://{cid}")])) && tags.contains(&json!(["alt", "lemma.md"])));
-    assert!(tags.contains(&json!(["x", added["sha256"]])) && tags.contains(&json!(["size", text.len().to_string()])));
+    let raw = raw_event(&call(&a.0, pa, "event", json!({"id": added["event"]})).unwrap());
+    assert_eq!(raw.kind, 1063);
+    assert_eq!(raw.pubkey.hex(), info["pubkey"].as_str().unwrap());
+    let has = |t: &[&str]| raw.tags.contains(&t.iter().map(|x| x.to_string()).collect::<Vec<_>>());
+    assert!(has(&["url", &format!("ipfs://{cid}")]) && has(&["alt", "lemma.md"]));
+    assert!(has(&["x", added["sha256"].as_str().unwrap()]) && has(&["size", &text.len().to_string()]));
     assert!(wait(Duration::from_secs(10), || call(&b.0, pb, "files", json!({"author": info["npub"]})).unwrap()["files"].as_array().is_some_and(|f| f.len() == 1)));
     let listed = &call(&b.0, pb, "files", json!({"query": "lemma"})).unwrap()["files"][0];
     assert_eq!((listed["cid"].as_str(), listed["name"].as_str(), listed["description"].as_str()), (Some(cid.as_str()), Some("lemma.md"), Some("the key step")));
@@ -617,10 +616,10 @@ fn files_through_kubo_move_between_nodes() {
     // a post linking a file carries its metadata (NIP-92 imeta), and other nodes keep the file
     let data = call(&a.0, pa, "ipfs_add", json!({"text": "x,y\n1,2", "name": "d.csv"})).unwrap()["cid"].as_str().unwrap().to_string();
     let post = call(&a.0, pa, "post", json!({"community": "math", "title": "Data", "content": format!("see [d.csv](ipfs://{data})")})).unwrap();
-    let raw: Value = serde_json::from_str(call(&a.0, pa, "event", json!({"id": post["id"]})).unwrap()["raw_json"].as_str().unwrap()).unwrap();
-    let imeta = raw["tags"].as_array().unwrap().iter().find(|t| t[0] == "imeta").expect("imeta tag").clone();
+    let raw = raw_event(&call(&a.0, pa, "event", json!({"id": post["id"]})).unwrap());
+    let imeta = raw.tags.iter().find(|t| t[0] == "imeta").expect("imeta tag").clone();
     assert_eq!(imeta[1], format!("url ipfs://{data}"));
-    assert!(imeta.as_array().unwrap().contains(&json!("alt d.csv")));
+    assert!(imeta.contains(&"alt d.csv".to_string()));
     assert!(wait(Duration::from_secs(15), || kb.has(&data)), "B's daemon fetched the linked file");
     // pin and unpin through B
     assert_eq!(call(&b.0, pb, "ipfs_pin", json!({"path": data})).unwrap()["ok"], true);
@@ -666,4 +665,12 @@ fn logs_are_structured_and_configurable() {
     assert!(code == 2 && stderr.contains("bad log filter"), "{stderr}");
     let (code, _, stderr) = out(cmd(&d.0).args(["id", "--log-format", "xml"]).output().unwrap());
     assert!(code == 2 && stderr.contains("--log-format"), "{stderr}");
+}
+
+/// The signed event in an `event` reply: protobuf bytes, base64 in the CLI's JSON.
+fn raw_event(v: &Value) -> sametra_node::event::Event {
+    let bytes = sametra_node::b64::decode(v["raw"].as_str().unwrap()).unwrap();
+    let e = sametra_node::event::Event::from_pb(sametra_node::pb::decode(&bytes).unwrap()).unwrap();
+    assert!(e.validate().is_ok());
+    e
 }

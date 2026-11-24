@@ -1,6 +1,6 @@
 //! Message bodies.
 //!
-//! A body is text in a declared format: tag `["m", <media type>]`, defaulting to
+//! A body is text in a declared format: the event's content type, defaulting to
 //! `text/markdown` (CommonMark with GFM tables and `$math$`). Clients that do
 //! not know a format show the text as it is, so new formats can be added later
 //! without breaking older nodes or posts. A post can ask for the format of its

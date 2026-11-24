@@ -14,10 +14,11 @@ fn tool(id: &str) -> pb::CapabilitySpec {
         name: "Plasma assay".into(),
         about: "Quantifies marker X in plasma samples, 48 h turnaround".into(),
         kind: "tool".into(),
-        input_schema: r#"{"type":"object","required":["sample"],"properties":{"sample":{"type":"string"}}}"#.into(),
+        input_proto: "syntax = \"proto3\"; package lab; message Sample { string sample = 1; double volume_ml = 2; }".into(),
+        input_message: "lab.Sample".into(),
         topics: vec!["Proteomics".into(), "mass spectrometry".into()],
         communities: vec!["onco".into()],
-        delete: false,
+        ..Default::default()
     }
 }
 fn skill(id: &str) -> pb::CapabilitySpec {
@@ -38,8 +39,9 @@ async fn publish_search_and_withdraw() {
     assert!(n.err("set_capability", &bad(&|s| s.id = "no spaces".into())).await.1.contains("'id'"));
     assert!(n.err("set_capability", &bad(&|s| s.name = " ".into())).await.1.contains("name"));
     assert!(n.err("set_capability", &bad(&|s| s.kind = "spell".into())).await.1.contains("tool or skill"));
-    assert!(n.err("set_capability", &bad(&|s| s.input_schema = "{oops".into())).await.1.contains("not JSON"));
-    assert!(n.err("set_capability", &bad(&|s| s.input_schema = "[1]".into())).await.1.contains("object"));
+    assert!(n.err("set_capability", &bad(&|s| s.input_proto = "message {".into())).await.1.contains("input_proto:"));
+    assert!(n.err("set_capability", &bad(&|s| s.input_message = "lab.Nope".into())).await.1.contains("no message 'lab.Nope'"));
+    assert!(n.err("set_capability", &bad(&|s| s.input_proto = String::new())).await.1.contains("declares its input"));
     assert!(n.err("set_capability", &bad(&|s| s.communities = vec!["Bad Slug".into()])).await.1.contains("slug"));
     n.ok::<_, pb::Ack>("set_capability", &tool("assay")).await;
     n.ok::<_, pb::Ack>("set_capability", &skill("pathology")).await;
@@ -52,7 +54,9 @@ async fn publish_search_and_withdraw() {
     let spec = c.spec.clone().unwrap();
     assert_eq!((spec.id.as_str(), spec.kind.as_str()), ("assay", "tool"));
     assert_eq!(spec.topics, ["proteomics", "mass spectrometry"], "topics are lowercased");
-    assert!(spec.input_schema.contains("required") && c.text_match > 0.0);
+    // the input type travels compiled, as a descriptor, next to its source for reading
+    assert!(!spec.input_descriptor.is_empty() && spec.input_message == "lab.Sample" && spec.input_proto.contains("message Sample"));
+    assert!(c.text_match > 0.0);
     assert_eq!((c.provider.as_str(), c.requests, c.rep), (n.node.keys.pubkey.hex().as_str(), 0, 0.0));
     let by_kind: pb::CapabilitiesResponse = n.ok("capabilities", &pb::CapabilitiesRequest { kind: "skill".into(), ..Default::default() }).await;
     assert_eq!(by_kind.capabilities[0].spec.as_ref().unwrap().id, "pathology");
@@ -71,7 +75,7 @@ async fn publish_search_and_withdraw() {
     let r: pb::CapabilitiesResponse = n.ok("capabilities", &find("")).await;
     assert_eq!(r.capabilities.len(), 1, "withdrawn capabilities disappear");
     // you cannot request your own capability
-    let own = pb::JobRequest { provider: n.node.keys.npub(), capability: "pathology".into(), input: "x".into(), ..Default::default() };
+    let own = pb::JobRequest { provider: n.node.keys.npub(), capability: "pathology".into(), input_text: "x".into(), ..Default::default() };
     assert!(n.err("request", &own).await.1.contains("your own"));
 }
 
@@ -97,10 +101,12 @@ async fn request_accept_deliver_and_rate() {
     let cap = cap.expect("announcement reached the asker");
     assert!(cap.provider_is_agent && cap.provider_name == "Hospital lab agent");
 
-    // input validation against the tool's schema
-    let req = |input: &str| pb::JobRequest { provider: cap.provider.clone(), capability: "assay".into(), input: input.into(), community: "onco".into(), ..Default::default() };
-    assert!(asker.err("request", &req(r#"{"volume":2}"#)).await.1.contains("'sample'"));
-    assert!(asker.err("request", &req("plain text")).await.1.contains("must be JSON"));
+    // the input is a lab.Sample: given as JSON at the edge, checked and sent as protobuf
+    let req = |input: &str| pb::JobRequest { provider: cap.provider.clone(), capability: "assay".into(), input_json: input.into(), community: "onco".into(), ..Default::default() };
+    assert!(asker.err("request", &req(r#"{"colour":2}"#)).await.1.contains("not a valid lab.Sample"));
+    assert!(asker.err("request", &req("plain text")).await.1.contains("not a valid lab.Sample"));
+    let raw = pb::JobRequest { input_json: String::new(), input: vec![0x0a, 0x09], ..req("") };
+    assert!(asker.err("request", &raw).await.1.contains("not a valid lab.Sample"), "truncated bytes are refused too");
     assert!(asker.err("request", &pb::JobRequest { capability: "nope".into(), ..req("{}") }).await.1.contains("no capability 'nope'"));
     let post: pb::Ack = asker.ok("post", &pb::PostRequest { needs: vec!["plasma assay".into()], ..post("onco", "Need marker X measured", "two samples") }).await;
     let job: pb::Ack = asker.ok("request", &pb::JobRequest { post: post.id.clone(), ..req(r#"{"sample":"S-17"}"#) }).await;
@@ -118,12 +124,14 @@ async fn request_accept_deliver_and_rate() {
     }
     let j = pending.expect("request reached the provider");
     assert_eq!((j.status.as_str(), j.capability.as_str(), j.input.as_str(), j.post.as_str(), j.community.as_str()), ("pending", "assay", r#"{"sample":"S-17"}"#, post.id.as_str(), "onco"));
+    // on the wire it was the encoded message: field 1, "S-17"
+    assert_eq!((j.input_data.as_slice(), j.input_type.as_str()), (&b"\x0a\x04S-17"[..], "application/x-protobuf; message=lab.Sample"));
     assert!(!j.mine && j.requester == asker.node.keys.pubkey.hex());
     let mine: pb::JobsResponse = asker.ok("inbox", &inbox("requester")).await;
     assert!(mine.jobs[0].mine && mine.jobs[0].status == "pending");
     assert!(asker.ok::<_, pb::JobsResponse>("inbox", &inbox("provider")).await.jobs.is_empty());
 
-    lab.ok::<_, pb::Ack>("respond", &pb::RespondRequest { request: job.id.clone(), action: "accept".into(), content: String::new() }).await;
+    lab.ok::<_, pb::Ack>("respond", &pb::RespondRequest { request: job.id.clone(), action: "accept".into(), content: String::new(), ..Default::default() }).await;
     assert!(eventually_status(&asker, &job.id, "accepted").await);
 
     // errors: not mine to answer, bad action, empty result
@@ -131,7 +139,7 @@ async fn request_accept_deliver_and_rate() {
     assert!(lab.err("respond", &pb::RespondRequest { request: job.id.clone(), action: "shrug".into(), ..Default::default() }).await.1.contains("unknown action"));
     assert!(lab.err("respond", &pb::RespondRequest { request: job.id.clone(), action: "result".into(), ..Default::default() }).await.1.contains("content"));
 
-    lab.ok::<_, pb::Ack>("respond", &pb::RespondRequest { request: job.id.clone(), action: "result".into(), content: "marker X: 42 ng/ml".into() }).await;
+    lab.ok::<_, pb::Ack>("respond", &pb::RespondRequest { request: job.id.clone(), action: "result".into(), content: "marker X: 42 ng/ml".into(), ..Default::default() }).await;
     assert!(eventually_status(&asker, &job.id, "done").await);
     let done: pb::JobsResponse = asker.ok("inbox", &pb::InboxRequest { status: "done".into(), ..Default::default() }).await;
     let d = &done.jobs[0];
@@ -192,7 +200,7 @@ async fn providers_may_decline() {
     assert!(asker.err("request", &req("  ")).await.1.contains("describe what you need"));
     let job: pb::Ack = asker.ok("request", &req("Could you review slide 4?")).await;
     assert!(eventually(T, || lab.has(&job.id)).await);
-    lab.ok::<_, pb::Ack>("respond", &pb::RespondRequest { request: job.id.clone(), action: "decline".into(), content: "no capacity this week".into() }).await;
+    lab.ok::<_, pb::Ack>("respond", &pb::RespondRequest { request: job.id.clone(), action: "decline".into(), content: "no capacity this week".into(), ..Default::default() }).await;
     assert!(eventually_status(&asker, &job.id, "declined").await);
     let r: pb::JobsResponse = asker.ok("inbox", &pb::InboxRequest::default()).await;
     assert_eq!(r.jobs[0].status_text, "no capacity this week");

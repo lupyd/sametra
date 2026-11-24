@@ -47,7 +47,7 @@ describe('wire compatibility with the Rust node', () => {
   // Same vectors as `pb::golden` in src/pb.rs.
   it.each([
     ['RateRequest', { score: -0.3, event: 'ab', reason: 'é' }, '09333333333333d3bf120261622a02c3a9'],
-    ['FetchRequest', { filter: { kinds: [11, 1111], tags: [{ name: 'c', values: ['m'] }], since: 1700000000, limit: 5 } }, '0a151a030bd70822060a016312016d2880e2cfaa063805'],
+    ['FetchRequest', { filter: { kinds: [11, 1111], tags: [{ name: 'c', values: [{ text: 'm' }] }], since: 1700000000, limit: 5 } }, '0a171a030bd70822080a016312030a016d2880e2cfaa063805'],
     ['Ack', { ok: true, id: 'x', count: 3, rep: -1.5, community: 'm' }, '0801120178180321000000000000f8bf2a016d'],
     ['IdRequest', { id: 'i', thread: true }, '0a01691001'],
   ])('%s encodes byte-identically', (type, obj, want) => {

@@ -64,16 +64,12 @@ fn opt_slug(s: &str) -> Option<&str> {
 }
 
 fn profile_of(st: &Store, pk: &H32) -> Profile {
-    let Some(v) = st.replaceable(pk, K_PROFILE, "").and_then(|e| serde_json::from_str::<serde_json::Value>(&e.content).ok()) else {
-        return Profile::default();
-    };
-    let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").chars().take(2000).collect::<String>();
-    let flag = |k: &str| v.get(k).and_then(|x| x.as_bool()).unwrap_or(false);
+    let Some(p) = st.replaceable(pk, K_PROFILE, "").and_then(|e| e.profile()) else { return Profile::default() };
     Profile {
-        name: s("name").chars().take(64).collect(),
-        about: s("about"),
-        agent: flag("agent") || flag("bot"), // NIP-24 `bot` from other nostr clients
-        model: s("model").chars().take(100).collect(),
+        name: p.name.chars().take(64).collect(),
+        about: p.about.chars().take(2000).collect(),
+        agent: p.agent,
+        model: p.model.chars().take(100).collect(),
     }
 }
 
@@ -114,14 +110,15 @@ fn name_of(st: &Store, pk: &H32) -> String {
 fn view(st: &Store, rep: &RepTable, e: &Event, full: bool, cx: &Cx) -> Item {
     let author_rep = rep.user(&e.pubkey);
     let score = rep.event(&e.id);
-    let content = if full || e.content.len() <= 600 {
-        e.content.clone()
+    let text = e.text();
+    let content = if full || text.len() <= 600 {
+        text.to_string()
     } else {
         let mut end = 600;
-        while !e.content.is_char_boundary(end) {
+        while !text.is_char_boundary(end) {
             end -= 1;
         }
-        format!("{}…", &e.content[..end])
+        format!("{}…", &text[..end])
     };
     Item {
         id: e.id.hex(),
@@ -150,9 +147,9 @@ fn view(st: &Store, rep: &RepTable, e: &Event, full: bool, cx: &Cx) -> Item {
         cited_by: st.cited_by(&e.id) as u32,
         popularity: round2(st.popularity(&e.id)),
         needs: e.tags_named("need").map(String::from).collect(),
-        format: e.tag("m").unwrap_or(crate::body::MARKDOWN).to_string(),
+        format: if e.content_type.is_empty() { crate::body::MARKDOWN.to_string() } else { e.content_type.clone() },
         accept: e.tags_named("accept").map(String::from).collect(),
-        blocks: if full && crate::body::is_markdown(e.tag("m").unwrap_or("")) { crate::body::blocks(&e.content) } else { vec![] },
+        blocks: if full && crate::body::is_markdown(&e.content_type) { crate::body::blocks(text) } else { vec![] },
         topic: e.topic_parent().filter(|_| e.kind == K_POST).map(|p| p.hex()).unwrap_or_default(),
         subtopics: if e.kind == K_POST { subtopics_of(st, &e.id).len() as u32 } else { 0 },
         root: e.root().filter(|_| e.kind == K_REPLY).map(|p| p.hex()).unwrap_or_default(),
@@ -365,7 +362,7 @@ async fn files(node: &Arc<Node>, r: FilesRequest) -> R<FilesResponse> {
                 media_type: tag("m"),
                 size: tag("size").parse().unwrap_or(0),
                 sha256: tag("x"),
-                description: e.content.clone(),
+                description: e.text().to_string(),
                 created_at: e.created_at,
                 author: e.pubkey.hex(),
                 author_name: name_of(&st, &e.pubkey),
@@ -391,7 +388,7 @@ async fn communities(node: &Arc<Node>, _: Empty) -> R<CommunitiesResponse> {
         }
         m.insert(
             d.clone(),
-            Community { name: e.tag("name").unwrap_or(&d).into(), about: e.content.clone(), creator: e.pubkey.hex(), slug: d, ..Default::default() },
+            Community { name: e.tag("name").unwrap_or(&d).into(), about: e.text().to_string(), creator: e.pubkey.hex(), slug: d, ..Default::default() },
         );
     }
     let blank = |c: &String| Community { slug: c.clone(), name: c.clone(), ..Default::default() };
@@ -548,7 +545,7 @@ async fn event(node: &Arc<Node>, r: IdRequest) -> R<EventResponse> {
     let rep = node.reputation(e.community().unwrap_or(""));
     let cx = Cx::of(node);
     let st = node.store.lock().unwrap();
-    Ok(EventResponse { item: Some(view(&st, &rep, &e, true, &cx)), raw_json: serde_json::to_string(&*e).unwrap() })
+    Ok(EventResponse { item: Some(view(&st, &rep, &e, true, &cx)), raw: pb::encode(&e.to_pb()) })
 }
 
 /// The chain of reasoning around a post: walk up through reply parents and
@@ -791,13 +788,16 @@ async fn post(node: &Arc<Node>, r: PostRequest) -> R<Ack> {
     for n in r.needs.iter().map(|n| n.trim()).filter(|n| !n.is_empty()).take(10) {
         tags.push(t("need", n.chars().take(100).collect::<String>()));
     }
-    // body format (default markdown, left implicit) and the formats replies should use
+    // body format (default markdown: an empty content type) and the formats replies should use
     let format = r.format.trim();
-    if !format.is_empty() && format != crate::body::MARKDOWN {
+    let content_type = if format.is_empty() || format == crate::body::MARKDOWN { String::new() } else { format.to_string() };
+    if !content_type.is_empty() {
         if !crate::body::valid_media_type(format) {
             return Err(format!("'format' must be a media type such as text/markdown or application/json, not '{format}'"));
         }
-        tags.push(t("m", format));
+        if !is_text(format) {
+            return Err(format!("posts are text: 'format' must be a text media type (text/*, JSON, XML), not '{format}'; attach other files"));
+        }
     }
     for a in r.accept.iter().map(|a| a.trim()).filter(|a| !a.is_empty()).take(5) {
         if !crate::body::valid_media_type(a) {
@@ -825,7 +825,7 @@ async fn post(node: &Arc<Node>, r: PostRequest) -> R<Ack> {
         tags.push(t("L", "sametra"));
         tags.push(vec!["l".into(), if mentioned.is_empty() { "addressed" } else { "mention" }.into(), "sametra".into()]);
     }
-    let e = node.publish(kind, tags, content)?;
+    let e = node.publish_data(kind, tags, content.into_bytes(), &content_type)?;
     Ok(Ack { mentioned: mentioned.iter().map(npub).collect(), unresolved, ..ack(Some(&e.id)) })
 }
 
@@ -1129,16 +1129,13 @@ async fn set_profile(node: &Arc<Node>, p: Profile) -> R<Ack> {
     if p.name.trim().is_empty() {
         return Err("missing 'name'".into());
     }
-    // kind 0 content stays NIP-01 JSON so other nostr clients can read it
-    let content = serde_json::json!({
-        "name": p.name.trim(),
-        "about": p.about,
-        "agent": p.agent,
-        "bot": p.agent, // NIP-24, so other nostr clients see it too
-        "model": if p.agent { p.model.trim().chars().take(100).collect::<String>() } else { String::new() },
-    })
-    .to_string();
-    let e = node.publish(K_PROFILE, vec![], content)?;
+    let profile = Profile {
+        name: p.name.trim().chars().take(64).collect(),
+        about: p.about.chars().take(2000).collect(),
+        agent: p.agent,
+        model: if p.agent { p.model.trim().chars().take(100).collect() } else { String::new() },
+    };
+    let e = node.publish_data(K_PROFILE, vec![], pb::encode(&profile), TYPE_PROFILE)?;
     Ok(ack(Some(&e.id)))
 }
 
@@ -1168,7 +1165,7 @@ async fn pin_impl(node: &Arc<Node>, r: IdRequest, on: bool) -> R<Ack> {
     if let Some(ipfs) = node.ipfs.get() {
         let texts: Vec<String> = {
             let st = node.store.lock().unwrap();
-            ids.iter().filter_map(|i| st.get(i)).map(|e| e.content.clone()).collect()
+            ids.iter().filter_map(|i| st.get(i)).map(|e| e.text().to_string()).collect()
         };
         let cids: Vec<_> = texts.iter().flat_map(|t| crate::files::linked_cids(t)).collect();
         if !cids.is_empty() {
@@ -1248,17 +1245,13 @@ fn spec_of(e: &Event) -> Option<CapabilitySpec> {
     if e.kind != K_CAPABILITY || e.tag("status") == Some("withdrawn") {
         return None;
     }
-    let v: serde_json::Value = serde_json::from_str(&e.content).ok()?;
-    let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let spec = e.capability_spec()?;
     Some(CapabilitySpec {
         id: e.d_tag().to_string(),
-        name: s("name"),
-        about: s("about"),
-        kind: s("kind"),
-        input_schema: v.get("input_schema").filter(|x| !x.is_null()).map(|x| x.to_string()).unwrap_or_default(),
         topics: e.tags_named("t").map(String::from).collect(),
         communities: e.tags_named("c").map(String::from).collect(),
         delete: false,
+        ..spec
     })
 }
 
@@ -1297,7 +1290,7 @@ fn job_state(st: &Store, req: &Event) -> JobState {
         Some("error") => "error",
         _ => "pending",
     };
-    JobState { status, text: fb.content.clone(), result: None, updated: fb.created_at }
+    JobState { status, text: fb.text().to_string(), result: None, updated: fb.created_at }
 }
 
 #[derive(Default, Clone, Copy)]
@@ -1379,7 +1372,7 @@ async fn set_capability(node: &Arc<Node>, c: CapabilitySpec) -> R<Ack> {
     let mut tags = vec![t("d", &id), t("k", K_JOB.to_string())];
     if c.delete {
         tags.push(t("status", "withdrawn"));
-        let e = node.publish(K_CAPABILITY, tags, "{}".into())?;
+        let e = node.publish(K_CAPABILITY, tags, String::new())?;
         return Ok(ack(Some(&e.id)));
     }
     if c.name.trim().is_empty() {
@@ -1390,15 +1383,18 @@ async fn set_capability(node: &Arc<Node>, c: CapabilitySpec) -> R<Ack> {
         "skill" | "" => "skill",
         other => return Err(format!("'kind' must be tool or skill, not '{other}'")),
     };
-    let schema = match c.input_schema.trim() {
-        "" => serde_json::Value::Null,
-        s => {
-            let v: serde_json::Value = serde_json::from_str(s).map_err(|e| format!("'input_schema' is not JSON: {e}"))?;
-            if !v.is_object() {
-                return Err("'input_schema' must be a JSON Schema object".into());
+    // a tool's input is a protobuf message: compile its .proto source once, here,
+    // and announce the descriptor so every requester can check inputs against it
+    let (input_proto, input_message) = (c.input_proto.trim().to_string(), c.input_message.trim().trim_start_matches('.').to_string());
+    let input_descriptor = match (kind, input_proto.is_empty()) {
+        ("tool", false) => {
+            if input_message.is_empty() {
+                return Err("give 'input_message': which message in input_proto is the input".into());
             }
-            v
+            crate::schema::compile(&input_proto, &input_message)?
         }
+        ("tool", true) => return Err("a tool declares its input: give 'input_proto' (.proto source) and 'input_message'".into()),
+        _ => vec![],
     };
     for tp in c.topics.iter().map(|x| x.trim()).filter(|x| !x.is_empty()).take(20) {
         tags.push(t("t", tp.to_lowercase().chars().take(50).collect::<String>()));
@@ -1406,13 +1402,16 @@ async fn set_capability(node: &Arc<Node>, c: CapabilitySpec) -> R<Ack> {
     for cm in c.communities.iter().filter(|x| !x.trim().is_empty()).take(10) {
         tags.push(t("c", slug(cm)?));
     }
-    let content = serde_json::json!({
-        "name": c.name.trim().chars().take(100).collect::<String>(),
-        "about": c.about.chars().take(4000).collect::<String>(),
-        "kind": kind,
-        "input_schema": schema,
-    });
-    let e = node.publish(K_CAPABILITY, tags, content.to_string())?;
+    let spec = CapabilitySpec {
+        name: c.name.trim().chars().take(100).collect(),
+        about: c.about.chars().take(4000).collect(),
+        kind: kind.into(),
+        input_proto: if kind == "tool" { input_proto } else { String::new() },
+        input_message: if kind == "tool" { input_message } else { String::new() },
+        input_descriptor,
+        ..Default::default()
+    };
+    let e = node.publish_data(K_CAPABILITY, tags, pb::encode(&spec), TYPE_CAPABILITY)?;
     Ok(ack(Some(&e.id)))
 }
 
@@ -1501,23 +1500,27 @@ async fn request(node: &Arc<Node>, r: JobRequest) -> R<Ack> {
         }
     };
     let spec = ann.as_deref().and_then(spec_of).ok_or_else(|| format!("{} offers no capability '{cap}'", npub(&provider)))?;
-    let input_text = r.input.trim();
-    if spec.kind == "tool" {
-        let v: serde_json::Value = serde_json::from_str(if input_text.is_empty() { "{}" } else { input_text }).map_err(|e| format!("'{cap}' is a tool: 'input' must be JSON ({e})"))?;
-        if let Ok(schema) = serde_json::from_str::<serde_json::Value>(&spec.input_schema) {
-            for k in schema.get("required").and_then(|x| x.as_array()).into_iter().flatten().filter_map(|k| k.as_str()) {
-                if v.get(k).is_none() {
-                    return Err(format!("'{cap}' requires input field '{k}'"));
-                }
-            }
+    // the input travels as the event's content: the tool's message, or text for skills
+    let (content, content_type) = if spec.kind == "tool" && !spec.input_descriptor.is_empty() {
+        let msg = spec.input_message.as_str();
+        let bytes = if !r.input_json.trim().is_empty() {
+            crate::schema::from_json(&spec.input_descriptor, msg, &r.input_json)?
+        } else {
+            crate::schema::check(&spec.input_descriptor, msg, &r.input)?;
+            r.input.clone()
+        };
+        (bytes, crate::schema::media_type(msg))
+    } else {
+        let text = if r.input_text.trim().is_empty() { String::from_utf8(r.input.clone()).map_err(|_| "a skill takes text: give 'input_text'")? } else { r.input_text.clone() };
+        if text.trim().is_empty() {
+            return Err("describe what you need in 'input_text'".into());
         }
-    } else if input_text.is_empty() {
-        return Err("describe what you need in 'input'".into());
+        (text.into_bytes(), String::new())
+    };
+    if content.len() > 32 * 1024 {
+        return Err("the input is limited to 32 KiB".into());
     }
-    if r.input.len() > 32 * 1024 {
-        return Err("'input' is limited to 32 KiB".into());
-    }
-    let mut tags = vec![t("p", provider.hex()), vec!["param".into(), "capability".into(), cap.clone()], vec!["i".into(), r.input.clone(), "text".into()]];
+    let mut tags = vec![t("p", provider.hex()), vec!["param".into(), "capability".into(), cap.clone()]];
     let mut community = opt_slug(&r.community).map(slug).transpose()?;
     if let Some(p) = opt_slug(&r.post) {
         let pid = hex_id(p, "post")?;
@@ -1530,8 +1533,23 @@ async fn request(node: &Arc<Node>, r: JobRequest) -> R<Ack> {
     if let Some(c) = community {
         tags.push(t("c", c));
     }
-    let e = node.publish(K_JOB, tags, String::new())?;
+    let e = node.publish_data(K_JOB, tags, content, &content_type)?;
     Ok(ack(Some(&e.id)))
+}
+
+/// An event's content for reading: its text, a tool message rendered with the
+/// capability's descriptor, or a note of what it is.
+fn readable(st: &Store, e: &Event, provider: &H32, cap: &str) -> String {
+    if is_text(&e.content_type) {
+        return e.text().to_string();
+    }
+    let spec = st.replaceable(provider, K_CAPABILITY, cap).and_then(|a| spec_of(a));
+    match spec {
+        Some(s) if e.content_type == crate::schema::media_type(&s.input_message) => {
+            crate::schema::to_json(&s.input_descriptor, &s.input_message, &e.content).unwrap_or_else(|err| format!("({err})"))
+        }
+        _ => format!("({} bytes of {})", e.content.len(), e.content_type),
+    }
 }
 
 /// Requests to me (role "provider"), my requests ("requester"), or both.
@@ -1569,13 +1587,17 @@ async fn inbox(node: &Arc<Node>, r: InboxRequest) -> R<JobsResponse> {
             provider: provider.hex(),
             provider_name: name_of(&st, &provider),
             capability: param(&req, "capability").unwrap_or("").into(),
-            input: input(&req, "text").unwrap_or("").into(),
+            input: readable(&st, &req, &provider, param(&req, "capability").unwrap_or("")),
+            input_data: req.content.clone(),
+            input_type: req.content_type.clone(),
             post: input(&req, "event").unwrap_or("").into(),
             community: req.community().unwrap_or("").into(),
             created_at: req.created_at,
             status: j.status.into(),
             status_text: j.text,
-            result: j.result.as_ref().map(|e| e.content.clone()).unwrap_or_default(),
+            result: j.result.as_ref().map(|e| if is_text(&e.content_type) { e.text().to_string() } else { format!("({} bytes of {})", e.content.len(), e.content_type) }).unwrap_or_default(),
+            result_data: j.result.as_ref().map(|e| e.content.clone()).unwrap_or_default(),
+            result_type: j.result.as_ref().map(|e| e.content_type.clone()).unwrap_or_default(),
             rated: !result_id.is_empty() && rated.contains(&result_id),
             result_id,
             updated_at: j.updated,
@@ -1605,18 +1627,22 @@ async fn respond(node: &Arc<Node>, r: RespondRequest) -> R<Ack> {
         "decline" => node.publish(K_JOB_FEEDBACK, status("error", "declined"), r.content)?,
         "error" => node.publish(K_JOB_FEEDBACK, status("error", "failed"), r.content)?,
         "result" => {
-            if r.content.trim().is_empty() {
-                return Err("a result needs 'content'".into());
+            // text in `content`, or bytes in `data` with their media type
+            let (content, ctype) = if r.data.is_empty() { (r.content.into_bytes(), String::new()) } else { (r.data, r.content_type.trim().to_string()) };
+            if content.iter().all(|b| b.is_ascii_whitespace()) {
+                return Err("a result needs 'content' (text) or 'data' with 'content_type'".into());
+            }
+            if !is_text(&ctype) && ctype.is_empty() {
+                return Err("binary 'data' needs a 'content_type'".into());
             }
             let mut tags = base.clone();
-            tags.push(t("request", serde_json::to_string(&*req).unwrap()));
             if let Some(cap) = param(&req, "capability") {
                 tags.push(vec!["param".into(), "capability".into(), cap.into()]);
             }
             if let Some(c) = req.community() {
                 tags.push(t("c", c));
             }
-            node.publish(K_JOB_RESULT, tags, r.content)?
+            node.publish_data(K_JOB_RESULT, tags, content, &ctype)?
         }
         other => return Err(format!("unknown action '{other}': use accept, decline, result or error")),
     };
@@ -1676,6 +1702,10 @@ mod tests {
         Node::new(Config { data, ..Default::default() }, Keys::generate()).unwrap()
     }
 
+    fn prof(k: &Keys, name: &str, at: u64) -> Event {
+        k.sign_data(K_PROFILE, vec![], pb::encode(&Profile { name: name.into(), ..Default::default() }), TYPE_PROFILE, at)
+    }
+
     fn test_cx(n: &Arc<Node>) -> Cx {
         Cx { me: n.keys.pubkey, hum: Default::default() }
     }
@@ -1684,9 +1714,9 @@ mod tests {
     fn mentions_resolve_handles_and_keys() {
         let n = node();
         let (argon, other_argon, ada) = (Keys::generate(), Keys::generate(), Keys::generate());
-        n.ingest(argon.sign_at(K_PROFILE, vec![], r#"{"name":"Doctor Argon"}"#.into(), now() - 100), 1, false).unwrap();
-        n.ingest(other_argon.sign_at(K_PROFILE, vec![], r#"{"name":"doctor-argon"}"#.into(), now() - 5000), 1, false).unwrap();
-        n.ingest(ada.sign(K_PROFILE, vec![], r#"{"name":"Ada"}"#.into()), 1, false).unwrap();
+        n.ingest(prof(&argon, "Doctor Argon", now() - 100), 1, false).unwrap();
+        n.ingest(prof(&other_argon, "doctor-argon", now() - 5000), 1, false).unwrap();
+        n.ingest(prof(&ada, "Ada", now()), 1, false).unwrap();
         n.store.lock().unwrap().touch(argon.pubkey, now());
         let me = n.keys.pubkey;
         let st = n.store.lock().unwrap();
@@ -1801,15 +1831,19 @@ mod tests {
     fn profile_of_sanitises() {
         let n = node();
         let k = Keys::generate();
-        let content = serde_json::json!({"name": "n".repeat(500), "about": 5, "agent": "yes"}).to_string();
-        n.ingest(k.sign(K_PROFILE, vec![], content), 1, false).unwrap();
+        let long = Profile { name: "n".repeat(500), about: "a".repeat(5000), ..Default::default() };
+        n.ingest(k.sign_data(K_PROFILE, vec![], pb::encode(&long), TYPE_PROFILE, now()), 1, false).unwrap();
         let st = n.store.lock().unwrap();
         let p = profile_of(&st, &k.pubkey);
-        assert_eq!(p.name.chars().count(), 64);
-        assert!(p.about.is_empty() && !p.agent);
+        assert_eq!((p.name.chars().count(), p.about.chars().count()), (64, 2000));
+        assert!(!p.agent);
         drop(st);
+        // a profile is a Profile message; anything else is no profile
         let j = Keys::generate();
-        n.ingest(j.sign(K_PROFILE, vec![], "not json".into()), 1, false).unwrap();
+        n.ingest(j.sign(K_PROFILE, vec![], "just text".into()), 1, false).unwrap();
         assert_eq!(profile_of(&n.store.lock().unwrap(), &j.pubkey), Profile::default());
+        let g = Keys::generate();
+        n.ingest(g.sign_data(K_PROFILE, vec![], vec![0xff, 0xff, 0xff], TYPE_PROFILE, now()), 1, false).unwrap();
+        assert_eq!(profile_of(&n.store.lock().unwrap(), &g.pubkey), Profile::default());
     }
 }

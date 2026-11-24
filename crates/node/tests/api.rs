@@ -101,7 +101,7 @@ async fn posting_threads_and_citations() {
 
     // the stored events have the NIP-22 style tags
     let ev: pb::EventResponse = n.ok("event", &id(&r2.id)).await;
-    let raw: Event = serde_json::from_str(&ev.raw_json).unwrap();
+    let raw = Event::from_pb(pb::decode(&ev.raw).unwrap()).unwrap();
     assert!(raw.validate().is_ok());
     assert_eq!(raw.kind, K_REPLY);
     assert_eq!(raw.root().unwrap().hex(), root.id);
@@ -194,7 +194,7 @@ async fn rating_and_reputation() {
     let alice = Keys::generate();
     let ae = alice.sign(K_POST, tags(&[&["c", "m"], &["title", "Proof"]]), "QED".into());
     n.node.ingest(ae.clone(), 9, false).unwrap();
-    n.node.ingest(alice.sign(K_PROFILE, vec![], r#"{"name":"Alice","agent":true}"#.into()), 9, false).unwrap();
+    n.node.ingest(profile_event(&alice, "Alice", true, ""), 9, false).unwrap();
 
     let rate = |score, event: &str, target: &str, c: &str| pb::RateRequest { score, event: event.into(), target: target.into(), community: c.into(), reason: "why".into(), ..Default::default() };
     let a: pb::Ack = n.ok("rate", &rate(0.6, &ae.id.hex(), "", "")).await;
@@ -254,10 +254,11 @@ async fn profiles() {
     assert!(p.last_seen + 5 >= now());
     let i: pb::InfoResponse = n.ok("info", &E).await;
     assert_eq!(i.name, "Lab bot");
-    // kind 0 content stays NIP-01 JSON for other nostr clients
+    // the profile travels as a protobuf message, typed by its content type
     let ev = n.node.store.lock().unwrap().replaceable(&n.node.keys.pubkey, K_PROFILE, "").unwrap().clone();
-    let v: serde_json::Value = serde_json::from_str(&ev.content).unwrap();
-    assert_eq!(v["name"], "Lab bot");
+    assert_eq!(ev.content_type, TYPE_PROFILE);
+    let stored: pb::Profile = pb::decode(&ev.content).unwrap();
+    assert_eq!((stored.name.as_str(), stored.agent), ("Lab bot", true));
     // updating replaces
     n.ok::<_, pb::Ack>("set_profile", &pb::Profile { name: "Renamed".into(), ..Default::default() }).await;
     let p: pb::ProfileResponse = n.ok("profile", &pb::ProfileRequest::default()).await;
@@ -487,8 +488,8 @@ async fn find_communities_by_topic() {
 async fn humanity_verifies_human_claims_and_agents_name_models() {
     let n = spawn(|_| {}).await;
     let (alice, bot) = (Keys::generate(), Keys::generate());
-    n.node.ingest(alice.sign(K_PROFILE, vec![], r#"{"name":"Alice"}"#.into()), 9, false).unwrap();
-    n.node.ingest(bot.sign(K_PROFILE, vec![], r#"{"name":"Totally human"}"#.into()), 9, false).unwrap();
+    n.node.ingest(profile_event(&alice, "Alice", false, ""), 9, false).unwrap();
+    n.node.ingest(profile_event(&bot, "Totally human", false, ""), 9, false).unwrap();
     let prof = |pk: &Keys| pb::ProfileRequest { pubkey: pk.npub() };
     let p: pb::ProfileResponse = n.ok("profile", &prof(&alice)).await;
     assert_eq!((p.human_status.as_str(), p.humanity, p.humanity_raters), ("unverified", 0.0, 0), "claims are unverified until vouched");
@@ -534,7 +535,7 @@ async fn humanity_verifies_human_claims_and_agents_name_models() {
     let me: pb::ProfileResponse = n.ok("profile", &pb::ProfileRequest::default()).await;
     assert!(me.profile.unwrap().model.is_empty());
     let other_client = Keys::generate();
-    n.node.ingest(other_client.sign(K_PROFILE, vec![], r#"{"name":"relay bot","bot":true}"#.into()), 9, false).unwrap();
+    n.node.ingest(profile_event(&other_client, "relay bot", true, ""), 9, false).unwrap();
     let o: pb::ProfileResponse = n.ok("profile", &prof(&other_client)).await;
     assert_eq!(o.human_status, "agent");
 }
@@ -543,8 +544,8 @@ async fn humanity_verifies_human_claims_and_agents_name_models() {
 async fn chains_of_reasoning_across_humans_and_models() {
     let n = spawn(|_| {}).await;
     let (human, claude, llama) = (Keys::generate(), Keys::generate(), Keys::generate());
-    n.node.ingest(claude.sign(K_PROFILE, vec![], r#"{"name":"Claude agent","agent":true,"model":"claude-opus-5-5"}"#.into()), 9, false).unwrap();
-    n.node.ingest(llama.sign(K_PROFILE, vec![], r#"{"name":"Llama agent","bot":true,"model":"llama-4"}"#.into()), 9, false).unwrap();
+    n.node.ingest(profile_event(&claude, "Claude agent", true, "claude-opus-5-5"), 9, false).unwrap();
+    n.node.ingest(profile_event(&llama, "Llama agent", true, "llama-4"), 9, false).unwrap();
     let at = |k: &Keys, t: u64, tg: Vec<Vec<String>>, c: &str| k.sign_at(if tg.iter().any(|x| x[0] == "e") { K_REPLY } else { K_POST }, tg, c.into(), now() - 1000 + t);
     // human asks; claude answers; llama replies to claude; a separate post by llama cites claude's step;
     // a human post cites that; an unrelated reply in the same thread is not part of the chain
@@ -608,9 +609,9 @@ async fn bodies_declare_formats_and_expose_blocks() {
     assert_eq!(it.accept, ["text/x-lean", "application/json"]);
     let blocks: Vec<(String, String)> = it.blocks.iter().map(|b| (b.kind.clone(), b.lang.clone())).collect();
     assert_eq!(blocks, [("inline-math".into(), "tex".into()), ("code".into(), "lean4".into()), ("math".into(), "tex".into())]);
-    let raw: Event = serde_json::from_str(&e.raw_json).unwrap();
-    assert!(raw.tag("m").is_none());
-    // another format is declared with an `m` tag; its body is not parsed as markdown
+    let raw = Event::from_pb(pb::decode(&e.raw).unwrap()).unwrap();
+    assert_eq!(raw.content_type, "", "markdown is the empty content type");
+    // another format is the event's content type; its body is not parsed as markdown
     let j: pb::Ack = n.ok("post", &pb::PostRequest { format: "application/json".into(), ..reply(&a.id, r#"{"proof":"rfl"}"#) }).await;
     let e: pb::EventResponse = n.ok("event", &id(&j.id)).await;
     let it = e.item.unwrap();
@@ -696,4 +697,10 @@ async fn notifications_cover_citations_and_requests() {
     assert_eq!(r.unread, 2);
     let people: pb::PeopleResponse = n.ok("find_people", &pb::FindPeopleRequest { kind: "agent".into(), ..Default::default() }).await;
     assert!(people.people.is_empty(), "nobody has an agent profile yet");
+}
+
+/// A profile event as any node would publish it: a Profile message.
+fn profile_event(k: &Keys, name: &str, agent: bool, model: &str) -> Event {
+    let p = pb::Profile { name: name.into(), agent, model: model.into(), ..Default::default() };
+    k.sign_data(K_PROFILE, vec![], pb::encode(&p), TYPE_PROFILE, now())
 }

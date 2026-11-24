@@ -4,7 +4,7 @@
 mod common;
 use common::*;
 use futures_util::{SinkExt, StreamExt};
-use sametra_node::event::Keys;
+use sametra_node::event::{Filter, Keys};
 use sametra_node::node::{Config, Node};
 use sametra_node::pb;
 use sametra_node::transport::{Dialer, Message};
@@ -82,17 +82,16 @@ async fn one_port_serves_plain_and_tls() {
     assert!(n.has(&a.id));
     let refused = n.raw_tls(&cert.cert(), &req(&format!("http://localhost:{port}"))).await.unwrap();
     assert_eq!(refused.status, 403, "an http:// page cannot write to the https:// origin");
-    // a nostr client over wss://
+    // a relay client over wss://: binary frames
+    let req = |sid: &str, f: Filter| Message::binary(pb::encode(&pb::Frame { type_pb: pb::F_REQ, sub_id: sid.into(), filters: vec![f.to_pb()], ..Default::default() }));
     let mut ws = Dialer::new(&[cert.cert()]).unwrap().connect(&format!("wss://localhost:{port}")).await.unwrap();
-    ws.send(Message::text(r##"["REQ","s",{"#c":["m"]}]"##)).await.unwrap();
+    ws.send(req("s", Filter { tags: vec![("c".into(), vec!["m".into()])], ..Default::default() })).await.unwrap();
     let mut events = 0;
     loop {
         let m = tokio::time::timeout(T, ws.next()).await.unwrap().unwrap().unwrap();
-        if !m.is_text() {
-            continue; // keepalive pings
-        }
-        let v: serde_json::Value = serde_json::from_str(m.to_text().unwrap()).unwrap();
-        if v[0] == "EOSE" {
+        let Message::Binary(b) = m else { continue }; // keepalive pings
+        let f: pb::Frame = pb::decode(&b).unwrap();
+        if f.type_pb == pb::F_EOSE {
             break;
         }
         events += 1;
@@ -100,14 +99,14 @@ async fn one_port_serves_plain_and_tls() {
     assert_eq!(events, 1);
     // and plain ws:// on the same port
     let mut plain_ws = Dialer::new(&[]).unwrap().connect(&n.ws).await.unwrap();
-    plain_ws.send(Message::text(r#"["REQ","s",{"kinds":[1]}]"#)).await.unwrap();
-    let m = loop {
+    plain_ws.send(req("s", Filter { kinds: Some(vec![1]), ..Default::default() })).await.unwrap();
+    let f = loop {
         let m = tokio::time::timeout(T, plain_ws.next()).await.unwrap().unwrap().unwrap();
-        if m.is_text() {
-            break m;
+        if let Message::Binary(b) = m {
+            break pb::decode::<pb::Frame>(&b).unwrap();
         }
     };
-    assert!(m.to_text().unwrap().starts_with("[\"EOSE\""));
+    assert_eq!(f.type_pb, pb::F_EOSE);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

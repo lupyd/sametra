@@ -4,7 +4,7 @@
 //! Crates: `sametra-proto` (schema, events), `sametra-transport` (ws/wss, TLS,
 //! wire codec), `sametra-mcp` (JSON bridge), and this one.
 
-pub use sametra_proto::{event, pb};
+pub use sametra_proto::{b64, event, pb};
 pub use sametra_transport as transport;
 
 pub mod api;
@@ -16,4 +16,5 @@ pub mod index;
 pub mod ipfs;
 pub mod node;
 pub mod rep;
+pub mod schema;
 pub mod store;

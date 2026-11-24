@@ -108,7 +108,7 @@ mod tests {
     #[test]
     fn delimited_records() {
         let mut buf = vec![];
-        let big = Event { content: "x".repeat(300), ..Default::default() }; // needs a 2-byte varint
+        let big = Event { content: vec![b'x'; 300], ..Default::default() }; // needs a 2-byte varint
         write_delimited(&mut buf, &frame()).unwrap();
         write_delimited(&mut buf, &big).unwrap();
         write_delimited(&mut buf, &Empty {}).unwrap();
@@ -148,6 +148,13 @@ mod tests {
     }
 }
 
+/// Text tag values (tests, literals).
+impl From<&str> for TagValue {
+    fn from(s: &str) -> TagValue {
+        TagValue { text: s.to_string(), ..Default::default() }
+    }
+}
+
 /// Golden encodings shared with web/test/api.test.js: both codecs must agree byte for byte.
 #[cfg(test)]
 mod golden {
@@ -168,7 +175,7 @@ mod golden {
     fn print_and_check_golden_vectors() {
         let want = [
             ("RateRequest", "09333333333333d3bf120261622a02c3a9"),
-            ("FetchRequest", "0a151a030bd70822060a016312016d2880e2cfaa063805"),
+            ("FetchRequest", "0a171a030bd70822080a016312030a016d2880e2cfaa063805"),
             ("Ack", "0801120178180321000000000000f8bf2a016d"),
             ("IdRequest", "0a01691001"),
         ];

@@ -39,14 +39,15 @@ function RequestBox({ c, post, onDone }) {
   const [busy, setBusy] = useState(false);
   return (
     <div class="box">
-      {tool && c.spec.input_schema && <pre class="schema">{c.spec.input_schema}</pre>}
-      <textarea value={input} onInput={(e) => setInput(e.currentTarget.value)} placeholder={tool ? 'JSON input' : 'Describe what you need'} />
+      {tool && c.spec.input_proto && <pre class="schema">{c.spec.input_proto}</pre>}
+      <textarea value={input} onInput={(e) => setInput(e.currentTarget.value)} placeholder={tool ? `${c.spec.input_message || 'input'} as JSON; it is sent as protobuf` : 'Describe what you need'} />
       <div class="row">
         <span class="grow muted small">Requests and results are public. The provider decides whether to help.</span>
         <button disabled={busy} onClick={async () => {
           setBusy(true);
           try {
-            await call('request', { provider: c.provider, capability: c.spec.id, input, post: post || '' });
+            const given = tool ? { input_json: input } : { input_text: input };
+            await call('request', { provider: c.provider, capability: c.spec.id, ...given, post: post || '' });
             onDone(); done('Request sent. Follow it in your inbox.');
           } catch (e) { flash(e.message); } finally { setBusy(false); }
         }}>Send request</button>
@@ -106,12 +107,13 @@ export function CapabilityList({ provider, self }) {
 }
 
 function CapabilityEditor() {
-  const [f, setF] = useState({ id: '', name: '', kind: 'skill', about: '', topics: '', communities: '', input_schema: '' });
+  const blank = { id: '', name: '', kind: 'skill', about: '', topics: '', communities: '', input_proto: '', input_message: '' };
+  const [f, setF] = useState(blank);
   const set = (k) => (e) => setF({ ...f, [k]: e.currentTarget.value });
   return (
     <div class="panel">
       <h3>Offer a capability</h3>
-      <p class="muted small">A <b>skill</b> describes what you can do (equipment, data, expertise). A <b>tool</b> is a strict call others make with JSON input.</p>
+      <p class="muted small">A <b>skill</b> describes what you can do (equipment, data, expertise). A <b>tool</b> is a strict call whose input is a protobuf message you declare.</p>
       <div class="row">
         <input name="cap-id" value={f.id} onInput={set('id')} placeholder="id, e.g. mass-spec" />
         <select value={f.kind} onChange={set('kind')} aria-label="kind"><option value="skill">skill</option><option value="tool">tool</option></select>
@@ -120,11 +122,12 @@ function CapabilityEditor() {
       <textarea value={f.about} onInput={set('about')} placeholder="What it does, limits, turnaround" />
       <input name="cap-topics" value={f.topics} onInput={set('topics')} placeholder="topics, comma separated" />
       <input name="cap-communities" value={f.communities} onInput={set('communities')} placeholder="communities it serves, comma separated slugs" />
-      {f.kind === 'tool' && <textarea class="mono" value={f.input_schema} onInput={set('input_schema')} placeholder='input JSON Schema, e.g. {"type":"object","required":["sample"]}' />}
+      {f.kind === 'tool' && <textarea class="mono" value={f.input_proto} onInput={set('input_proto')} placeholder={'input as .proto, e.g.\nsyntax = "proto3";\npackage lab;\nmessage Sample { string id = 1; double mass_mg = 2; }'} />}
+      {f.kind === 'tool' && <input name="cap-message" value={f.input_message} onInput={set('input_message')} placeholder="input message, e.g. lab.Sample" />}
       <div class="row"><span class="grow" /><button disabled={!f.id || !f.name} onClick={async () => {
         try {
           await call('set_capability', { ...f, topics: csv(f.topics), communities: csv(f.communities) });
-          setF({ id: '', name: '', kind: 'skill', about: '', topics: '', communities: '', input_schema: '' });
+          setF(blank);
           done('Capability published');
         } catch (e) { flash(e.message); }
       }}>Offer capability</button></div>

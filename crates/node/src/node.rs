@@ -9,7 +9,7 @@ use crate::event::*;
 use crate::rep::{self, RepTable};
 use crate::store::{Ev, Insert, Store};
 use futures_util::{SinkExt, StreamExt};
-use sametra_transport::codec::{Msg, Wire, parse_frame, parse_json};
+use sametra_transport::codec::{Msg, Wire, parse_frame};
 use sametra_transport::{Dialer, Message, WebSocketStream};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
@@ -363,7 +363,7 @@ impl Node {
                     && let Some(ipfs) = self.ipfs.get()
                     && let Ok(rt) = tokio::runtime::Handle::try_current()
                 {
-                    for cid in crate::files::linked_cids(&e.content) {
+                    for cid in crate::files::linked_cids(e.text()) {
                         let ipfs = ipfs.clone();
                         rt.spawn(async move { ipfs.cache(cid).await });
                     }
@@ -376,18 +376,24 @@ impl Node {
         }
     }
 
+    /// Sign and publish a text event (markdown).
     pub fn publish(&self, kind: u32, tags: Vec<Vec<String>>, content: String) -> Result<Ev, String> {
+        self.publish_data(kind, tags, content.into_bytes(), "")
+    }
+
+    /// Sign and publish an event with content of any media type.
+    pub fn publish_data(&self, kind: u32, tags: Vec<Vec<String>>, content: Vec<u8>, content_type: &str) -> Result<Ev, String> {
         let mut t = now();
-        // A replacement must be strictly newer than what it replaces: NIP-01 breaks
-        // same-second ties by lowest id, which would drop quick edits at random.
-        let probe = Event { id: H32([0; 32]), pubkey: self.keys.pubkey, created_at: t, kind, tags, content, sig: H64([0; 64]) };
+        // A replacement must be strictly newer than what it replaces: same-second
+        // ties are broken by lowest id, which would drop quick edits at random.
+        let probe = Event { id: H32([0; 32]), pubkey: self.keys.pubkey, created_at: t, kind, tags, content, content_type: content_type.to_string(), sig: H64([0; 64]) };
         if probe.is_replaceable() || probe.is_param_replaceable() {
             let d = if probe.is_replaceable() { "" } else { probe.d_tag() };
             if let Some(old) = self.store.lock().unwrap().replaceable(&self.keys.pubkey, kind, d) {
                 t = t.max(old.created_at + 1);
             }
         }
-        let e = self.keys.sign_at(kind, probe.tags, probe.content, t);
+        let e = self.keys.sign_data(kind, probe.tags, probe.content, content_type, t);
         self.ingest(e, ORIGIN_LOCAL, true).map(|(e, _)| e)
     }
 
@@ -583,19 +589,18 @@ where
     let (mut sink, mut stream) = ws.split();
     let (tx, mut rx) = mpsc::channel::<Out>(256);
     let own_tx = tx.clone();
-    let sametra = Arc::new(AtomicBool::new(outbound));
+    // every link speaks the binary protocol; there are no other kinds of client
+    let sametra = Arc::new(AtomicBool::new(true));
     node.peers.lock().unwrap().insert(id, PeerHandle { tx, outbound, sametra: sametra.clone(), addr: addr.clone(), since: now() });
     let mut brx = node.tx.subscribe();
     let mut subs: HashMap<String, Vec<Filter>> = HashMap::new();
     let mut ping = tokio::time::interval(Duration::from_secs(30));
     let mut budget = (now(), 0u32); // crude per-second rate limit for published EVENTs
-    // We only dial sametra nodes, so outbound links are binary from the start; inbound
-    // links follow whatever the remote sends first.
-    let mut wire = Wire { binary: outbound };
+    let wire = Wire;
 
     if outbound {
         let since = node.store.lock().unwrap().iter().next().map(|e| e.created_at.saturating_sub(3600)).unwrap_or(0);
-        let _ = sink.send(wire.req("sync", &node.sync_filters(since), 0).unwrap()).await;
+        let _ = sink.send(wire.req("sync", &node.sync_filters(since), 0)).await;
         node.heartbeat();
     }
 
@@ -603,11 +608,12 @@ where
         tokio::select! {
             m = stream.next() => {
                 let msg = match m {
-                    Some(Ok(Message::Text(t))) => parse_json(&t),
-                    Some(Ok(Message::Binary(b))) => {
-                        if !wire.binary { wire.binary = true; sametra.store(true, Ordering::Relaxed); }
-                        parse_frame(&b)
+                    // text is not part of the protocol
+                    Some(Ok(Message::Text(_))) => {
+                        let _ = sink.send(wire.notice("error: this relay speaks binary protobuf frames only")).await;
+                        break;
                     }
+                    Some(Ok(Message::Binary(b))) => parse_frame(&b),
                     Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
                     _ => continue,
                 };
@@ -633,7 +639,8 @@ where
                             }
                         };
                         // peers flooding to us don't need acks; nostr clients do
-                        if !wire.binary || !ok { let _ = sink.send(wire.ok(&eid, ok, &m)).await; }
+                        // peers flooding to us need no acks, refusals do
+                        if !ok { let _ = sink.send(wire.ok(&eid, ok, &m)).await; }
                     }
                     Msg::SubEvent(sid, e) => {
                         let pend = node.pending.lock().unwrap().get(&sid).cloned();
@@ -710,8 +717,8 @@ where
             }
             Some(cmd) = rx.recv() => {
                 let m = match cmd {
-                    Out::Req(sid, fs, hops) => wire.req(&sid, &fs, hops),
-                    Out::Close(sid) => wire.close(&sid),
+                    Out::Req(sid, fs, hops) => Some(wire.req(&sid, &fs, hops)),
+                    Out::Close(sid) => Some(wire.close(&sid)),
                     Out::Events(sid, evs) => {
                         let mut failed = false;
                         for e in &evs {
@@ -892,7 +899,7 @@ mod tests {
         assert!(rx.try_recv().is_err(), "duplicates are not re-broadcast");
 
         let mut forged = k.sign(K_POST, c("m"), "y".into());
-        forged.content = "z".into();
+        forged.content = b"z".to_vec();
         assert!(n.ingest(forged, 1, false).unwrap_err().starts_with("invalid"));
         let mut future = k.sign(K_POST, c("m"), "f".into());
         future.created_at = now() + 3600;
@@ -956,13 +963,13 @@ mod tests {
     fn quick_edits_of_replaceable_events_always_win() {
         let n = node_with("edits", |_| {});
         for i in 0..5 {
-            n.publish(K_PROFILE, vec![], format!(r#"{{"name":"v{i}"}}"#)).unwrap();
+            n.publish(K_PROFILE, vec![], format!("v{i}")).unwrap();
             let d = vec![vec!["d".into(), "x".into()], vec!["c".into(), "m".into()]];
             n.publish(K_RATING, d, format!("r{i}")).unwrap();
         }
         let st = n.store.lock().unwrap();
-        assert!(st.replaceable(&n.keys.pubkey, K_PROFILE, "").unwrap().content.contains("v4"));
-        assert_eq!(st.replaceable(&n.keys.pubkey, K_RATING, "x").unwrap().content, "r4");
+        assert_eq!(st.replaceable(&n.keys.pubkey, K_PROFILE, "").unwrap().text(), "v4");
+        assert_eq!(st.replaceable(&n.keys.pubkey, K_RATING, "x").unwrap().text(), "r4");
         assert_eq!(st.len(), 2);
     }
 

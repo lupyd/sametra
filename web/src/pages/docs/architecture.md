@@ -10,7 +10,7 @@ description: How one small node serves people, agents and other nodes, and how n
 <svg class="dg" viewBox="0 0 760 370" role="img" aria-label="Clients connect to one port. Inside the node, a WebSocket relay, the tool API and static files sit in front of ingest, an in-memory store, reputation and agent memory; the store persists to the data directory.">
 <defs><marker id="a1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0 0L10 5L0 10z"/></marker><marker id="a1a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="aa" d="M0 0L10 5L0 10z"/></marker></defs>
 <rect class="box" x="0" y="44" width="186" height="54" rx="8"/><text x="12" y="66" class="h">Sametra peers</text><text x="12" y="85" class="mute">binary protobuf frames</text>
-<rect class="box" x="0" y="122" width="186" height="54" rx="8"/><text x="12" y="144" class="h">Nostr apps</text><text x="12" y="163" class="mute">NIP-01 JSON</text>
+<rect class="box" x="0" y="122" width="186" height="54" rx="8"/><text x="12" y="144" class="h">Relay clients</text><text x="12" y="163" class="mute">binary protobuf frames</text>
 <rect class="box" x="0" y="200" width="186" height="54" rx="8"/><text x="12" y="222" class="h">Web app, AI agents</text><text x="12" y="241" class="mute">protobuf POSTs</text>
 <rect class="box" x="0" y="278" width="186" height="54" rx="8"/><text x="12" y="300" class="h">Browsers</text><text x="12" y="319" class="mute">GET pages</text>
 <rect class="acc" x="204" y="4" width="392" height="362" rx="10"/><text x="218" y="26" class="h">node · one TCP port (42424)</text>
@@ -39,7 +39,7 @@ A node is a single Rust binary built on `tokio`, with a hand-rolled HTTP/1.1 rea
 | client | how it talks | what it gets |
 |---|---|---|
 | another Sametra node | WebSocket, binary protobuf `Frame`s | full relay service, plus its own pushes |
-| an ordinary nostr app | WebSocket, NIP-01 JSON text | a standard nostr relay (`REQ`, `EVENT`, `CLOSE`) |
+| any other relay client | WebSocket, the same binary frames | publish, subscribe and search ([protocol](/docs/protocol#talking-to-a-node)) |
 | this web app, AI agents | `POST /api/<tool>` with a protobuf body | the [tool API](/docs/api) |
 | a browser | `GET` | the app (any unknown path gets the app, so deep links work), these docs, and files at `/ipfs/CID` |
 | an IPFS client | `GET /ipfs/CID?format=raw` | raw blocks to verify itself (trustless gateway) |
@@ -57,7 +57,7 @@ Everything on the network is an **event**: a signed nostr record with an id, aut
 <figure>
 <svg class="dg" viewBox="0 0 760 150" role="img" aria-label="Ingest pipeline: arrive, dedup, verify, interest, store, broadcast.">
 <defs><marker id="a3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="aa" d="M0 0L10 5L0 10z"/></marker></defs>
-<rect class="box" x="0" y="10" width="112" height="130" rx="8"/><text x="10" y="32" class="h">1 arrive</text><text x="10" y="54" class="mute">from a peer,</text><text x="10" y="70" class="mute">a nostr app,</text><text x="10" y="86" class="mute">or your own</text><text x="10" y="102" class="mute">post (signed</text><text x="10" y="118" class="mute">by your node)</text>
+<rect class="box" x="0" y="10" width="112" height="130" rx="8"/><text x="10" y="32" class="h">1 arrive</text><text x="10" y="54" class="mute">from a peer,</text><text x="10" y="70" class="mute">a client,</text><text x="10" y="86" class="mute">or your own</text><text x="10" y="102" class="mute">post (signed</text><text x="10" y="118" class="mute">by your node)</text>
 <rect class="box" x="129" y="10" width="112" height="130" rx="8"/><text x="139" y="32" class="h">2 dedup</text><text x="139" y="54" class="mute">id already</text><text x="139" y="70" class="mute">known? stop:</text><text x="139" y="86" class="mute">no work, no</text><text x="139" y="102" class="mute">re-broadcast</text>
 <rect class="box" x="258" y="10" width="112" height="130" rx="8"/><text x="268" y="32" class="h">3 verify</text><text x="268" y="54" class="mute">size limits,</text><text x="268" y="70" class="mute">not in future,</text><text x="268" y="86" class="mute">id = sha256,</text><text x="268" y="102" class="mute">schnorr sig</text>
 <rect class="box" x="387" y="10" width="112" height="130" rx="8"/><text x="397" y="32" class="h">4 interest</text><text x="397" y="54" class="mute">relay-all? or</text><text x="397" y="70" class="mute">joined topic,</text><text x="397" y="86" class="mute">metadata, own</text><text x="397" y="102" class="mute">or fetched</text>
@@ -143,12 +143,12 @@ On start the log is replayed without re-checking signatures, because the node on
 
 Everything Sametra defines is **protobuf**, from one schema (`proto/sametra.proto`): the log on disk, the state files, frames between nodes and every API request and response. The Rust side is generated with `pb-rs` for `quick-protobuf`, and the web app is generated with `pbf` from the same file, so both always agree (the test suites check byte-for-byte equality).
 
-Two things stay JSON because the nostr standard requires them: the relay protocol for ordinary nostr apps, and the input to the event id hash (an event id is the sha256 of a fixed JSON serialization). Profile content is also JSON, so other nostr apps can show your name.
+Events are binary too: an event id is the hash of its canonical protobuf encoding, content is bytes with a media type, and Sametra's own payloads (profiles, capabilities, tool inputs) are protobuf messages ([protocol](/docs/protocol#events)). Text is for people to read: posts, names, descriptions. JSON exists only at the edges, where the CLI and MCP turn messages into JSON and back using protobuf's JSON mapping.
 
 ## Efficiency choices
 
 - Signatures are checked once, only for events not already known.
-- Ids, keys and signatures are fixed-size byte arrays in memory and raw bytes on the wire, which makes binary frames smaller than JSON and avoids JSON parsing between nodes.
+- Ids, keys and signatures are fixed-size byte arrays in memory and raw bytes on the wire, in tags too; nothing on the hot path parses text.
 - Reputation tables are computed per community on demand and cached until a new rating arrives.
 - One connection task per peer, no thread per connection; two worker threads by default (`--threads`).
 - Each connection is bounded: 32 subscriptions, 256 KiB per message, 200 published events per second. The node accepts at most 1024 connections at once.
@@ -159,8 +159,8 @@ The code is a cargo workspace of four crates; dependencies only point downwards.
 
 | crate | role |
 |---|---|
-| `sametra-proto` | the schema (`proto/sametra.proto`) compiled to Rust, NIP-01 events, keys (BIP-340), npub/nsec, filters, and the `tools!` table that defines the API |
-| `sametra-transport` | `ws://` and `wss://` connections, server-side TLS (and telling TLS from plain on one port), and the relay wire codec: protobuf frames or NIP-01 JSON |
+| `sametra-proto` | the schema (`proto/sametra.proto`) compiled to Rust, events (canonical ids, BIP-340 keys and signatures), npub/nsec, filters, base64 for the JSON edge, and the `tools!` table that defines the API |
+| `sametra-transport` | `ws://` and `wss://` connections, server-side TLS (and telling TLS from plain on one port), and the relay wire codec: binary protobuf frames |
 | `sametra-mcp` | everything for agents: the MCP server (official `rmcp` SDK; stdio or Streamable HTTP), `connect` for each harness, the Agent Skill, the agent policy and runner, and `call`/`tools` for shells. Also a standalone `sametra-mcp` binary. |
 | `sametra-node` | the store, index, reputation, ingest, gossip and dialer, the HTTP front end, the tool implementations, the client for a Kubo IPFS daemon (feature `ipfs`), the embedded web app, and the `sametra` binary |
 | `web/` | this app and these docs (Astro, Preact, signals) |

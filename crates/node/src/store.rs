@@ -482,15 +482,15 @@ mod tests {
         assert!(matches!(s.insert(reply.clone()), Insert::Stored(_)));
         assert!(matches!(s.insert(reply.clone()), Insert::Duplicate(_)));
         assert_eq!(s.children(&root.id).len(), 1);
-        assert_eq!(s.query(&Filter::from_value(&serde_json::json!({"#c":["math"]})), 100).len(), 2);
+        assert_eq!(q(&s, serde_json::json!({"#c":["math"]})).len(), 2);
 
         // profile replaced by newer
-        let p1 = other.sign(K_PROFILE, vec![], r#"{"name":"a"}"#.into());
+        let p1 = other.sign(K_PROFILE, vec![], "a".into());
         s.insert(p1);
-        let mut p2 = other.sign(K_PROFILE, vec![], r#"{"name":"b"}"#.into());
+        let mut p2 = other.sign(K_PROFILE, vec![], "b".into());
         p2.created_at += 1; // signature not rechecked by store
         s.insert(p2);
-        assert!(s.replaceable(&other.pubkey, K_PROFILE, "").unwrap().content.contains("\"b\""));
+        assert_eq!(s.replaceable(&other.pubkey, K_PROFILE, "").unwrap().text(), "b");
 
         // an author going silent changes nothing: nodes forget by their own rules
         s.last_seen.insert(other.pubkey, 1);
@@ -509,7 +509,7 @@ mod tests {
         drop(s);
         let s2 = Store::open(dir.clone(), HashSet::from([reply.id])).unwrap();
         assert!(s2.contains(&root.id) && s2.contains(&reply.id) && s2.pinned.contains(&reply.id));
-        assert!(s2.replaceable(&other.pubkey, K_PROFILE, "").unwrap().content.contains("\"b\""));
+        assert_eq!(s2.replaceable(&other.pubkey, K_PROFILE, "").unwrap().text(), "b");
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -520,7 +520,7 @@ mod tests {
     fn at(k: &Keys, kind: u32, tags: Vec<Vec<String>>, content: &str, t: u64) -> Event {
         let mut e = k.sign(kind, tags, content.into());
         e.created_at = t;
-        e.id = Event::compute_id(&e.pubkey, t, kind, &e.tags, &e.content);
+        e.id = Event::compute_id(&e.pubkey, t, kind, &e.tags, &e.content, &e.content_type);
         e
     }
     fn reply_to(k: &Keys, root: &Event, parent: &Event, t: u64) -> Event {
@@ -533,8 +533,27 @@ mod tests {
     fn stored(i: Insert) -> bool {
         matches!(i, Insert::Stored(_))
     }
+    /// Filters written as JSON literals, for readable tests (never on the wire).
+    fn filter(v: serde_json::Value) -> Filter {
+        let strs = |x: &serde_json::Value| x.as_array().map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect::<Vec<_>>());
+        let mut f = Filter::default();
+        for (k, x) in v.as_object().unwrap() {
+            match k.as_str() {
+                "ids" => f.ids = strs(x),
+                "authors" => f.authors = strs(x),
+                "kinds" => f.kinds = x.as_array().map(|a| a.iter().filter_map(|n| n.as_u64().map(|n| n as u32)).collect()),
+                "since" => f.since = x.as_u64(),
+                "until" => f.until = x.as_u64(),
+                "limit" => f.limit = x.as_u64().map(|n| n as usize),
+                "search" => f.search = x.as_str().map(String::from),
+                t if t.starts_with('#') => f.tags.push((t[1..].to_string(), strs(x).unwrap_or_default())),
+                _ => {}
+            }
+        }
+        f
+    }
     fn q(s: &Store, v: serde_json::Value) -> Vec<Ev> {
-        s.query(&Filter::from_value(&v), 1000)
+        s.query(&filter(v), 1000)
     }
 
     #[test]
@@ -603,8 +622,8 @@ mod tests {
         // ids: exact, newest first, limited
         let got = q(&s, serde_json::json!({"ids": [root.id.hex(), replies[4].id.hex()], "limit": 1}));
         assert_eq!(got.iter().map(|e| e.id).collect::<Vec<_>>(), [replies[4].id]);
-        // ids by prefix fall back to a scan but still match
-        assert_eq!(q(&s, serde_json::json!({"ids": [&root.id.hex()[..12]]}))[0].id, root.id);
+        // ids match exactly: a prefix finds nothing
+        assert!(q(&s, serde_json::json!({"ids": [&root.id.hex()[..12]]})).is_empty());
         // #e: referencing events (replies and quotes), no duplicates although replies tag root twice
         let refs = q(&s, serde_json::json!({"#e": [root.id.hex()]}));
         assert_eq!(refs.len(), 5);
@@ -706,7 +725,7 @@ mod tests {
         let mut c: Vec<(String, usize)> = s.communities().map(|(k, n)| (k.clone(), n)).collect();
         c.sort();
         assert_eq!(c, [("bio".to_string(), 1), ("m".to_string(), 2)]);
-        let bio = s.query(&Filter::from_value(&serde_json::json!({"#c": ["bio"]})), 10)[0].id;
+        let bio = s.query(&filter(serde_json::json!({"#c": ["bio"]})), 10)[0].id;
         s.remove(&bio);
         assert_eq!(s.communities().count(), 1, "empty community index is dropped");
         let _ = fs::remove_dir_all(dir);

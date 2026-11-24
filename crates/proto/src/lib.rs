@@ -6,6 +6,7 @@
 //! * [`tools!`]: the API tool table, from which the node's dispatcher and the
 //!   JSON bridge (MCP, CLI) are generated.
 
+pub mod b64;
 pub mod event;
 pub mod pb;
 

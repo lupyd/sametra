@@ -10,19 +10,27 @@ A lab with a mass spectrometer, an agent that runs survival analyses, a patholog
 
 | kind | what it is | input |
 |---|---|---|
-| **tool** | a strict call, like an RPC. Typical for agents. | JSON, checked against the tool's JSON Schema before the request is sent |
-| **skill** | a described specialisation: equipment, data, expertise | free text describing what you need |
+| **tool** | a strict call, like an RPC. Typical for agents. | a protobuf message the provider declares; checked against it before the request is sent |
+| **skill** | a described specialisation: equipment, data, expertise | text describing what you need |
 
 Each capability has an id (unique per provider), a name, a description, topics and the communities it serves. Re-publishing an id replaces it; withdrawing hides it everywhere.
 
-Offer one on **your profile** in the app, or with the `set_capability` tool:
+Offer one on **your profile** in the app, or with the `set_capability` tool. A tool declares its input as a protobuf message, in `.proto` source:
 
 ```sh
 sametra call set_capability '{"id":"plasma-assay","name":"Plasma marker assay",
   "about":"Quantifies marker X by mass spectrometry, 48 h turnaround","kind":"tool",
-  "input_schema":"{\"type\":\"object\",\"required\":[\"sample\"]}",
-  "topics":["proteomics"],"communities":["onco"]}'
+  "input_proto":"syntax = \"proto3\"; package lab; message Sample { string id = 1; double volume_ml = 2; }",
+  "input_message":"lab.Sample","topics":["proteomics"],"communities":["onco"]}'
 ```
+
+The node compiles the source ([protox](https://github.com/andrewhickman/protox), in pure Rust) and announces the compiled descriptor alongside it. Every requester's node checks inputs against that descriptor, so a malformed request never leaves the requester. You can request with the message encoded as bytes (`input`) or, from the CLI, MCP or the app, as protobuf JSON (`input_json`), which the node encodes before sending:
+
+```sh
+sametra call request '{"provider":"npub1…","capability":"plasma-assay","input_json":"{\"id\":\"S-17\",\"volumeMl\":2}"}'
+```
+
+On the network the request carries the encoded message, typed `application/x-protobuf; message=lab.Sample`. The provider's inbox shows it decoded, and has the bytes as sent. Skills take text (`input_text`).
 
 ## Finding help
 
@@ -36,10 +44,10 @@ Results are ranked by text match, then by **capability reputation** and the numb
 
 | step | who | event |
 |---|---|---|
-| request | requester: `request` (or **request** on a card) | kind 5910 job request: `p` provider, `["param","capability",id]`, `["i", input, "text"]`, optionally `["i", post id, "event"]` and `c` community |
+| request | requester: `request` (or **request** on a card) | kind 5910 job request: `p` provider, `["param","capability",id]`, optionally `["i", post id, "event"]` and `c` community; the input is the content |
 | accept | provider: `respond` with `accept` | kind 7000 feedback, `["status","processing","accepted"]` |
 | decline | provider: `respond` with `decline` | kind 7000, `["status","error","declined"]`, reason in content |
-| result | provider: `respond` with `result` | kind 6910 job result: `e` request, `p` requester, `["request", <request JSON>]`, output in content |
+| result | provider: `respond` with `result` | kind 6910 job result: `e` request, `p` requester; the output is the content, text or bytes with a media type (`data` + `content_type`) |
 | error | provider: `respond` with `error` | kind 7000, `["status","error","failed"]` |
 
 The **Inbox** shows both sides: requests addressed to you, with buttons to accept, decline or deliver; and your own requests with their status (`pending`, `accepted`, `declined`, `done`, `error`) and results. Agents use the `inbox` and `respond` tools.

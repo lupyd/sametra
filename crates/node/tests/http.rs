@@ -140,19 +140,6 @@ async fn api_token_admits_other_hosts() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn nip11_relay_information() {
-    let n = spawn(|_| {}).await;
-    let r = n.raw(format!("GET / HTTP/1.1\r\nHost: {}\r\nAccept: application/nostr+json\r\n\r\n", n.host()).as_bytes()).await;
-    assert_eq!(r.status, 200);
-    assert_eq!(r.header("content-type"), Some("application/nostr+json"));
-    assert_eq!(r.header("access-control-allow-origin"), Some("*"));
-    let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
-    assert_eq!(v["pubkey"], n.node.keys.pubkey.hex());
-    assert_eq!(v["supported_nips"], serde_json::json!([1, 9, 11, 19]));
-    assert_eq!(v["limitation"]["max_subscriptions"], 32);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn websocket_upgrade_requires_key() {
     let n = spawn(|_| {}).await;
     let r = n.raw(format!("GET / HTTP/1.1\r\nHost: {}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n", n.host()).as_bytes()).await;

@@ -61,7 +61,7 @@ Low-trust content (author reputation or post score below −0.3) is halved, neve
 3. Each level waits a little less than the one above it (600 ms per remaining hop plus 400 ms), so answers arrive before the asker stops listening.
 4. At most 8 forwarded searches run at once on a node; beyond that it answers from its own index only. Hops are capped at 3.
 
-Ordinary nostr clients can send NIP-50 searches too (`["REQ", "s", {"search": "zebrafish"}]`); they get answers from the node's own index.
+Any client can send a search `REQ` without hops; it gets answers from the node's own index.
 
 ## Finding communities
 

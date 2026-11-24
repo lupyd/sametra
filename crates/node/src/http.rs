@@ -1,11 +1,11 @@
-//! One port, three faces: nostr relay (WebSocket), protobuf API, and the web UI (SPA + static docs).
+//! One port, three faces: the relay (binary WebSocket frames), the protobuf API, and the
+//! web UI (SPA + static docs), plus files at /ipfs/.
 //! A tiny hand-rolled HTTP/1.1 reader keeps the binary small (no hyper/axum).
 //! With a certificate configured the same port also speaks TLS: connections that
 //! open with a TLS ClientHello get HTTPS/WSS, the rest plain HTTP/WS.
 
 use crate::{api, pb};
 use crate::node::{self, Node};
-use serde_json::json;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -94,7 +94,7 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin + Send>(node: Arc<Node>, mut s
         headers: lines.filter_map(|l| l.split_once(':')).map(|(k, v)| (k.trim().to_string(), v.trim().to_string())).collect(),
     };
 
-    // --- nostr relay over WebSocket
+    // --- the relay: binary protobuf frames over WebSocket
     if r.header("upgrade").is_some_and(|u| u.eq_ignore_ascii_case("websocket")) {
         let Some(key) = r.header("sec-websocket-key") else { return respond(&mut sock, 400, "text/plain", b"missing key").await };
         let accept = tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes());
@@ -104,18 +104,7 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin + Send>(node: Arc<Node>, mut s
         return Ok(());
     }
 
-    // --- NIP-11 relay information
-    if r.path == "/" && r.header("accept").is_some_and(|a| a.contains("application/nostr+json")) {
-        let info = json!({
-            "name": "sametra", "description": "Sametra P2P collective knowledge node",
-            "pubkey": node.keys.pubkey, "software": "sametra", "version": env!("CARGO_PKG_VERSION"),
-            "supported_nips": [1, 9, 11, 19],
-            "limitation": {"max_message_length": 262144, "max_subscriptions": 32, "max_content_length": 65536},
-        });
-        return respond_cors(&mut sock, 200, "application/nostr+json", info.to_string().as_bytes()).await;
-    }
-
-    // --- files on the built-in IPFS node (a gateway, trustless with ?format=raw)
+    // --- files, through the IPFS daemon (a gateway, trustless with ?format=raw)
     #[cfg(feature = "ipfs")]
     if r.path.starts_with("/ipfs/") {
         let operator = authorize(&node, &r, &peer, secure).is_ok();
@@ -297,10 +286,6 @@ fn authorize(node: &Node, r: &Req, peer: &SocketAddr, secure: bool) -> Result<()
 
 async fn pb_resp<S: AsyncWrite + Unpin, M: sametra_proto::quick_protobuf::MessageWrite>(sock: &mut S, code: u16, m: &M) -> std::io::Result<()> {
     respond(sock, code, PROTO, &pb::encode(m)).await
-}
-
-async fn respond_cors<S: AsyncWrite + Unpin>(sock: &mut S, code: u16, ct: &str, body: &[u8]) -> std::io::Result<()> {
-    write_resp(sock, code, ct, body, "Access-Control-Allow-Origin: *\r\n").await
 }
 
 async fn respond<S: AsyncWrite + Unpin>(sock: &mut S, code: u16, ct: &str, body: &[u8]) -> std::io::Result<()> {
