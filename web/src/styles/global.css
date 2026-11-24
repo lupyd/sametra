@@ -210,3 +210,11 @@ ol.chain .joins a { color: var(--acc); }
 .body.md hr { border: 0; border-top: 1px solid var(--line); }
 .math { font-family: var(--mono); font-size: .9em; color: var(--acc); }
 div.math { padding: 6px 0; overflow-x: auto; white-space: pre; }
+
+/* files on IPFS */
+.attach { position: relative; display: inline-flex; align-items: center; padding: 6px 10px; border: 1px dashed var(--line); border-radius: var(--r); font-size: 13px; color: var(--mute); cursor: pointer; }
+.attach:hover { color: var(--ink); border-color: var(--ink); }
+.attach.busy { opacity: .6; cursor: progress; }
+.attach input { position: absolute; inset: 0; opacity: 0; cursor: inherit; width: 100%; }
+.body.md img { display: block; max-width: 100%; max-height: 480px; margin: 8px 0; border: 1px solid var(--line); border-radius: var(--r); background: var(--panel); }
+.body.md a.file::before { content: "⎘ "; color: var(--mute); }

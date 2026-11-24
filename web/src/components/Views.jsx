@@ -7,6 +7,7 @@ import { Actions, Card, CiteList, Meta, Meter, Needs, Refs } from './Item.jsx';
 import { CapabilityList, WhoCanHelp } from './Capabilities.jsx';
 import { Accepts, Body } from './Body.jsx';
 import { MentionHints } from './Mentions.jsx';
+import { Attach } from './Attach.jsx';
 import { useLoad } from './hooks.js';
 
 const Err = ({ error }) => error && <p class="err">{error.message}</p>;
@@ -88,7 +89,7 @@ function Composer({ slug }) {
       {open && <input name="needs" value={needs} onInput={(e) => setNeeds(e.currentTarget.value)} placeholder="Needs, if any, comma separated: mass spectrometry, a statistician" />}
       {open && <input name="accept" value={accept} onInput={(e) => setAccept(e.currentTarget.value)} placeholder="Ask replies to use a format, if any: text/x-lean, application/json" />}
       {open && (
-        <div class="row"><CiteList /><button disabled={busy || !body.trim()} onClick={submit}>Post</button></div>
+        <div class="row"><CiteList /><Attach text={body} setText={setBody} /><button disabled={busy || !body.trim()} onClick={submit}>Post</button></div>
       )}
     </div>
   );

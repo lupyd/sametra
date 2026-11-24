@@ -120,6 +120,11 @@ pub struct Node {
     /// Present when the node serves TLS (`tls_cert` + `tls_key`).
     #[cfg(feature = "tls")]
     pub tls: Option<sametra_transport::tls::TlsAcceptor>,
+    /// The built-in IPFS node, once started.
+    #[cfg(feature = "ipfs")]
+    pub ipfs: std::sync::OnceLock<Arc<crate::ipfs::Ipfs>>,
+    /// Our IPFS heartbeat tag (peer id and addresses), once known.
+    pub ipfs_tag: Mutex<Option<Vec<String>>>,
 }
 
 /// (provider, capability id) -> (reputation, raters)
@@ -182,6 +187,9 @@ impl Node {
             dialer,
             #[cfg(feature = "tls")]
             tls,
+            #[cfg(feature = "ipfs")]
+            ipfs: std::sync::OnceLock::new(),
+            ipfs_tag: Mutex::new(None),
         });
         node.save_state();
         Ok(node)
@@ -251,6 +259,15 @@ impl Node {
                         }
                     }
                 }
+                #[cfg(feature = "ipfs")]
+                if e.pubkey != self.keys.pubkey
+                    && let Some(ipfs) = self.ipfs.get()
+                    && let Some(tag) = e.tags.iter().find(|t| t.first().is_some_and(|n| n == "ipfs"))
+                    && let Ok(rt) = tokio::runtime::Handle::try_current()
+                {
+                    let (ipfs, tag) = (ipfs.clone(), tag.clone());
+                    rt.spawn(async move { ipfs.learn(&tag).await });
+                }
                 if e.pubkey != self.keys.pubkey
                     && let Some(addr) = e.tag("r").filter(|a| a.starts_with("ws://") || a.starts_with("wss://")) {
                         let mut book = self.book.lock().unwrap();
@@ -282,6 +299,17 @@ impl Node {
             Insert::Stored(e) => {
                 if let Some(c) = comm {
                     self.rep_cache.lock().unwrap().remove(&c);
+                }
+                // keep the files posts link to, and help serve them
+                #[cfg(feature = "ipfs")]
+                if matches!(e.kind, K_POST | K_REPLY)
+                    && let Some(ipfs) = self.ipfs.get()
+                    && let Ok(rt) = tokio::runtime::Handle::try_current()
+                {
+                    for cid in crate::ipfs::linked_cids(&e.content) {
+                        let ipfs = ipfs.clone();
+                        rt.spawn(async move { ipfs.cache(cid).await });
+                    }
                 }
                 let _ = self.tx.send((e.clone(), origin));
                 Ok((e, true))
@@ -343,6 +371,8 @@ impl Node {
         for c in self.joined.lock().unwrap().iter().take(50) {
             tags.push(vec!["c".to_string(), c.clone()]);
         }
+        // our IPFS side, so Sametra nodes swap files directly
+        tags.extend(self.ipfs_tag.lock().unwrap().clone());
         self.keys.sign(K_HEARTBEAT, tags, String::new())
     }
     fn heartbeat(&self) {

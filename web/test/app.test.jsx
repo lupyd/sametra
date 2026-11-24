@@ -165,6 +165,22 @@ describe('feed', () => {
     expect(cites.value).toEqual([]);
   });
 
+  it('attaching a file stores it on IPFS and links it in the post', async () => {
+    const CID = 'bafkreia3fjxcmwxpk6mpgisbsdfzsxiynumsnxtzd33jq5f6mxxrqudupe';
+    await mount('/c/math', { ipfs_add: (r) => ({ cid: CID, url: 'ipfs://' + CID, link: `![${r.name}](ipfs://${CID})`, size: r.data.length }) });
+    await type(byPlaceholder('Title'), 'Figure');
+    await type(byPlaceholder('Details'), 'Here it is');
+    const input = $('label.attach input[type=file]');
+    const file = new File([new Uint8Array([137, 80, 78, 71])], 'fig.png', { type: 'image/png' });
+    Object.defineProperty(input, 'files', { value: [file] });
+    await act(() => input.dispatchEvent(new Event('change', { bubbles: true })));
+    await settle();
+    const [req] = sent('ipfs_add');
+    expect(req.name).toBe('fig.png');
+    expect([...req.data]).toEqual([137, 80, 78, 71]);
+    expect(byPlaceholder('Details').value).toBe(`Here it is\n![fig.png](ipfs://${CID})\n`);
+  });
+
   it('composer surfaces node errors', async () => {
     await mount('/c/math', { post: () => new Error('community slug must be…') });
     await type(byPlaceholder('Title'), 't');

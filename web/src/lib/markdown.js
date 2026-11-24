@@ -1,12 +1,18 @@
 // Message bodies: markdown by default (CommonMark + GFM + $math$), rendered with
 // marked. Safety: raw HTML is shown as text, links are limited to safe schemes,
-// images become links (the CSP blocks remote images anyway), and nostr:npub
+// images become links unless they are on IPFS (served by this node), nostr:npub
 // mentions become @name links. Math is kept as marked-up TeX source for now; a
 // typesetter can be added later without changing stored posts.
 import { Marked } from 'marked';
 
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 const SAFE = /^(https?:|mailto:|nostr:|ipfs:|\/|#)/i;
+
+/** ipfs://CID/path (or /ipfs/CID/path) -> this node's gateway path; else null. */
+export function gateway(href) {
+  const m = /^(?:ipfs:\/\/|\/ipfs\/)([a-z0-9]+)((?:\/[^?#]*)?)$/i.exec(href || '');
+  return m ? `/ipfs/${m[1]}${m[2]}` : null;
+}
 
 const math = {
   extensions: [
@@ -43,9 +49,16 @@ export function makeMarkdown(names = () => null) {
         const m = /^nostr:(npub1[02-9ac-hj-np-z]+)$/.exec(href);
         if (m) return `<a class="mention" href="/u/${m[1]}">${inner}</a>`;
         const ext = /^https?:/i.test(href);
+        const ipfs = gateway(href);
+        if (ipfs) return `<a class="file" href="${esc(ipfs)}" data-ipfs="${esc(href)}" target="_blank" rel="noopener">${inner}</a>`;
         return `<a href="${esc(href)}"${title ? ` title="${esc(title)}"` : ''}${ext ? ' rel="noopener nofollow ugc" target="_blank"' : ''}>${inner}</a>`;
       },
-      image: ({ href, text }) => (SAFE.test(href) ? `<a href="${esc(href)}" rel="noopener nofollow ugc">${esc(text || href)}</a>` : esc(text)),
+      // IPFS images show inline, from this node; any other image stays a link
+      image: ({ href, text }) => {
+        const ipfs = gateway(href);
+        if (ipfs) return `<img src="${esc(ipfs)}" alt="${esc(text)}" loading="lazy">`;
+        return SAFE.test(href) ? `<a href="${esc(href)}" rel="noopener nofollow ugc">${esc(text || href)}</a>` : esc(text);
+      },
       code: ({ text, lang }) => `<pre><code${lang ? ` class="language-${esc(lang.split(/\s/)[0])}"` : ''}>${esc(text)}</code></pre>\n`,
     },
   });

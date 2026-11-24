@@ -11,6 +11,8 @@ pub mod api;
 pub mod body;
 pub mod http;
 pub mod index;
+#[cfg(feature = "ipfs")]
+pub mod ipfs;
 pub mod node;
 pub mod rep;
 pub mod store;

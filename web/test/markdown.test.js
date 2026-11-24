@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { makeMarkdown } from '../src/lib/markdown.js';
+import { gateway, makeMarkdown } from '../src/lib/markdown.js';
 
 const md = makeMarkdown((npub) => (npub.startsWith('npub1x') ? 'Doctor Argon' : null));
 
@@ -31,6 +31,20 @@ describe('markdown bodies', () => {
     const h = md(`Ask nostr:${npub} or see [paper](https://example.org/p) and [cid](ipfs://bafyx)`);
     expect(h).toContain(`<a class="mention" href="/u/${npub}">@Doctor Argon</a>`);
     expect(h).toContain('href="https://example.org/p" rel="noopener nofollow ugc" target="_blank"');
-    expect(h).toContain('href="ipfs://bafyx"');
+    expect(h).toContain('href="/ipfs/bafyx" data-ipfs="ipfs://bafyx"');
+  });
+
+  it('serves IPFS files from this node: images inline, files as links', () => {
+    const cid = 'bafkreia3fjxcmwxpk6mpgisbsdfzsxiynumsnxtzd33jq5f6mxxrqudupe';
+    expect(gateway(`ipfs://${cid}/a/b.csv`)).toBe(`/ipfs/${cid}/a/b.csv`);
+    expect(gateway('https://x.org/ipfs/abc')).toBeNull();
+    const h = md(`![plot](ipfs://${cid}) and [data](ipfs://${cid}/d.csv) and ![remote](https://x.org/p.png)`);
+    expect(h).toContain(`<img src="/ipfs/${cid}" alt="plot" loading="lazy">`);
+    expect(h).toContain(`<a class="file" href="/ipfs/${cid}/d.csv" data-ipfs="ipfs://${cid}/d.csv"`);
+    expect(h).not.toContain('src="https://x.org');
+    const bad = md('![x](ipfs://bad"onerror=alert(1))');
+    expect(bad).not.toContain('<img');
+    expect(bad).not.toMatch(/"\s*onerror/);
   });
 });
+

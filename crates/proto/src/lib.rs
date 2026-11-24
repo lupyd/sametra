@@ -47,6 +47,9 @@ macro_rules! tools {
             request: JobRequest => Ack, true;
             inbox: InboxRequest => JobsResponse, true;
             respond: RespondRequest => Ack, true;
+            ipfs_add: IpfsAddRequest => IpfsAddResponse, true;
+            ipfs_get: IpfsGetRequest => IpfsGetResponse, true;
+            ipfs_pin: IpfsPinRequest => Ack, true;
         }
     };
 }

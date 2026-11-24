@@ -38,9 +38,30 @@ TLS (optional; the port then serves both plain and TLS connections):
   --tls-key FILE         private key (PEM)
   --tls-ca FILE          extra CA (PEM) to trust when dialing wss:// peers (repeatable)
 
+IPFS (a built-in IPFS node; files at /ipfs/CID on the same port as the UI):
+  --no-ipfs              no IPFS node
+  --ipfs-port N          libp2p port, TCP and UDP/QUIC [default: 7449; any free port if taken]
+  --ipfs-private         stay off the public IPFS network (Sametra peers only)
+  --ipfs-cache-mb N      room for files that posts link to   [default: 1024]
+  --ipfs-max-file-mb N   largest such file to fetch and keep [default: 32]
+  --ipfs-open-gateway    fetch from the network for anyone over HTTP (default: only for
+                         the operator; others get files this node already has)
+
 IDENTITY:
   Key is read from $SAMETRA_KEY (nsec or hex) or DATA/key; generated on first run.
 ";
+
+/// `ws://host:port/x` -> `host`.
+#[cfg_attr(not(feature = "ipfs"), allow(dead_code))]
+fn url_host(url: &str) -> Option<String> {
+    let rest = url.split_once("://").map(|x| x.1).unwrap_or(url);
+    let authority = rest.split('/').next()?;
+    let host = match authority.strip_prefix('[') {
+        Some(v6) => v6.split(']').next()?,
+        None => authority.rsplit_once(':').map(|x| x.0).unwrap_or(authority),
+    };
+    (!host.is_empty()).then(|| host.to_string())
+}
 
 fn data_dir(args: &[String]) -> PathBuf {
     if let Some(d) = opt(args, "--data") {
@@ -164,11 +185,12 @@ fn ensure_node(args: &[String]) {
         return; // a node is already running here: share it
     }
     let mut node_args = vec!["--listen".to_string(), addr.clone()];
-    for flag in ["--data", "--peer", "--join", "--public"] {
-        for w in args.windows(2).filter(|w| w[0] == flag) {
+    for flag in NODE_FLAGS {
+        for w in args.windows(2).filter(|w| w[0] == *flag) {
             node_args.extend([w[0].clone(), w[1].clone()]);
         }
     }
+    node_args.extend(args.iter().filter(|a| NODE_SWITCHES.contains(&a.as_str())).cloned());
     std::thread::spawn(move || run(&node_args));
     let end = std::time::Instant::now() + std::time::Duration::from_secs(15);
     while std::net::TcpStream::connect(&addr).is_err() {
@@ -179,12 +201,18 @@ fn ensure_node(args: &[String]) {
     }
 }
 
+/// Node flags `mcp --node` and `agent` pass on to the node they start.
+const NODE_FLAGS: &[&str] = &["--data", "--peer", "--join", "--public", "--ipfs-port", "--ipfs-cache-mb", "--ipfs-max-file-mb"];
+const NODE_SWITCHES: &[&str] = &["--no-ipfs", "--ipfs-private", "--no-relay-all"];
+
 /// Node-only flags are not for the MCP server.
 fn strip_node_flags(args: &[String]) -> Vec<String> {
     let mut out = vec![];
     let mut i = 0;
     while i < args.len() {
-        if matches!(args[i].as_str(), "--data" | "--peer" | "--join" | "--public") {
+        if NODE_SWITCHES.contains(&args[i].as_str()) {
+            i += 1;
+        } else if NODE_FLAGS.contains(&args[i].as_str()) {
             i += 2;
         } else {
             out.push(args[i].clone());
@@ -212,6 +240,22 @@ fn run(args: &[String]) {
         tls_key: opt(args, "--tls-key").map(PathBuf::from),
         tls_ca: opts(args, "--tls-ca").into_iter().map(PathBuf::from).collect(),
     };
+    #[cfg(feature = "ipfs")]
+    let ipfs_cfg = (!args.iter().any(|a| a == "--no-ipfs")).then(|| {
+        let mut port = num(args, "--ipfs-port", 7449u16);
+        // a second node on this machine: take any free port rather than fail
+        if port != 0 && std::net::TcpListener::bind(("0.0.0.0", port)).is_err() {
+            port = 0;
+        }
+        sametra_node::ipfs::Config {
+            port,
+            public: !args.iter().any(|a| a == "--ipfs-private"),
+            cache_mb: num(args, "--ipfs-cache-mb", 1024usize),
+            max_file: num(args, "--ipfs-max-file-mb", 32usize) << 20,
+            announce_host: cfg.public_addr.as_deref().and_then(url_host),
+            open_gateway: args.iter().any(|a| a == "--ipfs-open-gateway"),
+        }
+    });
     let threads = num(args, "--threads", 2usize).max(1);
     let rt = if threads == 1 {
         tokio::runtime::Builder::new_current_thread().enable_all().build()
@@ -231,6 +275,18 @@ fn run(args: &[String]) {
             if node.cfg.tls_cert.is_some() { "ws:// + wss://" } else { "ws://" },
             node.store.lock().unwrap().len()
         );
+        #[cfg(feature = "ipfs")]
+        if let Some(c) = ipfs_cfg {
+            match sametra_node::ipfs::Ipfs::start(&node.cfg.data.join("ipfs"), c).await {
+                Ok(i) => {
+                    let tag = i.heartbeat_tag().await;
+                    eprintln!("  ipfs      {} on {}", i.peer_id, tag[2..].join(" "));
+                    *node.ipfs_tag.lock().unwrap() = Some(tag);
+                    let _ = node.ipfs.set(std::sync::Arc::new(i));
+                }
+                Err(e) => eprintln!("  ipfs      off: {e}"),
+            }
+        }
         node::spawn_background(node.clone());
         tokio::select! {
             _ = http::serve(node.clone(), listener) => {}
@@ -257,6 +313,9 @@ mod tests {
         assert_eq!(num(&args, "--max-peers", 8usize), 3);
         assert_eq!(num(&args, "--max-events", 7usize), 7);
         assert_eq!(opt(&a(&["--data"]), "--data"), None, "flag without value");
+        assert_eq!(url_host("wss://node.example.org/x").as_deref(), Some("node.example.org"));
+        assert_eq!(url_host("ws://1.2.3.4:7447").as_deref(), Some("1.2.3.4"));
+        assert_eq!(url_host("ws://[::1]:7447").as_deref(), Some("::1"));
     }
 
     #[test]

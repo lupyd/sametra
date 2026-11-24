@@ -226,6 +226,7 @@ fn c_filter(kinds: Option<Vec<u32>>, c: &str) -> Filter {
 // ---- tools -----------------------------------------------------------------
 
 async fn info(node: &Arc<Node>, _: Empty) -> R<InfoResponse> {
+    let ipfs = ipfs_info(node).await;
     let st = node.store.lock().unwrap();
     Ok(InfoResponse {
         pubkey: node.keys.pubkey.hex(),
@@ -238,7 +239,91 @@ async fn info(node: &Arc<Node>, _: Empty) -> R<InfoResponse> {
         peers: node.peers.lock().unwrap().len() as u32,
         public_addr: node.cfg.public_addr.clone().unwrap_or_default(),
         unread: addressed_to_me(&st, &node.keys.pubkey, node.notifications_read.load(std::sync::atomic::Ordering::Relaxed), 1000).len() as u32,
+        ..ipfs
     })
+}
+
+#[cfg(feature = "ipfs")]
+async fn ipfs_info(node: &Arc<Node>) -> InfoResponse {
+    match node.ipfs.get() {
+        Some(i) => InfoResponse { ipfs_peer: i.peer_id.to_string(), ipfs_addrs: i.listening().await, ipfs_peers: i.connected().await as u32, ..Default::default() },
+        None => InfoResponse::default(),
+    }
+}
+#[cfg(not(feature = "ipfs"))]
+async fn ipfs_info(_: &Arc<Node>) -> InfoResponse {
+    InfoResponse::default()
+}
+
+// ---- files (the built-in IPFS node) ------------------------------------------
+
+#[cfg(feature = "ipfs")]
+fn ipfs_node(node: &Arc<Node>) -> R<Arc<crate::ipfs::Ipfs>> {
+    node.ipfs.get().cloned().ok_or_else(|| "IPFS is off on this node (started with --no-ipfs, or it failed to start)".into())
+}
+
+#[cfg(feature = "ipfs")]
+async fn ipfs_add(node: &Arc<Node>, r: IpfsAddRequest) -> R<IpfsAddResponse> {
+    let ipfs = ipfs_node(node)?;
+    let data = if r.data.is_empty() { r.text.into_bytes() } else { r.data };
+    if data.is_empty() {
+        return Err("nothing to add: give text or data".into());
+    }
+    let size = data.len() as u64;
+    let cid = ipfs.add(data, !r.unpinned).await?;
+    let name = r.name.trim().replace(['[', ']', '(', ')', '\n'], "");
+    let image = matches!(crate::ipfs::content_type(&name, b""), t if t.starts_with("image/"));
+    let label = if name.is_empty() { cid.to_string() } else { name };
+    Ok(IpfsAddResponse {
+        url: format!("ipfs://{cid}"),
+        gateway: format!("/ipfs/{cid}"),
+        link: format!("{}[{label}](ipfs://{cid})", if image { "!" } else { "" }),
+        cid: cid.to_string(),
+        size,
+    })
+}
+
+#[cfg(feature = "ipfs")]
+async fn ipfs_get(node: &Arc<Node>, r: IpfsGetRequest) -> R<IpfsGetResponse> {
+    let ipfs = ipfs_node(node)?;
+    let max = if r.max_bytes == 0 { 256 << 10 } else { (r.max_bytes as usize).min(16 << 20) };
+    let path = crate::ipfs::parse_path(&r.path)?;
+    let cid = *path.root().cid().ok_or("not a CID path")?;
+    let (data, truncated) = ipfs.cat(&r.path, max, r.local, std::time::Duration::from_secs(60)).await?;
+    let name = path.iter().last().unwrap_or("").to_string();
+    let media_type = crate::ipfs::content_type(&name, &data).to_string();
+    let (text, data) = match String::from_utf8(data) {
+        Ok(t) if media_type.starts_with("text/") || media_type.contains("json") => (t, vec![]),
+        Ok(t) => (String::new(), t.into_bytes()),
+        // cut mid-character: still text
+        Err(e) if truncated && e.utf8_error().error_len().is_none() => {
+            let ok = e.utf8_error().valid_up_to();
+            let mut b = e.into_bytes();
+            b.truncate(ok);
+            (String::from_utf8(b).unwrap_or_default(), vec![])
+        }
+        Err(e) => (String::new(), e.into_bytes()),
+    };
+    Ok(IpfsGetResponse { cid: cid.to_string(), size: (text.len() + data.len()) as u64, media_type, text, data, truncated, pinned: ipfs.is_pinned(&cid).await })
+}
+
+#[cfg(feature = "ipfs")]
+async fn ipfs_pin(node: &Arc<Node>, r: IpfsPinRequest) -> R<Ack> {
+    let cid = ipfs_node(node)?.pin(&r.path, !r.unpin).await?;
+    Ok(Ack { ok: true, id: cid.to_string(), ..Default::default() })
+}
+
+#[cfg(not(feature = "ipfs"))]
+async fn ipfs_add(_: &Arc<Node>, _: IpfsAddRequest) -> R<IpfsAddResponse> {
+    Err("this build has no IPFS (feature `ipfs`)".into())
+}
+#[cfg(not(feature = "ipfs"))]
+async fn ipfs_get(_: &Arc<Node>, _: IpfsGetRequest) -> R<IpfsGetResponse> {
+    Err("this build has no IPFS (feature `ipfs`)".into())
+}
+#[cfg(not(feature = "ipfs"))]
+async fn ipfs_pin(_: &Arc<Node>, _: IpfsPinRequest) -> R<Ack> {
+    Err("this build has no IPFS (feature `ipfs`)".into())
 }
 
 async fn peers(node: &Arc<Node>, _: Empty) -> R<PeersResponse> {
@@ -1022,6 +1107,23 @@ async fn pin_impl(node: &Arc<Node>, r: IdRequest, on: bool) -> R<Ack> {
         }
     }
     let n = ids.len() as u32;
+    // pinning a post keeps the files it links to as well
+    #[cfg(feature = "ipfs")]
+    if let Some(ipfs) = node.ipfs.get() {
+        let texts: Vec<String> = {
+            let st = node.store.lock().unwrap();
+            ids.iter().filter_map(|i| st.get(i)).map(|e| e.content.clone()).collect()
+        };
+        let cids: Vec<_> = texts.iter().flat_map(|t| crate::ipfs::linked_cids(t)).collect();
+        if !cids.is_empty() {
+            let ipfs = ipfs.clone();
+            tokio::spawn(async move {
+                for cid in cids {
+                    let _ = ipfs.pin(&cid.to_string(), on).await;
+                }
+            });
+        }
+    }
     node.store.lock().unwrap().pin(ids, on);
     node.save_state();
     Ok(Ack { count: n, ..ack(Some(&id)) })

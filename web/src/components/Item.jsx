@@ -2,6 +2,7 @@ import { useState } from 'preact/hooks';
 import { call } from '../lib/api.js';
 import { navigate } from '../lib/router.js';
 import { MentionHints } from './Mentions.jsx';
+import { Attach } from './Attach.jsx';
 import { ago, cites, flash, fmtScore, short, tick } from '../lib/state.js';
 import { kindLabel, strand } from '../lib/strand.js';
 
@@ -85,6 +86,7 @@ export function Actions({ e }) {
           <MentionHints text={text} setText={setText} />
           <div class="row">
             <CiteList />
+            <Attach text={text} setText={setText} />
             {e.accept?.length > 0 && (
               <select value={format} onChange={(ev) => setFormat(ev.currentTarget.value)} aria-label="Reply format">
                 {e.accept.map((a) => <option key={a} value={a}>{a}</option>)}

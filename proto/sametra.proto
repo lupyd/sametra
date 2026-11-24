@@ -139,6 +139,9 @@ message InfoResponse {
   uint32 peers = 8;
   string public_addr = 9;
   uint32 unread = 10;              // notifications not yet seen
+  string ipfs_peer = 11;           // the built-in IPFS node's peer id (empty: IPFS off)
+  repeated string ipfs_addrs = 12; // where IPFS clients reach it
+  uint32 ipfs_peers = 13;          // IPFS peers connected now
 }
 
 message Community {
@@ -359,3 +362,34 @@ message PeopleResponse { repeated Person people = 1; }
 message NotificationsRequest { uint32 limit = 1; bool mark_read = 2; }
 message Notification { string reason = 1; Item item = 2; bool unread = 3; }
 message NotificationsResponse { repeated Notification notifications = 1; uint32 unread = 2; }
+
+// Files on the node's built-in IPFS node. Posts link to them as ipfs://CID; every
+// node serves them at /ipfs/CID.
+message IpfsAddRequest {
+  string text = 1;      // the file as text, or
+  bytes data = 2;       // as bytes
+  string name = 3;      // file name: used for the link and the content type
+  bool unpinned = 4;    // default: pinned, i.e. kept for good
+}
+message IpfsAddResponse {
+  string cid = 1;
+  string url = 2;       // ipfs://CID
+  string gateway = 3;   // /ipfs/CID on this node
+  uint64 size = 4;
+  string link = 5;      // markdown to paste into a post
+}
+message IpfsGetRequest {
+  string path = 1;       // CID, ipfs://CID[/path] or /ipfs/CID[/path]
+  uint32 max_bytes = 2;  // default 256 KiB, at most 16 MiB
+  bool local = 3;        // only what this node has; never the network
+}
+message IpfsGetResponse {
+  string cid = 1;
+  string media_type = 2;
+  string text = 3;       // when the file is text
+  bytes data = 4;        // otherwise
+  uint64 size = 5;       // bytes returned
+  bool truncated = 6;
+  bool pinned = 7;
+}
+message IpfsPinRequest { string path = 1; bool unpin = 2; }

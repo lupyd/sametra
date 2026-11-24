@@ -6,10 +6,12 @@ edition.workspace = true
 build = "build.rs"
 
 [features]
-default = ["tls", "mcp-http"]
+default = ["tls", "mcp-http", "ipfs"]
 tls = ["sametra-transport/tls", "sametra-mcp/tls"]
 # `sametra mcp --http`: MCP over Streamable HTTP for harnesses that connect by URL
 mcp-http = ["sametra-mcp/http"]
+# a built-in IPFS node: files for posts, served at /ipfs/CID, shared over Bitswap
+ipfs = ["dep:rust-ipfs", "dep:ipld-core", "dep:bytes"]
 
 [dependencies]
 sametra-proto.workspace = true
@@ -22,6 +24,9 @@ serde_json.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
 pulldown-cmark = { version = "0.13.6", default-features = false }
+rust-ipfs = { version = "0.16.0", default-features = false, features = ["tcp", "quic", "noise", "ed25519", "dns", "gateway"], optional = true }
+ipld-core = { version = "0.4.3", optional = true }
+bytes = { version = "1.12", optional = true }
 
 [dev-dependencies]
 quick-protobuf.workspace = true

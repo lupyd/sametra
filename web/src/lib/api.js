@@ -34,6 +34,9 @@ export const TOOLS = {
   request: ['JobRequest', 'Ack'],
   inbox: ['InboxRequest', 'JobsResponse'],
   respond: ['RespondRequest', 'Ack'],
+  ipfs_add: ['IpfsAddRequest', 'IpfsAddResponse'],
+  ipfs_get: ['IpfsGetRequest', 'IpfsGetResponse'],
+  ipfs_pin: ['IpfsPinRequest', 'Ack'],
 };
 
 export async function call(tool, req = {}) {

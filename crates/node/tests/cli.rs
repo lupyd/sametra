@@ -50,6 +50,8 @@ fn run_node(data: &Path, port: u16, extra: &[&str]) -> (Proc, u16) {
     let mut p = cmd(data)
         .args(["run", "--listen", &format!("127.0.0.1:{port}")])
         .args(extra)
+        // IPFS only where a test is about it (it would join the public network)
+        .args(if extra.iter().any(|a| a.starts_with("--ipfs")) { &[][..] } else { &["--no-ipfs"][..] })
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -361,7 +363,7 @@ fn mcp_node_runs_or_shares_a_node() {
     let d = tempdir("mcp-node");
     let api = format!("http://127.0.0.1:{}", free_port());
     // no node at that address: the MCP server starts one, with this data directory's identity
-    let own = mcp_session(&d.0, &["--node", "--api", &api, "--data", d.0.to_str().unwrap()], &[("info", json!({})), ("set_profile", json!({"name": "Agent", "agent": true, "model": "x"}))]);
+    let own = mcp_session(&d.0, &["--node", "--no-ipfs", "--api", &api, "--data", d.0.to_str().unwrap()], &[("info", json!({})), ("set_profile", json!({"name": "Agent", "agent": true, "model": "x"}))]);
     let (_, ident, _) = out(cmd(&d.0).args(["id", "--data", d.0.to_str().unwrap()]).output().unwrap());
     assert!(ident.contains(own[0]["npub"].as_str().unwrap()), "embedded node uses the data directory's key");
     assert_eq!(own[1]["ok"], true);
@@ -536,4 +538,69 @@ fn agent_runs_sessions_within_budget() {
     let s: Value = serde_json::from_str(&status).unwrap();
     assert_eq!(s["ledger"]["sessions"], 2);
     assert!((s["ledger"]["usd_day"].as_f64().unwrap() - 1.2).abs() < 1e-9);
+}
+
+
+/// GET over plain HTTP; (status, headers, body).
+fn http_get(port: u16, path: &str, host: &str) -> (u16, String, Vec<u8>) {
+    use std::io::Read;
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    write!(s, "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").unwrap();
+    let mut resp = vec![];
+    s.read_to_end(&mut resp).unwrap();
+    let split = resp.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+    let head = String::from_utf8_lossy(&resp[..split]).to_string();
+    let mut body = resp[split + 4..].to_vec();
+    if head.to_ascii_lowercase().contains("transfer-encoding: chunked") {
+        let (mut out, mut rest) = (vec![], &body[..]);
+        loop {
+            let nl = rest.windows(2).position(|w| w == b"\r\n").unwrap();
+            let n = usize::from_str_radix(std::str::from_utf8(&rest[..nl]).unwrap(), 16).unwrap();
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&rest[nl + 2..nl + 2 + n]);
+            rest = &rest[nl + 4 + n..];
+        }
+        body = out;
+    }
+    (head.split(' ').nth(1).unwrap().parse().unwrap(), head, body)
+}
+
+#[test]
+fn ipfs_files_move_between_nodes() {
+    let (a, b) = (tempdir("ipfs-a"), tempdir("ipfs-b"));
+    let ipfs = ["--ipfs-private", "--ipfs-port", "0"];
+    let (_na, pa) = run_node(&a.0, 0, &ipfs);
+    let (_nb, pb) = run_node(&b.0, 0, &[&ipfs[..], &["--peer", &format!("ws://127.0.0.1:{pa}")]].concat());
+    let info = call(&a.0, pa, "info", json!({})).unwrap();
+    assert!(info["ipfs_peer"].as_str().unwrap().starts_with("12D3Koo"));
+    // the nodes find each other's IPFS side through their heartbeats
+    assert!(wait(Duration::from_secs(15), || call(&b.0, pb, "info", json!({})).unwrap()["ipfs_peers"].as_u64() > Some(0)));
+    let added = call(&a.0, pa, "ipfs_add", json!({"text": "# Lemma\n\nEvery group of prime order is cyclic.", "name": "lemma.md"})).unwrap();
+    let cid = added["cid"].as_str().unwrap().to_string();
+    assert_eq!(added["link"], format!("[lemma.md](ipfs://{cid})"));
+    // B's gateway fetches it from A for its operator
+    let (code, head, body) = http_get(pb, &format!("/ipfs/{cid}"), &format!("127.0.0.1:{pb}"));
+    assert_eq!(code, 200, "{head}");
+    assert_eq!(body, b"# Lemma\n\nEvery group of prime order is cyclic.");
+    assert!(head.contains("Content-Security-Policy: sandbox") && head.contains("immutable"));
+    let (code, head, raw) = http_get(pb, &format!("/ipfs/{cid}?format=raw"), "localhost");
+    assert!(code == 200 && head.contains("application/vnd.ipld.raw"));
+    assert_eq!(raw, body, "small files are one raw block");
+    // anyone else only gets what B already has
+    let other = call(&a.0, pa, "ipfs_add", json!({"text": "only on A"})).unwrap()["cid"].as_str().unwrap().to_string();
+    let (code, _, body) = http_get(pb, &format!("/ipfs/{other}"), "example.org");
+    assert_eq!(code, 404);
+    assert!(String::from_utf8_lossy(&body).contains("not on this node"));
+    assert_eq!(http_get(pb, &format!("/ipfs/{cid}"), "example.org").0, 200);
+    // a file a post links to is fetched and kept by the nodes that carry the post
+    let data = call(&a.0, pa, "ipfs_add", json!({"text": "x,y\n1,2", "name": "d.csv"})).unwrap()["cid"].as_str().unwrap().to_string();
+    call(&a.0, pa, "post", json!({"community": "math", "title": "Data", "content": format!("see [d.csv](ipfs://{data})")})).unwrap();
+    assert!(wait(Duration::from_secs(15), || call(&b.0, pb, "ipfs_get", json!({"path": format!("ipfs://{data}"), "local": true})).is_ok_and(|v| v["text"] == "x,y\n1,2")));
+    // pin and unpin
+    assert_eq!(call(&b.0, pb, "ipfs_pin", json!({"path": data})).unwrap()["ok"], true);
+    assert_eq!(call(&b.0, pb, "ipfs_get", json!({"path": data, "local": true})).unwrap()["pinned"], true);
+    assert!(call(&a.0, pa, "ipfs_get", json!({"path": "ipfs://nope"})).is_err());
 }

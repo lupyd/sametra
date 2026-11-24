@@ -19,6 +19,8 @@ const NO_UI: &[u8] = b"<!doctype html><meta charset=utf-8><title>Sametra</title>
 const PROTO: &str = "application/x-protobuf";
 const MAX_HEAD: usize = 16 * 1024;
 const MAX_BODY: usize = 1 << 20;
+/// `ipfs_add` carries a whole file
+const MAX_UPLOAD: usize = 32 << 20;
 
 pub async fn serve(node: Arc<Node>, listener: TcpListener) {
     let sem = Arc::new(tokio::sync::Semaphore::new(1024));
@@ -84,7 +86,8 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin + Send>(node: Arc<Node>, mut s
     let mut first = lines.next().unwrap_or("").split(' ');
     let method = first.next().unwrap_or("").to_string();
     let target = first.next().unwrap_or("/");
-    let path = target.split_once('?').map(|x| x.0).unwrap_or(target);
+    #[cfg_attr(not(feature = "ipfs"), allow(unused_variables))]
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
     let r = Req {
         method,
         path: path.to_string(),
@@ -112,6 +115,13 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin + Send>(node: Arc<Node>, mut s
         return respond_cors(&mut sock, 200, "application/nostr+json", info.to_string().as_bytes()).await;
     }
 
+    // --- files on the built-in IPFS node (a gateway, trustless with ?format=raw)
+    #[cfg(feature = "ipfs")]
+    if r.path.starts_with("/ipfs/") {
+        let operator = authorize(&node, &r, &peer, secure).is_ok();
+        return ipfs_gateway(&node, &mut sock, &r, query, operator).await;
+    }
+
     let Some(tool) = r.path.strip_prefix("/api/") else {
         return static_file(&mut sock, &r).await;
     };
@@ -125,7 +135,8 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin + Send>(node: Arc<Node>, mut s
         return pb_resp(&mut sock, 415, &pb::Error { message: format!("Content-Type must be {PROTO}") }).await;
     }
     let clen: usize = r.header("content-length").and_then(|v| v.parse().ok()).unwrap_or(0);
-    if clen > MAX_BODY {
+    let max = if tool == "ipfs_add" { MAX_UPLOAD } else { MAX_BODY };
+    if clen > max {
         return respond(&mut sock, 413, "text/plain", b"body too large").await;
     }
     let mut body = buf[head_end..].to_vec();
@@ -147,6 +158,68 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin + Send>(node: Arc<Node>, mut s
         Some(Err(e)) => pb_resp(&mut sock, 400, &pb::Error { message: e }).await,
         None => pb_resp(&mut sock, 404, &pb::Error { message: format!("unknown tool '{tool}'") }).await,
     }
+}
+
+/// `GET /ipfs/CID[/path]`: the file, streamed; with `?format=raw` (or `Accept:
+/// application/vnd.ipld.raw`) the raw block, which IPFS clients verify themselves.
+/// The operator's requests may fetch from the network; others get what this node
+/// has, unless the gateway is open.
+#[cfg(feature = "ipfs")]
+async fn ipfs_gateway<S: AsyncWrite + Unpin>(node: &Node, sock: &mut S, r: &Req, query: &str, operator: bool) -> std::io::Result<()> {
+    use futures_util::StreamExt;
+    if r.method != "GET" && r.method != "HEAD" {
+        return respond(sock, 405, "text/plain", b"method not allowed").await;
+    }
+    let Some(ipfs) = node.ipfs.get() else { return respond(sock, 404, "text/plain", b"IPFS is off on this node").await };
+    let local = !(operator || ipfs.cfg.open_gateway);
+    let path = match crate::ipfs::parse_path(&r.path) {
+        Ok(p) => p,
+        Err(e) => return respond(sock, 400, "text/plain", e.as_bytes()).await,
+    };
+    let Some(cid) = path.root().cid().copied() else { return respond(sock, 400, "text/plain", b"not a CID").await };
+    let missing = |e: String| if local { format!("not on this node: {e}") } else { e };
+    let cors = "Access-Control-Allow-Origin: *\r\n";
+    let immutable = "Cache-Control: public, max-age=29030400, immutable\r\n";
+    let raw = query.split('&').any(|kv| kv == "format=raw") || r.header("accept").is_some_and(|a| a.contains("application/vnd.ipld.raw"));
+    if raw {
+        if path.iter().next().is_some() {
+            return respond(sock, 400, "text/plain", b"raw blocks: ask for a bare CID").await;
+        }
+        return match ipfs.block(&cid, local).await {
+            Ok(b) => write_resp(sock, 200, "application/vnd.ipld.raw", &b, &format!("{immutable}{cors}ETag: \"{cid}.raw\"\r\nX-Ipfs-Path: {}\r\n", r.path)).await,
+            Err(e) => respond(sock, 404, "text/plain", missing(e).as_bytes()).await,
+        };
+    }
+    let name = query.split('&').find_map(|kv| kv.strip_prefix("filename=")).map(String::from).unwrap_or_else(|| path.iter().last().unwrap_or("").to_string());
+    let mut chunks = Box::pin(ipfs.cat_stream(path, local));
+    let first = match chunks.next().await {
+        Some(Ok(b)) => b,
+        Some(Err(e)) => return respond(sock, 404, "text/plain", missing(e).as_bytes()).await,
+        None => Default::default(),
+    };
+    // other people's files, served from this origin: sandboxed, never run as a page
+    let csp = "Content-Security-Policy: sandbox; default-src 'none'; img-src 'self' data:; media-src 'self'; style-src 'unsafe-inline'\r\n";
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\nX-Content-Type-Options: nosniff\r\n{immutable}{csp}{cors}ETag: \"{cid}\"\r\n\r\n",
+        crate::ipfs::content_type(&name, &first)
+    );
+    sock.write_all(head.as_bytes()).await?;
+    if r.method == "HEAD" {
+        return sock.shutdown().await;
+    }
+    let mut next = Some(Ok(first));
+    while let Some(c) = next {
+        // on an error mid-file, stop without the final chunk: the client sees it cut short
+        let Ok(c) = c else { return sock.shutdown().await };
+        if !c.is_empty() {
+            sock.write_all(format!("{:x}\r\n", c.len()).as_bytes()).await?;
+            sock.write_all(&c).await?;
+            sock.write_all(b"\r\n").await?;
+        }
+        next = chunks.next().await;
+    }
+    sock.write_all(b"0\r\n\r\n").await?;
+    sock.shutdown().await
 }
 
 /// Embedded SPA: exact file match, else index.html so client-side routes deep-link.
