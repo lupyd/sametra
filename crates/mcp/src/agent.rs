@@ -114,8 +114,8 @@ pub fn run_session(argv: &[String], limit: Duration) -> Result<String, String> {
     // a stopped harness's own children may still hold the pipe open: do not wait on them
     let out = rx.recv_timeout(if status.is_some() { Duration::from_secs(30) } else { Duration::from_secs(2) }).unwrap_or_default();
     match status {
-        None => eprintln!("session stopped after {}s (agent.max_session)", limit.as_secs()),
-        Some(st) if !st.success() => eprintln!("{} exited with {st}", argv[0]),
+        None => tracing::warn!(secs = limit.as_secs(), "session stopped at agent.max_session"),
+        Some(st) if !st.success() => tracing::warn!(harness = %argv[0], status = %st, "harness exited with an error"),
         _ => {}
     }
     Ok(out)
@@ -143,7 +143,7 @@ pub fn run(policy: &Policy, server: &[String], client: &Client, once: bool, prin
             if once || policy.exhausted_for_good(&ledger) {
                 return Err(format!("budget: {why}"));
             }
-            eprintln!("budget: {why}; next session after midnight UTC");
+            tracing::warn!(reason = %why, "budget reached; next session after midnight UTC");
             std::thread::sleep(Duration::from_secs(secs_to_next_utc_day()));
             continue;
         }
@@ -159,7 +159,9 @@ pub fn run(policy: &Policy, server: &[String], client: &Client, once: bool, prin
             println!("{}", crate::connect::shell_line(&argv));
             return Ok(());
         }
-        eprintln!("session {} ({}, {waiting} notifications waiting)", ledger.sessions + 1, policy.agent.harness);
+        let span = tracing::info_span!("session", n = ledger.sessions + 1, harness = %policy.agent.harness);
+        let _enter = span.enter();
+        tracing::info!(notifications = waiting, "session starting");
         last = Some(Instant::now());
         let out = run_session(&argv, max_session)?;
         let usage = usage_from(&out);
@@ -167,7 +169,7 @@ pub fn run(policy: &Policy, server: &[String], client: &Client, once: bool, prin
         policy.charge(&mut ledger, &usage);
         policy.save_ledger(&ledger);
         let cost = usage.usd.map(|u| format!("${u:.4}")).unwrap_or_else(|| "cost not reported".into());
-        eprintln!("session done: {} in / {} out tokens, {cost}; today ${:.4}, {} tokens", usage.input, usage.output, ledger.usd_day, ledger.tokens_day);
+        tracing::info!(input_tokens = usage.input, output_tokens = usage.output, cost = %cost, usd_today = ledger.usd_day, tokens_today = ledger.tokens_day, "session done");
         if once {
             return Ok(());
         }

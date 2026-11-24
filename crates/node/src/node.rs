@@ -271,8 +271,9 @@ impl Node {
                 if e.pubkey != self.keys.pubkey
                     && let Some(addr) = e.tag("r").filter(|a| a.starts_with("ws://") || a.starts_with("wss://")) {
                         let mut book = self.book.lock().unwrap();
-                        if book.len() < 2000 {
-                            book.entry(addr.to_string()).or_default();
+                        if book.len() < 2000 && !book.contains_key(addr) {
+                            tracing::debug!(%addr, "learned a peer address");
+                            book.insert(addr.to_string(), Default::default());
                         }
                     }
             }
@@ -432,8 +433,10 @@ impl Node {
             .map(|(_, p)| p.tx.clone())
             .collect();
         let mut waiting = txs.iter().filter(|t| t.try_send(Out::Req(sid.clone(), filters.clone(), hops)).is_ok()).count();
+        let asked = waiting;
         let mut out = Vec::new();
-        let deadline = tokio::time::Instant::now() + timeout;
+        let started = tokio::time::Instant::now();
+        let deadline = started + timeout;
         while waiting > 0 {
             match tokio::time::timeout_at(deadline, rx.recv()).await {
                 Ok(Some(Some(e))) => out.push(e),
@@ -447,6 +450,7 @@ impl Node {
         }
         let mut seen = HashSet::new();
         out.retain(|e| seen.insert(e.id));
+        tracing::debug!(%sid, hops, asked, unanswered = waiting, found = out.len(), ms = started.elapsed().as_millis() as u64, "asked peers");
         out
     }
 
@@ -472,8 +476,8 @@ pub fn is_mention(e: &Event) -> bool {
 
 fn write_atomic(path: &std::path::Path, bytes: &[u8]) {
     let tmp = path.with_extension("tmp");
-    if std::fs::write(&tmp, bytes).is_ok() {
-        let _ = std::fs::rename(&tmp, path);
+    if let Err(e) = std::fs::write(&tmp, bytes).and_then(|_| std::fs::rename(&tmp, path)) {
+        tracing::warn!(path = %path.display(), error = %e, "saving node state failed");
     }
 }
 
@@ -484,7 +488,9 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let ws = sametra_transport::accept(stream, part).await;
-    run_conn(node, ws, false, addr).await;
+    tracing::debug!(%addr, "inbound websocket");
+    run_conn(node, ws, false, addr.clone()).await;
+    tracing::debug!(%addr, "inbound websocket closed");
 }
 
 async fn run_conn<S>(node: Arc<Node>, ws: WebSocketStream<S>, outbound: bool, addr: String)
@@ -496,7 +502,7 @@ where
     let (tx, mut rx) = mpsc::channel::<Out>(256);
     let own_tx = tx.clone();
     let sametra = Arc::new(AtomicBool::new(outbound));
-    node.peers.lock().unwrap().insert(id, PeerHandle { tx, outbound, sametra: sametra.clone(), addr, since: now() });
+    node.peers.lock().unwrap().insert(id, PeerHandle { tx, outbound, sametra: sametra.clone(), addr: addr.clone(), since: now() });
     let mut brx = node.tx.subscribe();
     let mut subs: HashMap<String, Vec<Filter>> = HashMap::new();
     let mut ping = tokio::time::interval(Duration::from_secs(30));
@@ -529,13 +535,19 @@ where
                         if budget.0 != t { budget = (t, 0); }
                         budget.1 += 1;
                         let eid = e.id;
+                        if budget.1 == 201 {
+                            tracing::warn!(conn = id, %addr, "peer is publishing over 200 events/s; refusing the rest of this second");
+                        }
                         let (ok, m) = if budget.1 > 200 {
                             (false, "rate-limited: slow down".to_string())
                         } else {
                             match node.ingest(e, id, false) {
                                 Ok((_, true)) => (true, String::new()),
                                 Ok((_, false)) => (true, "duplicate:".into()),
-                                Err(m) => (false, m),
+                                Err(m) => {
+                                    tracing::debug!(conn = id, %addr, event = %eid.hex(), reason = %m, "event refused");
+                                    (false, m)
+                                }
                             }
                         };
                         // peers flooding to us don't need acks; nostr clients do
@@ -707,12 +719,14 @@ pub fn spawn_background(node: Arc<Node>) {
                 let evicted = {
                     let mut st = n.store.lock().unwrap();
                     let k = st.evict(&n.keys.pubkey, n.cfg.author_ttl, n.cfg.max_events);
-                    let _ = st.compact_if_needed(false);
+                    if let Err(e) = st.compact_if_needed(false) {
+                        tracing::warn!(error = %e, "compacting the event log failed");
+                    }
                     k
                 };
                 if evicted > 0 {
                     n.rep_cache.lock().unwrap().clear();
-                    eprintln!("evicted {evicted} events");
+                    tracing::info!(evicted, cached = n.store.lock().unwrap().len(), "evicted events");
                 }
                 let cut = now().saturating_sub(1200);
                 n.seen.lock().unwrap().retain(|_, t| *t > cut);
@@ -738,18 +752,22 @@ pub async fn dial(node: Arc<Node>, addr: String) {
             let i = book.entry(addr.clone()).or_default();
             i.fails += 1;
             i.next_try = now() + (15u64 << i.fails.min(8)).min(3600);
+            let error = failed.map(|r| r.err().unwrap_or_default()).unwrap_or_else(|_| "timed out".into());
+            let retry_in = i.next_try.saturating_sub(now());
             if i.fails == 1 {
-                eprintln!("dial failed: {}", failed.map(|r| r.err().unwrap_or_default()).unwrap_or_else(|_| "timed out".into()));
+                tracing::warn!(%addr, %error, retry_in, "dial failed");
+            } else {
+                tracing::debug!(%addr, %error, fails = i.fails, retry_in, "dial failed again");
             }
             return;
         }
     };
-    eprintln!("connected to {addr}");
+    tracing::info!(%addr, "connected to peer");
     if let Some(i) = node.book.lock().unwrap().get_mut(&addr) {
         i.fails = 0;
     }
     run_conn(node.clone(), ws, true, addr.clone()).await;
-    eprintln!("disconnected from {addr}");
+    tracing::info!(%addr, "disconnected from peer");
     if let Some(i) = node.book.lock().unwrap().get_mut(&addr) {
         i.next_try = now() + 5;
     }

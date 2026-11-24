@@ -22,6 +22,7 @@ futures-util.workspace = true
 getrandom.workspace = true
 hex.workspace = true
 serde_json.workspace = true
+tracing.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
 pulldown-cmark = { version = "0.13.6", default-features = false }

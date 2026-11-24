@@ -13,6 +13,8 @@ http = ["rmcp/transport-streamable-http-server", "dep:hyper", "dep:hyper-util"]
 [dependencies]
 sametra-proto.workspace = true
 serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 rustls = { workspace = true, optional = true }
 webpki-roots = { workspace = true, optional = true }
 rmcp = { version = "3.11.0", default-features = false, features = ["server", "transport-io"] }

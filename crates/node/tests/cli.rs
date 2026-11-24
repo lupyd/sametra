@@ -122,7 +122,7 @@ fn identity_is_created_once_and_private() {
     let d = tempdir("id");
     let (code, first, stderr) = out(cmd(&d.0).arg("id").output().unwrap());
     assert_eq!(code, 0);
-    assert!(stderr.contains("generated new identity"));
+    assert!(stderr.contains("generated a new identity"));
     assert!(first.contains("npub:   npub1") && first.contains("pubkey: ") && !first.contains("nsec"));
     #[cfg(unix)]
     {
@@ -529,7 +529,7 @@ fn agent_runs_sessions_within_budget() {
     assert_eq!(code, 0, "{stderr}");
     let prompt = std::fs::read_to_string(d.0.join("prompt")).unwrap();
     assert!(prompt.contains("notifications") && prompt.contains("Your priority is the communities math") && prompt.ends_with("Be brief."));
-    assert!(stderr.contains("1000 in / 200 out tokens, $0.6000"), "{stderr}");
+    assert!(stderr.contains("session done") && stderr.contains("input_tokens=1000 output_tokens=200 cost=$0.6000"), "{stderr}");
     assert_eq!(agent(&["--once"]).0, 0, "$0.60 of $1.00: one more session");
     let (code, _, stderr) = agent(&["--once"]);
     assert!(code == 2 && stderr.contains("daily limit reached"), "{stderr}");
@@ -603,4 +603,30 @@ fn ipfs_files_move_between_nodes() {
     assert_eq!(call(&b.0, pb, "ipfs_pin", json!({"path": data})).unwrap()["ok"], true);
     assert_eq!(call(&b.0, pb, "ipfs_get", json!({"path": data, "local": true})).unwrap()["pinned"], true);
     assert!(call(&a.0, pa, "ipfs_get", json!({"path": "ipfs://nope"})).is_err());
+}
+
+#[test]
+fn logs_are_structured_and_configurable() {
+    let d = tempdir("logs");
+    let port = free_port();
+    let mut p = cmd(&d.0)
+        .args(["run", "--no-ipfs", "--listen", &format!("127.0.0.1:{port}"), "--log", "debug", "--log-format", "json"])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    assert!(wait(Duration::from_secs(10), || std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()));
+    call(&d.0, port, "info", json!({})).unwrap();
+    let _ = p.kill();
+    let _ = p.wait();
+    let mut err = String::new();
+    std::io::Read::read_to_string(&mut p.stderr.take().unwrap(), &mut err).unwrap();
+    let events: Vec<Value> = err.lines().map(|l| serde_json::from_str(l).unwrap_or_else(|_| panic!("not JSON: {l}"))).collect();
+    let started = events.iter().find(|e| e["fields"]["message"] == "node started").expect("a start event");
+    assert_eq!(started["fields"]["local"], format!("127.0.0.1:{port}"));
+    assert!(events.iter().any(|e| e["level"] == "DEBUG" && e["fields"]["message"] == "api" && e["fields"]["tool"] == "info"), "{err}");
+    // a bad filter or format is an error, not silence
+    let (code, _, stderr) = out(cmd(&d.0).args(["id", "--log", "sametra=[["]).output().unwrap());
+    assert!(code == 2 && stderr.contains("bad log filter"), "{stderr}");
+    let (code, _, stderr) = out(cmd(&d.0).args(["id", "--log-format", "xml"]).output().unwrap());
+    assert!(code == 2 && stderr.contains("--log-format"), "{stderr}");
 }

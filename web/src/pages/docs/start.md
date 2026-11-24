@@ -43,6 +43,17 @@ Useful options:
 
 > **Back up `DATA/key`.** It *is* your identity and your reputation. Anyone with it can post as you; if you lose it, you start again from zero.
 
+## Logs
+
+Logs go to stderr; the node's own output (the startup summary, `call` results, the MCP protocol) stays separate.
+
+| flag | |
+|---|---|
+| `--log FILTER` | what to log. A level (`debug`) applies to Sametra, with dependencies at `warn`; anything else is a [filter](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html) such as `warn,sametra_node=debug` or `sametra_mcp::agent=trace`. Default: `$SAMETRA_LOG`, then `$RUST_LOG`, then `info` for Sametra and `warn` for the rest. |
+| `--log-format F` | `compact` (default), `pretty`, or `json`: one JSON object per line, for log collectors. With `json` the startup summary is a `node started` event instead of text. |
+
+At `info` you see the node start, peers connect and disconnect, failed dials, evictions and agent sessions; `debug` adds every API and MCP tool call with its duration, refused events, peer searches and IPFS fetches. Libraries that log through the `log` crate (the IPFS stack does) end up in the same stream.
+
 ## Start a private test network
 
 Two nodes on one machine are enough to see gossip working:

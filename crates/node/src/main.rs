@@ -32,6 +32,9 @@ RUN OPTIONS:
   --author-ttl-hours N   drop unpinned content of authors unseen this long [default: 168]
   --api-token TOKEN      allow write tools from non-localhost with 'Authorization: Bearer TOKEN'
   --threads N            worker threads               [default: 2]
+  --log FILTER           what to log: a level (debug) or an EnvFilter (warn,sametra_node=debug)
+                         [default: $SAMETRA_LOG, $RUST_LOG, or info for sametra, warn for the rest]
+  --log-format F         compact (default), pretty or json; logs go to stderr
 
 TLS (optional; the port then serves both plain and TLS connections):
   --tls-cert FILE        certificate chain (PEM) for HTTPS/WSS on --listen
@@ -104,7 +107,7 @@ fn load_keys(dir: &PathBuf) -> Keys {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
     }
-    eprintln!("generated new identity in {}", path.display());
+    tracing::info!(path = %path.display(), "generated a new identity");
     k
 }
 
@@ -112,6 +115,9 @@ fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = if args.first().is_some_and(|a| !a.starts_with('-')) { args.remove(0) } else { "run".into() };
     let delegated = matches!(cmd.as_str(), "mcp" | "call" | "tools" | "connect" | "skill" | "agent");
+    if let Err(e) = sametra_mcp::logging::init(&args) {
+        die(&e);
+    }
     if !delegated && args.iter().any(|a| a == "-h" || a == "--help") {
         print!("{USAGE}");
         return;
@@ -256,6 +262,7 @@ fn run(args: &[String]) {
             open_gateway: args.iter().any(|a| a == "--ipfs-open-gateway"),
         }
     });
+    let json_logs = sametra_mcp::logging::json(args);
     let threads = num(args, "--threads", 2usize).max(1);
     let rt = if threads == 1 {
         tokio::runtime::Builder::new_current_thread().enable_all().build()
@@ -267,30 +274,43 @@ fn run(args: &[String]) {
         let listen = cfg.listen.clone();
         let node = node::Node::new(cfg, keys).unwrap_or_else(|e| die(&format!("starting node: {e}")));
         let listener = tokio::net::TcpListener::bind(&listen).await.unwrap_or_else(|e| die(&format!("bind {listen}: {e}")));
-        eprintln!(
-            "sametra node {}\n  identity  {}\n  listening {} (relay {}, API /api/, UI /)\n  cached    {} events",
-            env!("CARGO_PKG_VERSION"),
-            node.keys.npub(),
-            listener.local_addr().map(|a| a.to_string()).unwrap_or(listen),
-            if node.cfg.tls_cert.is_some() { "ws:// + wss://" } else { "ws://" },
-            node.store.lock().unwrap().len()
-        );
+        let local = listener.local_addr().map(|a| a.to_string()).unwrap_or(listen);
+        let cached = node.store.lock().unwrap().len();
+        let tls = node.cfg.tls_cert.is_some();
+        // the banner is for people; with JSON logs the same facts go out as one event
+        if !json_logs {
+            eprintln!(
+                "sametra node {}\n  identity  {}\n  listening {local} (relay {}, API /api/, UI /)\n  cached    {cached} events",
+                env!("CARGO_PKG_VERSION"),
+                node.keys.npub(),
+                if tls { "ws:// + wss://" } else { "ws://" },
+            );
+        }
+        tracing::info!(version = env!("CARGO_PKG_VERSION"), npub = %node.keys.npub(), %local, tls, cached, relay_all = node.cfg.relay_all, "node started");
         #[cfg(feature = "ipfs")]
         if let Some(c) = ipfs_cfg {
             match sametra_node::ipfs::Ipfs::start(&node.cfg.data.join("ipfs"), c).await {
                 Ok(i) => {
                     let tag = i.heartbeat_tag().await;
-                    eprintln!("  ipfs      {} on {}", i.peer_id, tag[2..].join(" "));
+                    if !json_logs {
+                        eprintln!("  ipfs      {} on {}", i.peer_id, tag[2..].join(" "));
+                    }
+                    tracing::info!(peer_id = %i.peer_id, addrs = ?&tag[2..], public = i.cfg.public, "IPFS node started");
                     *node.ipfs_tag.lock().unwrap() = Some(tag);
                     let _ = node.ipfs.set(std::sync::Arc::new(i));
                 }
-                Err(e) => eprintln!("  ipfs      off: {e}"),
+                Err(e) => {
+                    if !json_logs {
+                        eprintln!("  ipfs      off: {e}");
+                    }
+                    tracing::warn!(error = %e, "IPFS node did not start; running without it");
+                }
             }
         }
         node::spawn_background(node.clone());
         tokio::select! {
             _ = http::serve(node.clone(), listener) => {}
-            _ = tokio::signal::ctrl_c() => { eprintln!("shutting down"); }
+            _ = tokio::signal::ctrl_c() => { tracing::info!("shutting down"); }
         }
         node.store.lock().unwrap().flush();
     });

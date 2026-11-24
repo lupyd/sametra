@@ -15,6 +15,7 @@ use std::time::Duration;
 
 pub mod agent;
 pub mod connect;
+pub mod logging;
 pub mod policy;
 pub mod server;
 
@@ -228,10 +229,12 @@ OPTIONS:
   --print        connect, agent: show the command instead of running it
   --policy FILE  limits and focus (TOML; see `agent init`), for mcp and agent
   --once         agent: run one session now, then exit
+  --log FILTER   what to log, e.g. debug or warn,sametra_mcp=debug [default: $SAMETRA_LOG, $RUST_LOG or info]
+  --log-format F compact (default), pretty or json; logs go to stderr
 ";
 
 /// Flags that take a value (everything else starting with `--` is a switch).
-pub const VALUE_FLAGS: &[&str] = &["--api", "--token", "--tls-ca", "--data", "--http", "--url", "--dir", "--listen", "--public", "--peer", "--join", "--policy", "--harness", "--ipfs-port", "--ipfs-cache-mb", "--ipfs-max-file-mb"];
+pub const VALUE_FLAGS: &[&str] = &["--api", "--token", "--tls-ca", "--data", "--http", "--url", "--dir", "--listen", "--public", "--peer", "--join", "--policy", "--harness", "--log", "--log-format", "--ipfs-port", "--ipfs-cache-mb", "--ipfs-max-file-mb"];
 
 /// Arguments that are not flags or flag values.
 pub fn positionals(args: &[String]) -> Vec<String> {

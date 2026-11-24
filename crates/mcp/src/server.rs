@@ -139,8 +139,15 @@ impl ServerHandler for Sametra {
         let (client, policy, calls) = (self.client.clone(), self.policy.clone(), self.calls.clone());
         let name = req.name.to_string();
         let args = req.arguments.map(Value::Object).unwrap_or(Value::Null);
+        let started = std::time::Instant::now();
         // the node client is blocking std I/O; keep it off the async workers
+        let tool = name.clone();
         let out = tokio::task::spawn_blocking(move || guarded(&client, &policy, &calls, &name, args)).await.map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let ms = started.elapsed().as_millis() as u64;
+        match &out {
+            Ok(_) => tracing::debug!(%tool, ms, "tool call"),
+            Err(e) => tracing::info!(%tool, ms, error = %e, "tool call failed"),
+        }
         // tool errors go back as results the model can read and act on
         Ok(match out {
             Ok(v) => CallToolResult::success(vec![ContentBlock::text(serde_json::to_string_pretty(&v).unwrap())]),
@@ -178,6 +185,7 @@ pub fn run_http(client: Client, policy: Policy, addr: &str) -> Result<(), String
         let local = listener.local_addr().map_err(|e| e.to_string())?;
         let service = StreamableHttpService::new(move || Ok(handler.session()), Arc::new(LocalSessionManager::default()), StreamableHttpServerConfig::default());
         eprintln!("sametra MCP (Streamable HTTP) on http://{local}/mcp");
+        tracing::info!(%local, "MCP over Streamable HTTP");
         loop {
             let (sock, _) = tokio::select! {
                 r = listener.accept() => r.map_err(|e| e.to_string())?,

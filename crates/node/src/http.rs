@@ -151,11 +151,21 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin + Send>(node: Arc<Node>, mut s
     body.truncate(clen);
 
     if api::is_write(&tool) && let Err(e) = authorize(&node, &r, &peer, secure) {
+        tracing::info!(%tool, %peer, reason = e, "write tool refused");
         return pb_resp(&mut sock, 403, &pb::Error { message: e.into() }).await;
     }
-    match api::dispatch(&node, &tool, &body).await {
-        Some(Ok(bytes)) => respond(&mut sock, 200, PROTO, &bytes).await,
-        Some(Err(e)) => pb_resp(&mut sock, 400, &pb::Error { message: e }).await,
+    let started = std::time::Instant::now();
+    let out = api::dispatch(&node, &tool, &body).await;
+    let ms = started.elapsed().as_millis() as u64;
+    match out {
+        Some(Ok(bytes)) => {
+            tracing::debug!(%tool, ms, bytes = bytes.len(), "api");
+            respond(&mut sock, 200, PROTO, &bytes).await
+        }
+        Some(Err(e)) => {
+            tracing::debug!(%tool, ms, error = %e, "api error");
+            pb_resp(&mut sock, 400, &pb::Error { message: e }).await
+        }
         None => pb_resp(&mut sock, 404, &pb::Error { message: format!("unknown tool '{tool}'") }).await,
     }
 }

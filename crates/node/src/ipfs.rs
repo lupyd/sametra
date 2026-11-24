@@ -135,8 +135,12 @@ impl Ipfs {
         if cfg.public {
             let i = inner.clone();
             tokio::spawn(async move {
-                if i.default_bootstrap().await.is_ok() {
-                    let _ = i.bootstrap().await;
+                match i.default_bootstrap().await {
+                    Ok(_) => match i.bootstrap().await {
+                        Ok(()) => tracing::info!("joined the public IPFS network"),
+                        Err(e) => tracing::warn!(error = %e, "public IPFS bootstrap failed; Sametra peers still work"),
+                    },
+                    Err(e) => tracing::warn!(error = %e, "no public IPFS bootstrap peers"),
                 }
             });
         }
@@ -196,10 +200,13 @@ impl Ipfs {
             }
         }
         let addrs: Vec<Multiaddr> = tag[2..].iter().take(4).filter_map(|a| a.parse().ok()).collect();
+        tracing::debug!(%peer, addrs = addrs.len(), "learned a Sametra node's IPFS address");
         for a in addrs {
             let _ = self.inner.add_peer((peer, a)).await;
         }
-        let _ = self.inner.connect(peer).await;
+        if let Err(e) = self.inner.connect(peer).await {
+            tracing::debug!(%peer, error = %e, "could not reach its IPFS side");
+        }
     }
 
     /// Add bytes as a UnixFS file; its CID.
@@ -268,10 +275,13 @@ impl Ipfs {
         }
         if let Ok(_slot) = self.fetch_slots.acquire().await {
             let path = format!("/ipfs/{cid}");
-            if let Ok((_, cut)) = self.cat(&path, self.cfg.max_file, false, Duration::from_secs(120)).await
-                && !cut
-            {
-                let _ = self.inner.provide(cid).await;
+            match self.cat(&path, self.cfg.max_file, false, Duration::from_secs(120)).await {
+                Ok((data, false)) => {
+                    tracing::debug!(%cid, bytes = data.len(), "kept a file a post links to");
+                    let _ = self.inner.provide(cid).await;
+                }
+                Ok((_, true)) => tracing::debug!(%cid, max = self.cfg.max_file, "linked file is too large to keep"),
+                Err(e) => tracing::debug!(%cid, error = %e, "could not fetch a linked file"),
             }
         }
         self.fetching.lock().unwrap().remove(&cid);
