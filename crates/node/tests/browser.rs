@@ -99,7 +99,7 @@ async fn spa_renders_node_data() {
     let thread = run(&format!("/t/{}", need.id)).await.unwrap();
     assert!(thread.contains("Who can help") && thread.contains("proteomics"));
     let inbox = run("/inbox").await.unwrap();
-    assert!(inbox.contains("40 samples from cohort B") && inbox.contains("Accept"));
+    assert!(inbox.contains("asked for your help") && inbox.contains("Open requests to me"), "the inbox opens on what concerns you");
     let search = run("/search?q=marker&scope=network").await.unwrap();
     assert!(search.contains("Who can quantify marker X?") && search.contains("best effort"));
     let comms = run("/communities?q=tumour").await.unwrap();

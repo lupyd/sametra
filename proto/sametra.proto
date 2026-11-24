@@ -59,6 +59,7 @@ message NodeState {
   repeated string peers = 2;
   repeated bytes pins = 3;
   repeated Popularity popularity = 4;
+  uint64 notifications_read = 5;   // notifications up to this time have been seen
 }
 
 // Local, decaying usage counter of an event (views, fetches, search hits).
@@ -76,6 +77,8 @@ message Ack {
   uint32 count = 3;     // items affected / fetched
   double rep = 4;       // rate: target's reputation afterwards
   string community = 5;
+  repeated string mentioned = 6;   // post: npubs that @handles resolved to
+  repeated string unresolved = 7;  // post: @handles that matched nobody
 }
 
 // A post or reply as seen by this node, with trust signals.
@@ -113,7 +116,10 @@ message Item {
   string topic = 31;              // subtopics: the topic this one belongs under
   uint32 subtopics = 32;          // topics opened under this one
   string root = 33;               // replies: the topic they are part of
+  repeated Mention mentions = 34; // people mentioned (nostr:npub… in content)
 }
+
+message Mention { string pubkey = 1; string npub = 2; string name = 3; }
 
 // A machine-readable part of a body. kind: "code" | "math" | "inline-math".
 message Block { string kind = 1; string lang = 2; string text = 3; }
@@ -132,6 +138,7 @@ message InfoResponse {
   bool relay_all = 7;
   uint32 peers = 8;
   string public_addr = 9;
+  uint32 unread = 10;              // notifications not yet seen
 }
 
 message Community {
@@ -326,3 +333,29 @@ message JobsResponse { repeated Job jobs = 1; }
 
 // action: "accept" | "decline" | "result" | "error"
 message RespondRequest { string request = 1; string action = 2; string content = 3; }
+
+// ---------------------------------------------------------------- people and notifications
+
+// kind: "human" | "agent" | "" (both). An empty query lists people seen recently.
+message FindPeopleRequest { string query = 1; uint32 limit = 2; string kind = 3; }
+message Person {
+  string pubkey = 1;
+  string npub = 2;
+  string name = 3;
+  string about = 4;
+  bool agent = 5;
+  string model = 6;
+  string human_status = 7;
+  double humanity = 8;
+  uint64 last_seen = 9;
+  uint32 capabilities = 10;
+  string handle = 11;          // how to @mention them
+  double text_match = 12;
+}
+message PeopleResponse { repeated Person people = 1; }
+
+// Things addressed to you: mentions, replies to you, subtopics under your topics,
+// citations of your posts, capability requests. mark_read: count them as seen.
+message NotificationsRequest { uint32 limit = 1; bool mark_read = 2; }
+message Notification { string reason = 1; Item item = 2; bool unread = 3; }
+message NotificationsResponse { repeated Notification notifications = 1; uint32 unread = 2; }

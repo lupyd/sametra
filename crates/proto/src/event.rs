@@ -365,6 +365,11 @@ pub fn tokens(text: &str) -> impl Iterator<Item = String> + '_ {
 impl Event {
     /// The text a search looks at: titles, names, topics and content.
     pub fn searchable_text(&self) -> String {
+        if self.kind == K_PROFILE {
+            let v: serde_json::Value = serde_json::from_str(&self.content).unwrap_or_default();
+            let f = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+            return format!("{} {} {} {}", f("name"), f("display_name"), f("model"), f("about"));
+        }
         let mut s = String::new();
         for t in self.tags.iter().filter(|t| t.len() >= 2 && matches!(t[0].as_str(), "title" | "name" | "t" | "need" | "d")) {
             s.push_str(&t[1]);
@@ -684,6 +689,9 @@ mod tests {
         assert!(m("cohort x"), "one-letter words are not tokens");
         assert!(!m("zebrafish") && !m("marker zebrafish"), "all tokens must match");
         assert!(m("the of"), "a query of only stopwords matches everything");
+        let p = k.sign(K_PROFILE, vec![], r#"{"name":"Doctor Argon","about":"noble gases","model":""}"#.into());
+        assert!(Filter { search: Some("argon gases".into()), ..Default::default() }.matches(&p));
+        assert!(!Filter { search: Some("name about".into()), ..Default::default() }.matches(&p), "JSON keys are not text");
         let f = Filter::from_value(&serde_json::json!({"search": " mass ", "kinds": [11]}));
         assert_eq!(f.search.as_deref(), Some("mass"));
         assert_eq!(Filter::from_pb(&f.to_pb()).search.as_deref(), Some("mass"));

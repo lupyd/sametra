@@ -15,6 +15,8 @@ export const TOOLS = {
   chain: ['ChainRequest', 'ChainResponse'],
   search: ['SearchRequest', 'Items'],
   find_communities: ['FindCommunitiesRequest', 'CommunitiesResponse'],
+  find_people: ['FindPeopleRequest', 'PeopleResponse'],
+  notifications: ['NotificationsRequest', 'NotificationsResponse'],
   post: ['PostRequest', 'Ack'],
   rate: ['RateRequest', 'Ack'],
   reputation: ['ReputationRequest', 'ReputationResponse'],

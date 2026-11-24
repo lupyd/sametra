@@ -53,6 +53,12 @@ header { display: flex; align-items: center; gap: 18px; padding: 10px 24px; back
 .search input { background: var(--bg); }
 nav.top { margin-left: auto; display: flex; gap: 18px; font-size: 14px; color: var(--mute); white-space: nowrap; }
 nav.top a.on { color: var(--ink); }
+.count { display: inline-block; min-width: 18px; margin-left: 6px; padding: 0 5px; border-radius: 9px; background: var(--acc); color: var(--panel); font-size: 11.5px; line-height: 18px; text-align: center; font-weight: 650; }
+.who.unread::after { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--acc); margin-left: 2px; }
+.people { display: flex; flex-direction: column; gap: 6px; margin: 0 0 18px; padding: 10px 0 14px; border-bottom: 1px solid var(--line); font-size: 14px; }
+.people a { display: flex; flex-wrap: wrap; gap: 4px; align-items: baseline; }
+.hints { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; font-size: 13px; }
+.hints button { background: var(--panel); color: var(--ink); border: 1px solid var(--line); padding: 2px 9px; font-weight: 500; }
 .me { color: var(--mute); font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 22%; }
 button.theme { background: none; border: 1px solid var(--line); color: var(--ink); width: 34px; height: 34px; padding: 0; border-radius: 50%; display: grid; place-items: center; cursor: pointer; transition: transform .25s ease; }
 button.theme:hover { border-color: var(--acc); color: var(--acc); }

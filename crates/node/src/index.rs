@@ -12,7 +12,7 @@ use std::collections::HashMap;
 
 /// Kinds worth searching.
 pub fn indexed(kind: u32) -> bool {
-    matches!(kind, K_POST | K_REPLY | K_COMMUNITY | K_CAPABILITY)
+    matches!(kind, K_POST | K_REPLY | K_COMMUNITY | K_CAPABILITY | K_PROFILE)
 }
 
 /// Cap on distinct tokens indexed per event (bounds memory for huge posts).
@@ -169,7 +169,6 @@ mod tests {
     fn only_searchable_kinds_and_removal() {
         let k = Keys::generate();
         let mut ix = Index::default();
-        ix.add(&k.sign(K_PROFILE, vec![], r#"{"name":"marker"}"#.into()));
         ix.add(&k.sign(K_RATING, vec![vec!["d".into(), "marker".into()]], "marker".into()));
         assert!(ix.is_empty());
         let cap = k.sign(K_CAPABILITY, vec![vec!["d".into(), "ms".into()], vec!["t".into(), "proteomics".into()]], r#"{"name":"Mass spec"}"#.into());

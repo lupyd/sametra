@@ -349,3 +349,67 @@ async fn communities_found_across_the_network_with_members() {
     assert_eq!(c.name, "Glaciology");
     assert!(!c.joined);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mentions_reach_people_through_scoped_nodes() {
+    // asker <- relay -> argon, where nobody but asker follows "chem": only the mention travels
+    let asker = spawn(|c| {
+        c.relay_all = false;
+        c.join = vec!["chem".into()];
+    })
+    .await;
+    let relay = spawn(|c| c.relay_all = false).await;
+    let argon = spawn(|c| c.relay_all = false).await;
+    relay.connect(&asker).await;
+    argon.connect(&relay).await;
+    argon.ok::<_, pb::Ack>("set_profile", &pb::Profile { name: "Doctor Argon".into(), about: "noble gas spectroscopy".into(), agent: true, model: "claude-opus-5-5".into() }).await;
+    argon.ok::<_, pb::Ack>("set_capability", &pb::CapabilitySpec { id: "spectra".into(), name: "Gas spectra".into(), kind: "skill".into(), ..Default::default() }).await;
+    // the profile is global metadata: asker learns it, and can find and mention Argon
+    let mut found = vec![];
+    for _ in 0..100 {
+        let r: pb::PeopleResponse = asker.ok("find_people", &pb::FindPeopleRequest { query: "@doctorargon".into(), ..Default::default() }).await;
+        if r.people.first().is_some_and(|p| p.capabilities == 1) {
+            found = r.people;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let p = found.first().expect("asker finds Argon by handle");
+    assert_eq!((p.handle.as_str(), p.model.as_str(), p.capabilities, p.human_status.as_str()), ("DoctorArgon", "claude-opus-5-5", 1, "agent"));
+    let quiet: pb::Ack = asker.ok("post", &post("chem", "Unrelated", "nobody is mentioned")).await;
+    let a: pb::Ack = asker.ok("post", &post("chem", "Odd spectral line", "@DoctorArgon could you look at this? Also @nobody.")).await;
+    assert_eq!(a.mentioned, [argon.node.keys.npub()]);
+    assert_eq!(a.unresolved, ["nobody"]);
+    assert!(eventually(T, || argon.has(&a.id)).await, "the mention reached Argon through a node that ignores chem");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!argon.has(&quiet.id) && !relay.has(&quiet.id), "posts without mentions stay in their community");
+    let n: pb::NotificationsResponse = argon.ok("notifications", &pb::NotificationsRequest::default()).await;
+    assert_eq!(n.unread, 1);
+    assert_eq!((n.notifications[0].reason.as_str(), n.notifications[0].unread), ("mention", true));
+    let it = n.notifications[0].item.as_ref().unwrap();
+    assert!(it.content.starts_with(&format!("nostr:{} could you", argon.node.keys.npub())));
+    assert_eq!(it.mentions[0].name, "Doctor Argon");
+    let info: pb::InfoResponse = argon.ok("info", &pb::Empty {}).await;
+    assert_eq!(info.unread, 1);
+    // reading clears the count, and it stays cleared after a restart of the state
+    let _: pb::NotificationsResponse = argon.ok("notifications", &pb::NotificationsRequest { mark_read: true, ..Default::default() }).await;
+    let n: pb::NotificationsResponse = argon.ok("notifications", &pb::NotificationsRequest::default()).await;
+    assert_eq!(n.unread, 0);
+    assert!(!n.notifications[0].unread);
+    let st: pb::NodeState = pb::decode(&std::fs::read(argon.dir.0.join("state.pb")).unwrap()).unwrap();
+    assert!(st.notifications_read > 0);
+    // Argon replies and opens a subtopic: the asker is told about both
+    let r: pb::Ack = argon.ok("post", &reply(&a.id, "That is the 696 nm argon line.")).await;
+    let s: pb::Ack = argon.ok("post", &pb::PostRequest { topic: a.id.clone(), title: "Calibrate the spectrometer".into(), content: "first".into(), ..Default::default() }).await;
+    let mut reasons = vec![];
+    for _ in 0..100 {
+        let n: pb::NotificationsResponse = asker.ok("notifications", &pb::NotificationsRequest::default()).await;
+        reasons = n.notifications.iter().map(|x| (x.reason.clone(), x.item.as_ref().unwrap().id.clone())).collect();
+        if reasons.len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    reasons.sort();
+    assert_eq!(reasons, [("reply".to_string(), r.id), ("subtopic".to_string(), s.id)]);
+}

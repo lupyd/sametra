@@ -48,7 +48,7 @@ export default function App() {
         </form>
         <nav class="top">
           <a href="/help" class={on('/help')}>Find help</a>
-          <a href="/inbox" class={on('/inbox')}>Inbox</a>
+          <a href="/inbox" class={on('/inbox')}>Inbox{info.value?.unread > 0 && <b class="count" aria-label={`${info.value.unread} unread`}>{info.value.unread}</b>}</a>
           <a href="/docs">Docs</a>
         </nav>
         <a class="me" href="/me">{info.value ? (info.value.name || info.value.npub.slice(0, 14) + '…') : '…'}</a>

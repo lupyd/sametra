@@ -156,6 +156,13 @@ fn view(st: &Store, rep: &RepTable, e: &Event, full: bool, cx: &Cx) -> Item {
         topic: e.topic_parent().filter(|_| e.kind == K_POST).map(|p| p.hex()).unwrap_or_default(),
         subtopics: if e.kind == K_POST { subtopics_of(st, &e.id).len() as u32 } else { 0 },
         root: e.root().filter(|_| e.kind == K_REPLY).map(|p| p.hex()).unwrap_or_default(),
+        mentions: e
+            .tags
+            .iter()
+            .filter(|t| t.len() >= 4 && t[0] == "p" && t[3] == "mention")
+            .filter_map(|t| H32::from_hex(&t[1]))
+            .map(|pk| Mention { pubkey: pk.hex(), npub: npub(&pk), name: name_of(st, &pk) })
+            .collect(),
         text_match: 0.0,
     }
 }
@@ -230,6 +237,7 @@ async fn info(node: &Arc<Node>, _: Empty) -> R<InfoResponse> {
         relay_all: node.cfg.relay_all,
         peers: node.peers.lock().unwrap().len() as u32,
         public_addr: node.cfg.public_addr.clone().unwrap_or_default(),
+        unread: addressed_to_me(&st, &node.keys.pubkey, node.notifications_read.load(std::sync::atomic::Ordering::Relaxed), 1000).len() as u32,
     })
 }
 
@@ -662,8 +670,231 @@ async fn post(node: &Arc<Node>, r: PostRequest) -> R<Ack> {
         }
         tags.push(t("accept", a));
     }
-    let e = node.publish(kind, tags, r.content)?;
-    Ok(ack(Some(&e.id)))
+    let (content, mentioned, unresolved) = resolve_mentions(&node.store.lock().unwrap(), &node.keys.pubkey, &r.content);
+    for pk in &mentioned {
+        tags.push(vec!["p".into(), pk.hex(), "".into(), "mention".into()]);
+    }
+    // NIP-32 labels, so scoped nodes can subscribe to them (`#l`): mentions, and posts
+    // written from outside the community (e.g. answering a mention), addressed to the
+    // people they reply to; both travel through every node to reach them
+    let outsider = !node.cfg.relay_all
+        && tags.iter().any(|x| x[0] == "p")
+        && tags.iter().find(|x| x[0] == "c").is_none_or(|c| !node.joined.lock().unwrap().contains(&c[1]));
+    if !mentioned.is_empty() || outsider {
+        tags.push(t("L", "sametra"));
+        tags.push(vec!["l".into(), if mentioned.is_empty() { "addressed" } else { "mention" }.into(), "sametra".into()]);
+    }
+    let e = node.publish(kind, tags, content)?;
+    Ok(Ack { mentioned: mentioned.iter().map(npub).collect(), unresolved, ..ack(Some(&e.id)) })
+}
+
+// ---- people and mentions ------------------------------------------------------
+
+/// The @handle for a name: letters and digits only, so "Doctor Argon" is @DoctorArgon.
+pub fn handle_of(name: &str) -> String {
+    name.chars().filter(|c| c.is_alphanumeric() || *c == '_').collect()
+}
+
+/// Rewrite `@handle`, `@npub1…` and bare `nostr:npub1…` into NIP-27 `nostr:npub1…`
+/// references and collect who was mentioned (at most 10, never yourself). A handle
+/// matches a profile name ignoring case, spaces and punctuation; if several match,
+/// the most recently seen wins (the post's `p` tag records exactly who was meant).
+fn resolve_mentions(st: &Store, me: &H32, text: &str) -> (String, Vec<H32>, Vec<String>) {
+    let mut people: std::collections::HashMap<String, Vec<(H32, u64)>> = Default::default();
+    let mut out = String::with_capacity(text.len());
+    let (mut mentioned, mut unresolved): (Vec<H32>, Vec<String>) = (vec![], vec![]);
+    let add = |pk: H32, mentioned: &mut Vec<H32>| {
+        if pk != *me && !mentioned.contains(&pk) && mentioned.len() < 10 {
+            mentioned.push(pk);
+        }
+    };
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    let mut in_code = false;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '`' {
+            in_code = !in_code; // never rewrite inside code
+        }
+        let starts_word = i == 0 || !(chars[i - 1].is_alphanumeric() || chars[i - 1] == '_' || chars[i - 1] == '.');
+        if !in_code && c == '@' && starts_word {
+            let mut j = i + 1;
+            while j < chars.len() && (chars[j].is_alphanumeric() || chars[j] == '_') && j - i <= 64 {
+                j += 1;
+            }
+            let handle: String = chars[i + 1..j].iter().collect();
+            if !handle.is_empty() {
+                if let Some(pk) = handle.starts_with("npub1").then(|| parse_pubkey(&handle)).flatten() {
+                    add(pk, &mut mentioned);
+                    out.push_str(&format!("nostr:{}", npub(&pk)));
+                    i = j;
+                    continue;
+                }
+                if people.is_empty() {
+                    for p in st.query(&Filter { kinds: Some(vec![K_PROFILE]), ..Default::default() }, usize::MAX) {
+                        let h = handle_of(&profile_of(st, &p.pubkey).name).to_lowercase();
+                        if !h.is_empty() {
+                            people.entry(h).or_default().push((p.pubkey, st.last_seen.get(&p.pubkey).copied().unwrap_or(0)));
+                        }
+                    }
+                    people.entry(String::new()).or_default(); // loaded, even if nobody has a profile
+                }
+                match people.get(&handle.to_lowercase()).and_then(|v| v.iter().max_by_key(|x| (x.1, x.0))) {
+                    Some((pk, _)) => {
+                        add(*pk, &mut mentioned);
+                        out.push_str(&format!("nostr:{}", npub(pk)));
+                    }
+                    None => {
+                        if !unresolved.contains(&handle) {
+                            unresolved.push(handle.clone());
+                        }
+                        out.push('@');
+                        out.push_str(&handle);
+                    }
+                }
+                i = j;
+                continue;
+            }
+        }
+        if !in_code && c == 'n' && chars[i..].iter().take(11).collect::<String>() == "nostr:npub1" {
+            let tok: String = chars[i + 6..].iter().take_while(|c| c.is_ascii_alphanumeric()).collect();
+            if let Some(pk) = parse_pubkey(&tok) {
+                add(pk, &mut mentioned);
+            }
+        }
+        out.push(c);
+        i += 1;
+    }
+    (out, mentioned, unresolved)
+}
+
+/// Find people (humans and agents) by name, description or model.
+async fn find_people(node: &Arc<Node>, r: FindPeopleRequest) -> R<PeopleResponse> {
+    let q = r.query.trim().trim_start_matches('@').to_string();
+    let limit = if r.limit == 0 { 20 } else { r.limit.min(200) } as usize;
+    let hum = node.humanity();
+    let st = node.store.lock().unwrap();
+    let matches: std::collections::HashMap<H32, f64> = if q.is_empty() {
+        Default::default()
+    } else {
+        st.search(&q, 2000).into_iter().filter_map(|h| st.get(&h.id).filter(|e| e.kind == K_PROFILE).map(|e| (e.pubkey, h.score * if h.all { 1.0 } else { 0.4 }))).collect()
+    };
+    let caps: std::collections::HashMap<H32, u32> = st.query(&Filter { kinds: Some(vec![K_CAPABILITY]), ..Default::default() }, usize::MAX).iter().filter(|e| spec_of(e).is_some()).fold(Default::default(), |mut m, e| {
+        *m.entry(e.pubkey).or_default() += 1;
+        m
+    });
+    let qh = handle_of(&q).to_lowercase();
+    let now = now();
+    let mut out: Vec<(f64, Person)> = vec![];
+    for e in st.query(&Filter { kinds: Some(vec![K_PROFILE]), ..Default::default() }, usize::MAX) {
+        let p = profile_of(&st, &e.pubkey);
+        if (r.kind == "human" && p.agent) || (r.kind == "agent" && !p.agent) {
+            continue;
+        }
+        let handle = handle_of(&p.name);
+        let exact = !qh.is_empty() && handle.to_lowercase() == qh;
+        let prefix = !qh.is_empty() && handle.to_lowercase().starts_with(&qh);
+        let m = matches.get(&e.pubkey).copied().unwrap_or(0.0) + if exact { 10.0 } else if prefix { 3.0 } else { 0.0 };
+        if !q.is_empty() && m == 0.0 {
+            continue;
+        }
+        let seen = st.last_seen.get(&e.pubkey).copied().unwrap_or(0);
+        let recent = if now.saturating_sub(seen) < 86400 { 0.3 } else { 0.0 };
+        let c = caps.get(&e.pubkey).copied().unwrap_or(0);
+        let quality = 1.0 + hum.user(&e.pubkey).max(0.0) + recent + 0.2 * (1.0 + c as f64).ln();
+        out.push((
+            if q.is_empty() { seen as f64 } else { m * quality },
+            Person {
+                pubkey: e.pubkey.hex(),
+                npub: npub(&e.pubkey),
+                about: p.about.chars().take(280).collect(),
+                agent: p.agent,
+                model: p.model.clone(),
+                human_status: human_status(&st, &hum, &e.pubkey).into(),
+                humanity: round2(hum.user(&e.pubkey)),
+                last_seen: seen,
+                capabilities: c,
+                handle,
+                name: p.name,
+                text_match: round2(m),
+            },
+        ));
+    }
+    out.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.pubkey.cmp(&b.1.pubkey)));
+    Ok(PeopleResponse { people: out.into_iter().take(limit).map(|x| x.1).collect() })
+}
+
+/// Why an event concerns me, if it does (and is not mine).
+fn notification_reason(me: &H32, mine: &std::collections::HashSet<H32>, e: &Event) -> Option<&'static str> {
+    if e.pubkey == *me {
+        return None;
+    }
+    let to_me = |marker: Option<&str>| e.tags.iter().any(|t| t.len() >= 2 && t[0] == "p" && H32::from_hex(&t[1]) == Some(*me) && marker.is_none_or(|m| t.get(3).map(String::as_str) == Some(m)));
+    if to_me(Some("mention")) {
+        return Some("mention");
+    }
+    match e.kind {
+        K_JOB if to_me(None) => Some("request"),
+        K_REPLY if e.parent().is_some_and(|p| mine.contains(&p)) => Some("reply"),
+        K_POST if e.topic_parent().is_some_and(|p| mine.contains(&p)) => Some("subtopic"),
+        K_POST | K_REPLY if e.tags_named("q").filter_map(H32::from_hex).any(|q| mine.contains(&q)) => Some("citation"),
+        _ => None,
+    }
+}
+
+/// Events addressed to me newer than `since`, newest first.
+fn addressed_to_me(st: &Store, me: &H32, since: u64, cap: usize) -> Vec<(&'static str, Ev)> {
+    let mine: std::collections::HashSet<H32> = st
+        .query(&Filter { authors: Some(vec![me.hex()]), kinds: Some(vec![K_POST, K_REPLY]), ..Default::default() }, usize::MAX)
+        .iter()
+        .map(|e| e.id)
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut out = vec![];
+    // things that tag me, and things that reply to, cite or extend my posts
+    let mut cands: Vec<Ev> = st.query(&Filter { tags: vec![("p".into(), vec![me.hex()])], since: Some(since + 1), ..Default::default() }, usize::MAX);
+    for id in &mine {
+        cands.extend(st.referencing(id).into_iter().filter(|e| e.created_at > since));
+    }
+    cands.sort_by_key(|e| std::cmp::Reverse((e.created_at, e.id)));
+    for e in cands {
+        if !seen.insert(e.id) {
+            continue;
+        }
+        if let Some(why) = notification_reason(me, &mine, &e) {
+            out.push((why, e));
+            if out.len() >= cap {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// What concerns me: mentions, replies, subtopics, citations, capability requests.
+async fn notifications(node: &Arc<Node>, r: NotificationsRequest) -> R<NotificationsResponse> {
+    let limit = if r.limit == 0 { 50 } else { r.limit.min(500) } as usize;
+    let read = node.notifications_read.load(std::sync::atomic::Ordering::Relaxed);
+    let cx = Cx::of(node);
+    let (out, newest) = {
+        let st = node.store.lock().unwrap();
+        let all = addressed_to_me(&st, &node.keys.pubkey, 0, limit);
+        let unread = all.iter().filter(|(_, e)| e.created_at > read).count() as u32;
+        let newest = all.iter().map(|(_, e)| e.created_at).max().unwrap_or(0);
+        let mut reps: std::collections::HashMap<String, Arc<RepTable>> = Default::default();
+        let mut list = vec![];
+        for (why, e) in &all {
+            let c = e.community().unwrap_or("").to_string();
+            let rep = reps.entry(c.clone()).or_insert_with(|| Arc::new(RepTable::default())).clone();
+            list.push(Notification { reason: why.to_string(), item: Some(view(&st, &rep, e, false, &cx)), unread: e.created_at > read });
+        }
+        (NotificationsResponse { notifications: list, unread }, newest)
+    };
+    if r.mark_read && newest > read {
+        node.notifications_read.store(newest, std::sync::atomic::Ordering::Relaxed);
+        node.save_state();
+    }
+    Ok(out)
 }
 
 /// Rate a person or a message. Aspects: "trust" (default; accuracy, feeds the
@@ -1287,6 +1518,30 @@ mod tests {
 
     fn test_cx(n: &Arc<Node>) -> Cx {
         Cx { me: n.keys.pubkey, hum: Default::default() }
+    }
+
+    #[test]
+    fn mentions_resolve_handles_and_keys() {
+        let n = node();
+        let (argon, other_argon, ada) = (Keys::generate(), Keys::generate(), Keys::generate());
+        n.ingest(argon.sign_at(K_PROFILE, vec![], r#"{"name":"Doctor Argon"}"#.into(), now() - 100), 1, false).unwrap();
+        n.ingest(other_argon.sign_at(K_PROFILE, vec![], r#"{"name":"doctor-argon"}"#.into(), now() - 5000), 1, false).unwrap();
+        n.ingest(ada.sign(K_PROFILE, vec![], r#"{"name":"Ada"}"#.into()), 1, false).unwrap();
+        n.store.lock().unwrap().touch(argon.pubkey, now());
+        let me = n.keys.pubkey;
+        let st = n.store.lock().unwrap();
+        let (text, who, missing) = resolve_mentions(&st, &me, "Ping @DoctorArgon and @ada, not @nobody or mail@ada.org; `@ada` in code stays.");
+        assert_eq!(who, [argon.pubkey, ada.pubkey], "most recently seen Argon wins; emails and code are not mentions");
+        assert_eq!(missing, ["nobody"]);
+        assert!(text.starts_with(&format!("Ping nostr:{} and nostr:{}, not @nobody or mail@ada.org; `@ada`", argon.npub(), ada.npub())));
+        let (text, who, _) = resolve_mentions(&st, &me, &format!("cc @{} and nostr:{}", ada.npub(), argon.npub()));
+        assert_eq!(who, [ada.pubkey, argon.pubkey]);
+        assert_eq!(text, format!("cc nostr:{} and nostr:{}", ada.npub(), argon.npub()));
+        let (_, who, _) = resolve_mentions(&st, &me, &format!("@{}", npub(&me)));
+        assert!(who.is_empty(), "never yourself");
+        let many: String = (0..20).map(|_| format!("@{} ", Keys::generate().npub())).collect();
+        assert_eq!(resolve_mentions(&st, &me, &many).1.len(), 10, "at most 10");
+        assert_eq!(handle_of("Doctor Argon, PhD"), "DoctorArgonPhD");
     }
 
     #[test]

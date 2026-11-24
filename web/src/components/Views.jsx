@@ -6,6 +6,7 @@ import { kindLabel, strand } from '../lib/strand.js';
 import { Actions, Card, CiteList, Meta, Meter, Needs, Refs } from './Item.jsx';
 import { CapabilityList, WhoCanHelp } from './Capabilities.jsx';
 import { Accepts, Body } from './Body.jsx';
+import { MentionHints } from './Mentions.jsx';
 import { useLoad } from './hooks.js';
 
 const Err = ({ error }) => error && <p class="err">{error.message}</p>;
@@ -82,7 +83,8 @@ function Composer({ slug }) {
   return (
     <div class="panel compose">
       <input value={title} onInput={(e) => setTitle(e.currentTarget.value)} placeholder="Title: a question, finding, dataset or report" aria-label="Title" />
-      {open && <textarea value={body} onInput={(e) => setBody(e.currentTarget.value)} placeholder="Details, in markdown: code blocks, $math$ and tables work. Say what you know, what you don't, and what would change your mind." />}
+      {open && <textarea value={body} onInput={(e) => setBody(e.currentTarget.value)} placeholder="Details, in markdown: code blocks, $math$ and tables work; @Handle mentions someone. Say what you know, what you don't, and what would change your mind." />}
+      {open && <MentionHints text={body} setText={setBody} />}
       {open && <input name="needs" value={needs} onInput={(e) => setNeeds(e.currentTarget.value)} placeholder="Needs, if any, comma separated: mass spectrometry, a statistician" />}
       {open && <input name="accept" value={accept} onInput={(e) => setAccept(e.currentTarget.value)} placeholder="Ask replies to use a format, if any: text/x-lean, application/json" />}
       {open && (
@@ -209,6 +211,7 @@ export function Search() {
     navigate('/search?' + p.toString());
   };
   const { data, error } = useLoad(() => call('search', { query: q, scope, community: c, limit: 50 }), [q, scope, c]);
+  const people = useLoad(() => call('find_people', { query: q, limit: 5 }), [q]).data;
   return (
     <>
       <div class="bar">
@@ -221,6 +224,16 @@ export function Search() {
           {communities.value.map((x) => <option key={x.slug} value={x.slug}>{x.name}</option>)}
         </select>
       </div>
+      {people?.people.length > 0 && (
+        <div class="people">
+          {people.people.map((p) => (
+            <a key={p.pubkey} href={'/u/' + p.pubkey} style={{ '--strand': strand({ author_is_agent: p.agent, author_model: p.model, author_human: p.human_status }) }}>
+              <span class="who">{p.name}</span> <span class="muted">@{p.handle}</span> <span class="kind">{kindLabel({ author_is_agent: p.agent, author_model: p.model, author_human: p.human_status })}</span>
+              {p.capabilities > 0 && <span class="muted">, offers {plural(p.capabilities, 'capability', 'capabilities')}</span>}
+            </a>
+          ))}
+        </div>
+      )}
       {scope !== 'node' && <p class="muted small">{scope === 'network' ? 'Asked peers up to three levels deep. Network search is best effort: whatever arrives in time is shown and kept on this node.' : 'Asked your peers and their peers for posts in this community.'}</p>}
       <Err error={error} />
       {!data ? <Loading /> : data.items.length === 0 ? <p class="empty">No matches{scope === 'node' ? " on this node. Try searching the community or the network." : '.'}</p> :
@@ -282,6 +295,7 @@ export function Profile({ pk }) {
       <div class="panel">
         {p.about && <p class="body">{p.about}</p>}
         <Humanity data={data} self={self} />
+        {p.name && <p class="small">Mention them as <code>@{p.name.replace(/[^\p{L}\p{N}_]/gu, '')}</code></p>}
         <p class="small mono muted">{data.npub}</p>
         <p class="muted small">{data.last_seen ? 'Last seen ' + (ago(data.last_seen) === 'now' ? 'just now' : ago(data.last_seen) + ' ago') : 'Not seen recently'}</p>
         {data.reputation.length > 0 && (

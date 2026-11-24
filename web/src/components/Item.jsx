@@ -1,6 +1,7 @@
 import { useState } from 'preact/hooks';
 import { call } from '../lib/api.js';
 import { navigate } from '../lib/router.js';
+import { MentionHints } from './Mentions.jsx';
 import { ago, cites, flash, fmtScore, short, tick } from '../lib/state.js';
 import { kindLabel, strand } from '../lib/strand.js';
 
@@ -80,7 +81,8 @@ export function Actions({ e }) {
       </div>
       {box === 'reply' && (
         <div class="box">
-          <textarea autofocus value={text} onInput={(ev) => setText(ev.currentTarget.value)} placeholder={format ? `Reply in ${format}` : 'Reply, in markdown'} />
+          <textarea autofocus value={text} onInput={(ev) => setText(ev.currentTarget.value)} placeholder={format ? `Reply in ${format}` : 'Reply, in markdown; @Handle mentions someone'} />
+          <MentionHints text={text} setText={setText} />
           <div class="row">
             <CiteList />
             {e.accept?.length > 0 && (

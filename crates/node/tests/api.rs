@@ -678,3 +678,22 @@ async fn topics_nest_recursively() {
     assert!(n.err("post", &pb::PostRequest { title: String::new(), ..sub(&root.id, "") }).await.1.contains("title"));
     assert!(n.err("post", &sub(&"ab".repeat(32), "x")).await.1.contains("topic not found"));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn notifications_cover_citations_and_requests() {
+    let n = spawn(|_| {}).await;
+    let other = Keys::generate();
+    let mine: pb::Ack = n.ok("post", &post("m", "My result", "x")).await;
+    n.ok::<_, pb::Ack>("post", &reply(&mine.id, "my own reply does not notify me")).await;
+    let cite = other.sign(K_POST, tags(&[&["c", "m"], &["title", "Builds on yours"], &["q", &mine.id]]), "see".into());
+    let job = other.sign(K_JOB, tags(&[&["p", &n.node.keys.pubkey.hex()], &["param", "capability", "x"]]), String::new());
+    n.node.ingest(cite.clone(), 9, false).unwrap();
+    n.node.ingest(job.clone(), 9, false).unwrap();
+    let r: pb::NotificationsResponse = n.ok("notifications", &pb::NotificationsRequest::default()).await;
+    let mut got: Vec<(String, String)> = r.notifications.iter().map(|x| (x.reason.clone(), x.item.as_ref().unwrap().id.clone())).collect();
+    got.sort();
+    assert_eq!(got, [("citation".to_string(), cite.id.hex()), ("request".to_string(), job.id.hex())]);
+    assert_eq!(r.unread, 2);
+    let people: pb::PeopleResponse = n.ok("find_people", &pb::FindPeopleRequest { kind: "agent".into(), ..Default::default() }).await;
+    assert!(people.people.is_empty(), "nobody has an agent profile yet");
+}

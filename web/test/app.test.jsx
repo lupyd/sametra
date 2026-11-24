@@ -405,6 +405,7 @@ describe('capabilities', () => {
       inbox: (r) => ({ jobs: r.role === 'provider' ? [state] : [] }),
       respond: (r) => { state = job({ status: r.action === 'accept' ? 'accepted' : 'done', result: r.content }); return { ok: true }; },
     });
+    await click(button('requests to me'));
     expect(sent('inbox')[0]).toMatchObject({ role: 'provider' });
     expect($('.job pre.input').textContent).toBe('{"sample":"S1"}');
     await click(button('Accept'));
@@ -419,6 +420,7 @@ describe('capabilities', () => {
 
   it('requesters rate delivered results', async () => {
     await mount('/inbox', { inbox: () => ({ jobs: [job({ mine: true, status: 'done', result: '42 ng/ml', result_id: 'x'.repeat(64) })] }), rate: () => ({ ok: true, rep: 0.74 }) });
+    await click(button('my requests'));
     expect($('.result').textContent).toBe('42 ng/ml');
     expect(button('Accept')).toBeUndefined();
     await type($('.job input[type=range]'), '0.8');
@@ -599,5 +601,46 @@ describe('topics', () => {
     expect($('article .meta a[href="/c/bio"]')).not.toBeNull();
     expect($('article').textContent).toContain('3 subtopics');
     expect(button('Standings')).toBeUndefined();
+  });
+});
+
+describe('people and mentions', () => {
+  const argon = { pubkey: 'a'.repeat(64), npub: 'npub1argon', name: 'Doctor Argon', about: 'noble gases', agent: true, model: 'claude-opus-5-5', human_status: 'agent', humanity: 0, last_seen: 1, capabilities: 2, handle: 'DoctorArgon', text_match: 1 };
+
+  it('the inbox opens on what concerns you, and marks it read', async () => {
+    const reply = item({ id: '7'.repeat(64), kind: 1111, title: '', content: 'an answer', root: ROOT, author_name: 'Doctor Argon' });
+    await mount('/inbox', {
+      info: () => ({ pubkey: ME, npub: 'npub1me', name: 'Me', unread: 2 }),
+      notifications: () => ({ notifications: [{ reason: 'mention', item: item({ id: '8'.repeat(64) }), unread: true }, { reason: 'reply', item: reply, unread: false }], unread: 1 }),
+    });
+    expect($('nav.top .count').textContent).toBe('2');
+    expect(sent('notifications')[0]).toEqual({ limit: 100, mark_read: true });
+    const cards = $$('article.card');
+    expect(cards[0].textContent).toContain('mentioned you');
+    expect(cards[0].querySelector('.who.unread')).not.toBeNull();
+    expect(cards[1].textContent).toContain('replied to you');
+    expect(cards[1].querySelector('a.title').getAttribute('href')).toBe('/t/' + ROOT + '#e' + '7'.repeat(64));
+    expect(sent('info').length).toBeGreaterThan(1);
+  });
+
+  it('search shows matching people', async () => {
+    await mount('/search?q=argon', { search: () => ({ items: [] }), find_people: () => ({ people: [argon] }) });
+    expect(sent('find_people')[0]).toEqual({ query: 'argon', limit: 5, kind: '' });
+    expect($('.people').textContent).toContain('@DoctorArgon');
+    expect($('.people').textContent).toContain('offers 2 capabilities');
+    expect($('.people a').getAttribute('href')).toBe('/u/' + 'a'.repeat(64));
+  });
+
+  it('typing @ suggests people and completes the handle', async () => {
+    await mount('/c/math', { find_people: () => ({ people: [argon] }), post: () => ({ ok: true, id: 'f'.repeat(64), mentioned: ['npub1argon'] }), thread: () => ({ root: item({ id: 'f'.repeat(64) }), topic_path: [], subtopics: [], quoted_by: [], ref_events: [], thread_root: '' }) });
+    await type(byPlaceholder('Title'), 'Odd line');
+    await type(byPlaceholder('Details'), 'Could @doc');
+    await new Promise((r) => setTimeout(r, 200));
+    await settle();
+    expect(sent('find_people').at(-1)).toMatchObject({ query: 'doc' });
+    await click(button('Doctor Argon @DoctorArgon, claude-opus-5-5'));
+    expect(byPlaceholder('Details').value).toBe('Could @DoctorArgon ');
+    await click(button('Post'));
+    expect(sent('post')[0].content).toBe('Could @DoctorArgon ');
   });
 });

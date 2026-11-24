@@ -102,6 +102,8 @@ pub struct Node {
     seen: Mutex<HashMap<H32, u64>>, // recent ephemeral ids
     rep_cache: Mutex<HashMap<String, Arc<RepTable>>>,
     pub memory: Mutex<BTreeMap<String, String>>,
+    /// notifications up to this time have been seen
+    pub notifications_read: AtomicU64,
     /// community -> participants announcing it in heartbeats -> last seen
     members: Mutex<HashMap<String, HashMap<H32, u64>>>,
     /// recently seen search subscription ids (loop guard for forwarded searches)
@@ -169,6 +171,7 @@ impl Node {
             seen: Mutex::new(HashMap::new()),
             rep_cache: Mutex::new(HashMap::new()),
             memory: Mutex::new(memory),
+            notifications_read: AtomicU64::new(state.notifications_read),
             members: Mutex::new(HashMap::new()),
             searches: Mutex::new(HashMap::new()),
             search_slots: Arc::new(tokio::sync::Semaphore::new(8)),
@@ -195,6 +198,7 @@ impl Node {
             peers: self.book.lock().unwrap().iter().filter(|(_, i)| i.fails < 8).map(|(a, _)| a.clone()).collect(),
             pins,
             popularity,
+            notifications_read: self.notifications_read.load(Ordering::Relaxed),
         };
         write_atomic(&self.cfg.data.join("state.pb"), &pb::encode(&st));
     }
@@ -212,6 +216,8 @@ impl Node {
             || e.community().is_some_and(|c| self.joined.lock().unwrap().contains(c))
             // capability requests, results and feedback addressed to us
             || e.tags_named("p").any(|p| H32::from_hex(p) == Some(self.keys.pubkey))
+            // mentions travel through every node so they reach the people named
+            || is_mention(e)
     }
 
     /// Validate, store and fan out an event. `force` stores even if outside our interests
@@ -352,6 +358,8 @@ impl Node {
         let joined: Vec<String> = self.joined.lock().unwrap().iter().cloned().collect();
         let mut f = vec![Filter { kinds: Some(GLOBAL_KINDS.to_vec()), since: Some(since), ..Default::default() }, hb];
         f.push(Filter { tags: vec![("p".into(), vec![self.keys.pubkey.hex()])], since: Some(since), ..Default::default() });
+        // mentions of anyone: relayed by every node so they reach the people named
+        f.push(Filter { tags: vec![("l".into(), vec!["mention".into(), "addressed".into()])], since: Some(since), ..Default::default() });
         if !joined.is_empty() {
             f.push(Filter { tags: vec![("c".into(), joined)], since: Some(since), limit: Some(20000), ..Default::default() });
         }
@@ -421,6 +429,15 @@ impl Node {
     pub fn peer_list(&self) -> Vec<pb::Peer> {
         self.peers.lock().unwrap().values().map(|p| pb::Peer { addr: p.addr.clone(), outbound: p.outbound, since: p.since }).collect()
     }
+}
+
+/// Is the event addressed to people beyond its community: it @mentions someone
+/// (`["p", pubkey, relay, "mention"]`), or is labelled `addressed` (written from
+/// outside the community to the people it replies to)? Such events travel through
+/// every node, labelled (`["l", ...]`) so scoped nodes can subscribe to them.
+pub fn is_mention(e: &Event) -> bool {
+    e.tags.iter().any(|t| t.len() >= 4 && t[0] == "p" && t[3] == "mention")
+        || (e.tags.iter().any(|t| t.len() >= 2 && t[0] == "l" && t[1] == "addressed") && e.tags_named("p").next().is_some())
 }
 
 fn write_atomic(path: &std::path::Path, bytes: &[u8]) {

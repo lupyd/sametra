@@ -159,7 +159,7 @@ mod golden {
             ("FetchRequest", encode(&FetchRequest {
                 filter: Some(Filter { kinds: vec![11, 1111], tags: vec![TagFilter { name: "c".into(), values: vec!["m".into()] }], since: 1700000000, limit: 5, ..Default::default() }),
             })),
-            ("Ack", encode(&Ack { ok: true, id: "x".into(), count: 3, rep: -1.5, community: "m".into() })),
+            ("Ack", encode(&Ack { ok: true, id: "x".into(), count: 3, rep: -1.5, community: "m".into(), ..Default::default() })),
             ("IdRequest", encode(&IdRequest { id: "i".into(), thread: true })),
         ]
     }

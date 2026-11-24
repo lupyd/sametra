@@ -28,6 +28,8 @@ macro_rules! tools {
             chain: ChainRequest => ChainResponse, false;
             search: SearchRequest => Items, false;
             find_communities: FindCommunitiesRequest => CommunitiesResponse, false;
+            find_people: FindPeopleRequest => PeopleResponse, false;
+            notifications: NotificationsRequest => NotificationsResponse, true;
             post: PostRequest => Ack, true;
             rate: RateRequest => Ack, true;
             reputation: ReputationRequest => ReputationResponse, false;

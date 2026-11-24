@@ -2,9 +2,9 @@
 import { useState } from 'preact/hooks';
 import { call } from '../lib/api.js';
 import { navigate, query } from '../lib/router.js';
-import { ago, flash, fmtScore, short, tick } from '../lib/state.js';
+import { ago, flash, fmtScore, refreshNode, short, tick } from '../lib/state.js';
 import { strand } from '../lib/strand.js';
-import { Meter } from './Item.jsx';
+import { Card, Meter } from './Item.jsx';
 import { useLoad } from './hooks.js';
 
 const done = (msg) => { flash(msg); tick.value++; };
@@ -133,17 +133,51 @@ function CapabilityEditor() {
 }
 
 export function Inbox() {
-  const [role, setRole] = useState('provider');
-  const { data, error } = useLoad(() => call('inbox', { role, limit: 100 }), [role]);
+  const [role, setRole] = useState('notes');
+  if (role === 'notes') return <InboxShell role={role} setRole={setRole}><Notifications openRequests={() => setRole('provider')} /></InboxShell>;
+  return <InboxShell role={role} setRole={setRole}><Jobs role={role} /></InboxShell>;
+}
+
+const REASONS = { mention: 'mentioned you', reply: 'replied to you', subtopic: 'opened a subtopic under your topic', citation: 'built on your post', request: 'asked for your help' };
+
+function Notifications({ openRequests }) {
+  const { data, error } = useLoad(async () => { const r = await call('notifications', { limit: 100, mark_read: true }); refreshNode(); return r; }, []);
+  if (error) return <p class="err">{error.message}</p>;
+  if (!data) return <p class="muted">Loading…</p>;
+  if (data.notifications.length === 0) return <p class="empty">Nothing yet. When someone mentions you with your @handle, replies to you, or builds on your posts, it shows up here.</p>;
+  return data.notifications.map((n) => {
+    const e = n.item;
+    return (
+      <Card key={e.id + n.reason} e={e}>
+        <div class="meta"><span class={'who' + (n.unread ? ' unread' : '')}>{e.author_name}</span><span>{REASONS[n.reason] || n.reason}</span><span>{ago(e.created_at)}</span>{e.community && <span>in {e.community}</span>}</div>
+        {n.reason === 'request'
+          ? <button class="link title" onClick={openRequests}>Open requests to me</button>
+          : <a class="title" href={'/t/' + (e.kind === 1111 && e.root ? e.root + '#e' + e.id : e.id)}>{e.title || e.content.split('\n')[0].slice(0, 120)}</a>}
+      </Card>
+    );
+  });
+}
+
+function InboxShell({ role, setRole, children }) {
   return (
     <>
       <div class="bar">
         <h2 class="grow">Inbox</h2>
         <div class="seg" role="tablist">
+          <button class={role === 'notes' ? 'on' : ''} onClick={() => setRole('notes')}>for you</button>
           <button class={role === 'provider' ? 'on' : ''} onClick={() => setRole('provider')}>requests to me</button>
           <button class={role === 'requester' ? 'on' : ''} onClick={() => setRole('requester')}>my requests</button>
         </div>
       </div>
+      {children}
+    </>
+  );
+}
+
+function Jobs({ role }) {
+  const { data, error } = useLoad(() => call('inbox', { role, limit: 100 }), [role]);
+  return (
+    <>
       {error && <p class="err">{error.message}</p>}
       {!data ? <p class="muted">Loading…</p> : data.jobs.length === 0 ? <p class="empty">{role === 'provider' ? 'No requests yet. Offer capabilities on your profile.' : 'You have not requested anything yet. Try Find help.'}</p> :
         data.jobs.map((j) => <JobCard key={j.id} j={j} />)}
