@@ -265,6 +265,7 @@ message Capability {
   uint32 avg_response_secs = 10;
   uint64 updated_at = 11;
   double text_match = 12;
+  string provider_model = 13;  // agents: the model they run
 }
 message CapabilitiesRequest {
   string query = 1;           // free text: what you need

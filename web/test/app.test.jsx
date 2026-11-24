@@ -52,7 +52,8 @@ describe('shell', () => {
     expect(links.map((a) => a.getAttribute('href'))).toEqual(['/c/math', '/c/bio']);
     expect(links[0].className).toContain('on');
     expect(links[1].textContent).toContain('○ Biology'); // not joined
-    expect($('aside').textContent).toContain('1 peers · 7 cached');
+    expect($('aside').textContent).toContain('Connected to 1 peer. 7 events kept on this node.');
+    expect($('header button.theme')).not.toBeNull();
     expect($$('header nav.top a').map((a) => a.getAttribute('href'))).toEqual(['/help', '/inbox', '/docs']);
     expect($('aside a[href="/communities"]')).not.toBeNull();
   });
@@ -66,13 +67,13 @@ describe('shell', () => {
   it('home welcomes a fresh node', async () => {
     await mount('/', { communities: () => ({ communities: [] }) });
     expect(root.textContent).toContain('Welcome to Sametra');
-    expect(root.textContent).toContain('None yet');
-    expect($('main a[href="/docs"]').textContent).toBe('Read the docs');
+    expect(root.textContent).toContain('You have not joined any yet.');
+    expect($('main a[href="/docs"]').textContent).toBe('Read how it works');
   });
 
   it('unknown routes say so', async () => {
     await mount('/x/y/z');
-    expect($('main').textContent).toBe('Not found.');
+    expect($('main').textContent).toContain('There is nothing at this address');
   });
 
   it('header search navigates', async () => {
@@ -95,15 +96,15 @@ describe('shell', () => {
 
   it('creates and joins communities from the sidebar', async () => {
     await mount('/c/math', { create_community: (r) => ({ ok: true, community: r.slug }), join: (r) => ({ ok: true, community: r.community }) });
-    expect(button('Create').disabled).toBe(true);
-    await type(byPlaceholder('slug'), 'oncology');
-    await type(byPlaceholder('name'), 'Oncology');
-    await type(byPlaceholder('what it works on'), 'tumours');
-    await click(button('Create'));
+    expect(button('Start').disabled).toBe(true);
+    await type(byPlaceholder('Short name'), 'oncology');
+    await type(byPlaceholder('Display name'), 'Oncology');
+    await type(byPlaceholder('What it works on'), 'tumours');
+    await click(button('Start'));
     expect(sent('create_community')).toEqual([{ slug: 'oncology', name: 'Oncology', about: 'tumours' }]);
     expect(loc.value).toBe('/c/oncology');
-    expect(byPlaceholder('slug').value).toBe('');
-    await type(byPlaceholder('slug'), 'chem');
+    expect(byPlaceholder('Short name').value).toBe('');
+    await type(byPlaceholder('Short name'), 'chem');
     await click(button('Join'));
     expect(sent('join')).toEqual([{ community: 'chem' }]);
     expect(loc.value).toBe('/c/chem');
@@ -121,13 +122,13 @@ describe('feed', () => {
     const card = $('article.card');
     expect(card.querySelector('a.title').getAttribute('href')).toBe('/t/' + ROOT);
     expect(card.textContent).toContain('2 replies');
-    const tags = [...card.querySelectorAll('.tag')].map((t) => t.textContent);
-    expect(tags).toEqual(expect.arrayContaining(['rep 0.45', 'score -0.4', 'agent']));
+    const meters = [...card.querySelectorAll('.meter')].map((m) => m.textContent);
+    expect(meters).toEqual(['standing+0.5', 'accuracy-0.4']);
+    expect(card.querySelector('.meter.neg').textContent).toBe('accuracy-0.4');
+    expect(card.querySelector('.kind').textContent).toBe('AI agent');
+    expect(card.style.getPropertyValue('--strand')).toMatch(/^var\(--s[1-6]\)$/);
     expect(card.querySelector('.meta a[href^="/t/cccc"]').textContent).toBe('cccccccc');
-    const sel = $('select');
-    sel.value = 'new';
-    await act(() => sel.dispatchEvent(new Event('change', { bubbles: true })));
-    await settle();
+    await click(button('new'));
     expect(sent('feed').at(-1).sort).toBe('new');
     expect($('a.title').textContent).toBe('Newest');
   });
@@ -136,13 +137,14 @@ describe('feed', () => {
     await mount('/c/math', { feed: () => ({ items: [item({ low_trust: true, author_rep: -0.6 })] }) });
     expect($('article').className).toContain('low');
     expect($('article').textContent).toContain('Body text');
-    expect($$('.tag.bad').map((t) => t.textContent)).toEqual(['rep -0.6', 'low trust']);
+    expect($('article .meta').textContent).toContain('low trust');
+    expect($('article .meter.neg').textContent).toBe('standing-0.6');
   });
 
   it('shows an empty state and a join button for unjoined communities', async () => {
     await mount('/c/bio', { feed: () => ({ items: [] }), join: () => ({ ok: true, community: 'bio' }) });
     expect(root.textContent).toContain('Nothing here yet');
-    await click(button('join'));
+    await click(button('Join', $('main')));
     expect(sent('join')).toEqual([{ community: 'bio' }]);
   });
 
@@ -153,7 +155,7 @@ describe('feed', () => {
     await type(byPlaceholder('Title'), 'Is P = NP?');
     expect(button('Post').disabled).toBe(true);
     await type(byPlaceholder('Details'), 'Asking for a friend');
-    expect(root.textContent).toContain('citing cccccccc');
+    expect(root.textContent).toContain('builds on cccccccc');
     await click(button('Post'));
     expect(sent('post')).toEqual([{ community: 'math', title: 'Is P = NP?', content: 'Asking for a friend', parent: '', refs: ['c'.repeat(64)], needs: [] }]);
     expect(loc.value).toBe('/t/' + 'f'.repeat(64));
@@ -188,15 +190,16 @@ describe('thread', () => {
     expect($('#e' + R1 + ' .replies #e' + R2 + ' > .body').textContent).toBe('nested');
     expect($('a.back').getAttribute('href')).toBe('/c/math');
     const sections = $$('h3.section').map((h) => h.textContent);
-    expect(sections).toEqual(['Cites', 'Cited by']);
+    expect(sections).toEqual(['Builds on', 'Built upon by']);
+    expect($('a[href="/chain/' + ROOT + '"]')).not.toBeNull();
     expect(root.textContent).toContain('A cited source');
     expect(root.textContent).toContain('A citing thread');
-    expect(button('whole thread')).toBeUndefined();
+    expect($$('a.btn').find((a) => a.textContent === 'Whole thread')).toBeUndefined();
   });
 
   it('links a reply back to its whole thread', async () => {
     await mount('/t/' + R1, { thread: () => thread({ thread_root: ROOT }) });
-    expect($$('a.btn').find((a) => a.textContent === 'whole thread').getAttribute('href')).toBe('/t/' + ROOT);
+    expect($$('a.btn').find((a) => a.textContent === 'Whole thread').getAttribute('href')).toBe('/t/' + ROOT);
   });
 
   it('shows lookup errors', async () => {
@@ -222,10 +225,10 @@ describe('thread', () => {
     expect([slider.min, slider.max, slider.step]).toEqual(['-1', '1', '0.1']);
     await type(slider, '-0.4');
     expect($('.box b').textContent).toBe('-0.4');
-    await type(byPlaceholder('reason'), 'not replicated');
+    await type(byPlaceholder('Why'), 'not replicated');
     await click(button('Rate'));
     expect(sent('rate')).toEqual([{ score: -0.4, event: R1, target: '', community: '', reason: 'not replicated', aspect: 'trust', capability: '' }]);
-    expect(toast.value).toContain('-0.12');
+    expect(toast.value).toBe("Rated. The author's standing is now -0.1");
   });
 
   it('cites, pins and deletes', async () => {
@@ -233,8 +236,8 @@ describe('thread', () => {
     globalThis.confirm = confirm;
     await mount('/t/' + ROOT, { thread: () => thread(), pin: () => ({ ok: true, count: 3 }), delete: () => ({ ok: true }) });
     const acts = $('#e' + ROOT + ' > .acts');
-    await click(button('cite', acts));
-    await click(button('cite', acts));
+    await click(button('build on', acts));
+    await click(button('build on', acts));
     expect(cites.value).toEqual([ROOT]);
     await click(button('pin', acts));
     expect(sent('pin')).toEqual([{ id: ROOT, thread: true }]);
@@ -256,14 +259,14 @@ describe('other views', () => {
     await mount('/c/math/reputation', { reputation: () => ({ entries: [{ pubkey: 'p1', name: 'Good', rep: 0.75, raters: 4 }, { pubkey: 'p2', name: 'Troll', rep: -0.8, raters: 6 }] }) });
     expect(sent('reputation')[0]).toEqual({ community: 'math', pubkey: '' });
     const rows = $$('table.rep tbody tr').map((r) => [...r.children].map((c) => c.textContent));
-    expect(rows).toEqual([['Good', '0.75', '4'], ['Troll', '-0.8', '6']]);
+    expect(rows).toEqual([['Good', '+0.8', '4'], ['Troll', '-0.8', '6']]);
     expect($$('td.neg').length).toBe(1);
     expect($('main a[href="/docs/reputation"]')).not.toBeNull();
   });
 
   it('reputation empty state', async () => {
     await mount('/c/math/reputation', { reputation: () => ({ entries: [] }) });
-    expect(root.textContent).toContain('No ratings yet.');
+    expect(root.textContent).toContain('Nobody here has been rated yet.');
   });
 
   it('search results', async () => {
@@ -280,11 +283,11 @@ describe('other views', () => {
     });
     expect(sent('profile')[0]).toEqual({ pubkey: '' });
     await settle(); // NodePanel loads peers after the profile arrives
-    expect(root.textContent).toContain('last seen just now');
+    expect(root.textContent).toContain('Last seen just now');
     expect(root.textContent).toContain('npub1me');
     expect($('table.rep a[href="/c/math"]')).not.toBeNull();
     expect(root.textContent).toContain('ws://peer:7447');
-    expect(root.textContent).toContain('relaying everything');
+    expect(root.textContent).toContain('Relaying everything');
     await type(byPlaceholder('display name'), 'New name');
     const cb = $('input[type=checkbox]');
     cb.checked = true;
@@ -299,7 +302,7 @@ describe('other views', () => {
     await mount('/u/' + 'b'.repeat(64), { profile: () => ({ pubkey: 'b'.repeat(64), npub: 'npub1them', profile: { name: 'Bot', agent: true }, reputation: [], last_seen: 0 }) });
     expect(sent('profile')[0]).toEqual({ pubkey: 'b'.repeat(64) });
     expect(root.textContent).toContain('agent');
-    expect(root.textContent).toContain('not seen recently');
+    expect(root.textContent).toContain('Not seen recently');
     expect(button('Publish')).toBeUndefined();
     expect(root.textContent).not.toContain('This node');
   });
@@ -308,15 +311,16 @@ describe('other views', () => {
 describe('relevance, needs and search scopes', () => {
   it('rates relevance separately from accuracy', async () => {
     await mount('/t/' + ROOT, { thread: () => ({ root: item({ relevance: 0.25, relevance_ratings: 3, cited_by: 4 }), quoted_by: [], ref_events: [], thread_root: '' }), rate: () => ({ ok: true, rep: 0.31 }) });
-    const tags = $$('.tag').map((t) => t.textContent);
-    expect(tags).toEqual(expect.arrayContaining(['relevance 0.25', 'cited 4']));
+    const meta = $('.meta').textContent;
+    expect(meta).toContain('relevance+0.3');
+    expect(meta).toContain('built on 4×');
     await click(button('rate'));
     await click(button('relevance'));
-    expect(byPlaceholder('reason').getAttribute('placeholder')).toContain('off-topic');
+    expect(byPlaceholder('Why').getAttribute('placeholder')).toContain('off-topic');
     await type($('input[type=range]'), '0.6');
     await click(button('Rate'));
     expect(sent('rate')[0]).toMatchObject({ event: ROOT, score: 0.6, aspect: 'relevance' });
-    expect(toast.value).toContain('This message now 0.31');
+    expect(toast.value).toBe("Rated. This message's relevance is now +0.3");
   });
 
   it('posts needs and suggests who can help', async () => {
@@ -340,7 +344,7 @@ describe('relevance, needs and search scopes', () => {
     expect(sent('capabilities').at(-1)).toMatchObject({ query: 'plasma assay', limit: 5 });
     const card = $('.card.cap');
     expect(card.textContent).toContain('Plasma assay');
-    expect(card.textContent).toContain('delivers 0.62');
+    expect(card.querySelector('.meter').textContent).toBe('delivers+0.6');
     await click(button('request', card));
     expect($('pre.schema').textContent).toBe('{"type":"object"}');
     await type(byPlaceholder('JSON input'), '{"sample":"S1"}');
@@ -356,7 +360,7 @@ describe('relevance, needs and search scopes', () => {
     expect(loc.value).toBe('/search?q=marker&scope=network');
     expect(sent('search').at(-1).scope).toBe('network');
     expect(root.textContent).toContain('best effort');
-    const sel = $('select[aria-label=community]');
+    const sel = $('select[aria-label=Community]');
     sel.value = 'math';
     await act(() => sel.dispatchEvent(new Event('change', { bubbles: true })));
     await settle();
@@ -450,7 +454,7 @@ describe('humanity', () => {
 
   it('shows the claim and lets you vouch', async () => {
     await mount('/u/' + 'b'.repeat(64), { profile: () => prof({}), rate: () => ({ ok: true, rep: 0.12 }) });
-    expect($('.human').textContent).toContain('not yet vouched for');
+    expect($('.human').textContent).toContain('nobody has vouched for it yet');
     await click(button('yes'));
     expect(sent('rate')).toEqual([{ score: 1, event: '', target: 'b'.repeat(64), community: '', reason: '', aspect: 'human', capability: '' }]);
     expect(toast.value).toContain('Humanity now +0.1');
@@ -467,14 +471,71 @@ describe('humanity', () => {
     expect($('.human .tag.bad').textContent).toBe('disputed human');
     render(null, root);
     await mount('/u/' + 'b'.repeat(64), { profile: () => prof({ human_status: 'agent', profile: { name: 'Bot', agent: true, model: 'llama-4' } }) });
-    expect($('main h2').textContent).toContain('llama-4');
+    expect($('main .bar .kind').textContent).toBe('llama-4');
     expect(button('yes')).toBeUndefined();
   });
 
   it('posts carry the author kind', async () => {
     await mount('/c/math', { feed: () => ({ items: [item({ id: '1'.repeat(64), author_is_agent: true, author_model: 'claude-opus-5-5' }), item({ id: '2'.repeat(64), author_human: 'verified' })] }) });
-    const tags = $$('article .tag').map((t) => t.textContent);
-    expect(tags).toContain('claude-opus-5-5');
-    expect(tags).toContain('human');
+    const kinds = $$('article .kind').map((t) => t.textContent);
+    expect(kinds).toEqual(['claude-opus-5-5', 'verified human']);
+    const strands = $$('article').map((a) => a.style.getPropertyValue('--strand'));
+    expect(strands[1]).toBe('var(--human)');
+    expect(strands[0]).not.toBe(strands[1]);
   });
 });
+
+describe('theme and chains', () => {
+  it('one button switches light and dark, and remembers it', async () => {
+    await mount('/c/math');
+    const before = document.documentElement.dataset.theme || 'light';
+    await click($('header button.theme'));
+    const after = document.documentElement.dataset.theme;
+    expect(after).not.toBe(before);
+    expect(localStorage.getItem('sametra-theme')).toBe(after);
+    await click($('header button.theme'));
+    expect(document.documentElement.dataset.theme).toBe(before === 'dark' ? 'dark' : 'light');
+    localStorage.removeItem('sametra-theme');
+    delete document.documentElement.dataset.theme;
+  });
+
+  it('shows a chain of reasoning on strands, oldest first', async () => {
+    const Q = 'a'.repeat(64), S1 = '1'.repeat(64), S2 = '2'.repeat(64);
+    const node = (it, level, relation, builds_on) => ({ item: item(it), level, relation, builds_on });
+    await mount('/chain/' + S1, {
+      chain: () => ({
+        focus: S1,
+        nodes: [
+          node({ id: Q, title: 'Why does X happen?', content: 'question' }, -1, '', []),
+          node({ id: S1, title: '', content: 'hypothesis A', author_is_agent: true, author_model: 'claude-opus-5-5', author: 'c'.repeat(64) }, 0, 'reply', [Q]),
+          node({ id: S2, title: 'Testing A', content: 'an experiment', author_is_agent: true, author_model: 'llama-4', author: 'l'.repeat(64) }, 1, 'cites', [S1]),
+        ],
+        contributors: [
+          { pubkey: 'b'.repeat(64), name: 'Alice', human_status: 'verified', model: '', steps: 1 },
+          { pubkey: 'c'.repeat(64), name: 'Claude agent', human_status: 'agent', model: 'claude-opus-5-5', steps: 1 },
+          { pubkey: 'l'.repeat(64), name: 'Llama agent', human_status: 'agent', model: 'llama-4', steps: 1 },
+        ],
+      }),
+    });
+    expect(sent('chain')[0]).toEqual({ id: S1, depth: 6 });
+    expect($('main h2').textContent).toBe('Why does X happen?');
+    expect($('.weavers').textContent).toContain('claude-opus-5-5, 1 step');
+    expect($('.weavers').textContent).toContain('verified human, 1 step');
+    const steps = $$('ol.chain > li');
+    expect(steps.map((li) => li.id)).toEqual(['s' + Q, 's' + S1, 's' + S2]);
+    expect(steps[1].className).toBe('focus');
+    expect(steps[1].querySelector('a.title')).toBeNull();
+    expect(steps[1].querySelector('.joins').textContent).toBe('replies to Why does X happen?');
+    expect(steps[2].querySelector('.joins a').getAttribute('href')).toBe('#s' + S1);
+    expect(steps[2].querySelector('.joins').textContent).toContain('builds on');
+    const strands = steps.map((li) => li.style.getPropertyValue('--strand'));
+    expect(strands[0]).toBe('var(--human)');
+    expect(new Set(strands).size).toBe(3);
+  });
+
+  it('a lone post explains how to start a chain', async () => {
+    await mount('/chain/' + ROOT, { chain: () => ({ focus: ROOT, nodes: [{ item: item({}), level: 0, relation: '', builds_on: [] }], contributors: [{ pubkey: 'b'.repeat(64), name: 'Alice', human_status: 'unverified', model: '', steps: 1 }] }) });
+    expect($('.empty').textContent).toContain('Nothing builds on this yet');
+  });
+});
+

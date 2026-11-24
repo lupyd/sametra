@@ -387,7 +387,7 @@ async fn chain(node: &Arc<Node>, r: ChainRequest) -> R<ChainResponse> {
         v.extend(e.tags_named("q").filter_map(H32::from_hex).map(|q| (q, "cites")));
         v
     };
-    let mut nodes: std::collections::HashMap<H32, (Ev, i32, &'static str)> = Default::default();
+    let mut nodes: std::collections::HashMap<H32, (Ev, i32, &'static str)> = Default::default(); // id -> (event, level, relation found while walking)
     nodes.insert(id, (focus.clone(), 0, ""));
     // upstream, fetching links this node does not have (bounded)
     let mut frontier = vec![focus.clone()];
@@ -452,14 +452,19 @@ async fn chain(node: &Arc<Node>, r: ChainRequest) -> R<ChainResponse> {
     let st = node.store.lock().unwrap();
     let mut out: Vec<ChainNode> = nodes
         .values()
-        .map(|(e, level, rel)| ChainNode {
-            item: Some(view(&st, &rep, e, true, &cx)),
-            builds_on: upstream(e).into_iter().map(|x| x.0).filter(|p| nodes.contains_key(p)).map(|p| p.hex()).collect(),
-            level: *level,
-            relation: rel.to_string(),
+        .map(|(e, level, _)| {
+            let up: Vec<(H32, &str)> = upstream(e).into_iter().filter(|(p, _)| nodes.contains_key(p)).collect();
+            ChainNode {
+                item: Some(view(&st, &rep, e, true, &cx)),
+                builds_on: up.iter().map(|(p, _)| p.hex()).collect(),
+                level: *level,
+                // how this step joins the chain: replying to a step in it, or citing one
+                relation: up.first().map(|(_, r)| r.to_string()).unwrap_or_default(),
+            }
         })
         .collect();
-    out.sort_by_key(|n| n.item.as_ref().map(|i| (i.created_at, i.id.clone())));
+    // oldest first; within the same second, what a step builds on comes before it
+    out.sort_by_key(|n| (n.item.as_ref().map(|i| i.created_at), n.level, n.item.as_ref().map(|i| i.id.clone())));
     let mut contributors: Vec<Contributor> = vec![];
     for n in &out {
         let it = n.item.as_ref().unwrap();
@@ -987,6 +992,7 @@ async fn capabilities(node: &Arc<Node>, r: CapabilitiesRequest) -> R<Capabilitie
                 provider: e.pubkey.hex(),
                 provider_name: name_of(&st, &e.pubkey),
                 provider_is_agent: profile.agent,
+                provider_model: profile.model.clone(),
                 spec: Some(spec),
                 rep: round2(rep),
                 ratings: raters as u32,

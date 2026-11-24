@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none" stroke-linecap="round" stroke-linejoin="round">
+  <!-- Sametra: three independent strokes woven into one form around a shared centre.
+       Geometry by agy (Gemini 3.8 Flash); scaled to fill the frame for favicon sizes. -->
+  <style>
+    .s { stroke: #15212b; }
+    .a { fill: #2f4ac2; }
+    @media (prefers-color-scheme: dark) { .s { stroke: #e3e8ee; } .a { fill: #8da2ff; } }
+  </style>
+  <defs>
+    <path id="lobe" d="M 24.6 25.2 C 26.5 18 28.5 11 32 11 C 39.5 11 43.5 27 38 36 C 34 40 30 40 26 36 C 24.2 33.2 23 31.5 22.2 29.8" />
+  </defs>
+  <g transform="translate(32 33) scale(1.25) translate(-32 -33)" stroke-width="4.8" class="s">
+    <use href="#lobe" />
+    <use href="#lobe" transform="rotate(120 32 33)" />
+    <use href="#lobe" transform="rotate(240 32 33)" />
+    <circle cx="32" cy="33" r="3.4" class="a" stroke="none" />
+  </g>
+</svg>

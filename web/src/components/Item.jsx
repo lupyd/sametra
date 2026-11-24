@@ -1,26 +1,32 @@
 import { useState } from 'preact/hooks';
 import { call } from '../lib/api.js';
 import { ago, cites, flash, fmtScore, short, tick } from '../lib/state.js';
+import { kindLabel, strand } from '../lib/strand.js';
 
-export function Badges({ e }) {
+/** A -1..1 value as a short track centred on zero, with the number beside it. */
+export function Meter({ v, label, title }) {
+  const x = Math.max(-1, Math.min(1, v || 0));
+  const fill = `left:${50 + Math.min(0, x) * 50}%;width:${Math.abs(x) * 50}%`;
   return (
-    <>
-      <span class={'tag' + (e.author_rep < 0 ? ' bad' : '')} title="author reputation in this community">rep {e.author_rep}</span>
-      {e.ratings > 0 && <span class={'tag' + (e.score < 0 ? ' bad' : '')} title={`weighted trust score from ${e.ratings} ratings`}>score {e.score}</span>}
-      {e.relevance_ratings > 0 && <span class={'tag' + (e.relevance < 0 ? ' bad' : '')} title={`weighted relevance from ${e.relevance_ratings} ratings`}>relevance {e.relevance}</span>}
-      {e.cited_by > 0 && <span class="tag" title="posts citing this">cited {e.cited_by}</span>}
-      {e.author_is_agent ? <span class="tag" title="AI agent">{e.author_model || 'agent'}</span> : e.author_human === 'verified' ? <span class="tag" title="others vouch this is a human">human</span> : e.author_human === 'disputed' ? <span class="tag bad" title="others dispute that this is a human">disputed human</span> : null}
-      {e.low_trust && <span class="tag bad">low trust</span>}
-      {e.pinned && <span class="tag">pinned</span>}
-    </>
+    <span class={'meter' + (x < 0 ? ' neg' : '')} title={title}>
+      {label}
+      <i><b style={fill} /></i>
+      {fmtScore(x)}
+    </span>
   );
 }
 
 export function Meta({ e, extra }) {
   return (
-    <div class="meta">
+    <div class="meta" style={{ '--strand': strand(e) }}>
       <a class="who" href={'/u/' + e.author}>{e.author_name}</a>
-      <Badges e={e} />
+      <span class={'kind' + (e.author_human === 'disputed' ? ' disputed' : '')}>{kindLabel(e)}</span>
+      <Meter v={e.author_rep} label="standing" title="The author's reputation in this community, from −1 to 1" />
+      {e.ratings > 0 && <Meter v={e.score} label="accuracy" title={`Weighted accuracy from ${e.ratings} rating${e.ratings === 1 ? '' : 's'}`} />}
+      {e.relevance_ratings > 0 && <Meter v={e.relevance} label="relevance" title={`Weighted relevance from ${e.relevance_ratings} rating${e.relevance_ratings === 1 ? '' : 's'}`} />}
+      {e.cited_by > 0 && <span title="Posts that build on this one">built on {e.cited_by}×</span>}
+      {e.low_trust && <span class="neg">low trust</span>}
+      {e.pinned && <span>pinned</span>}
       <span title={new Date(e.created_at * 1000).toLocaleString()}>{ago(e.created_at)}</span>
       {extra}
     </div>
@@ -39,8 +45,8 @@ export function Needs({ e }) {
 export function Refs({ e }) {
   if (!e.refs.length) return null;
   return (
-    <div class="meta">
-      cites {e.refs.map((r) => <a key={r} href={'/t/' + r}><code>{short(r)}</code></a>)}
+    <div class="meta refs">
+      builds on {e.refs.map((r) => <a key={r} href={'/t/' + r}><code>{short(r)}</code></a>)}
     </div>
   );
 }
@@ -63,9 +69,10 @@ export function Actions({ e }) {
       <div class="acts">
         <button class="link" onClick={() => toggle('reply')}>reply</button>
         <button class="link" onClick={() => toggle('rate')}>rate</button>
-        <button class="link" onClick={() => { if (!cites.value.includes(e.id)) cites.value = [...cites.value, e.id]; flash('Will cite ' + short(e.id) + ' in your next post'); }}>cite</button>
+        <button class="link" title="Cite this in your next post or reply" onClick={() => { if (!cites.value.includes(e.id)) cites.value = [...cites.value, e.id]; flash('Your next post will build on ' + short(e.id)); }}>build on</button>
+        <a class="link" href={'/chain/' + e.id}>chain</a>
         <button class="link" onClick={() => run(async () => { const a = await call(e.pinned ? 'unpin' : 'pin', { id: e.id, thread: true }); done((e.pinned ? 'Unpinned ' : 'Pinned ') + a.count); })}>{e.pinned ? 'unpin' : 'pin'}</button>
-        {e.mine && <button class="link" onClick={() => confirm('Retract this network-wide?') && run(async () => { await call('delete', { id: e.id }); done('Retracted'); })}>delete</button>}
+        {e.mine && <button class="link" onClick={() => confirm('Retract this from the whole network?') && run(async () => { await call('delete', { id: e.id }); done('Retracted'); })}>delete</button>}
       </div>
       {box === 'reply' && (
         <div class="box">
@@ -79,17 +86,17 @@ export function Actions({ e }) {
       )}
       {box === 'rate' && (
         <div class="box">
-          <div class="seg" role="group" aria-label="what you rate">
-            <button class={aspect === 'trust' ? 'on' : 'ghost'} onClick={() => setAspect('trust')} title="Is it accurate? Moves the author's reputation.">accuracy</button>
-            <button class={aspect === 'relevance' ? 'on' : 'ghost'} onClick={() => setAspect('relevance')} title="Is it useful and on-topic here? Scores only this message.">relevance</button>
+          <div class="seg" role="group" aria-label="What you are rating">
+            <button class={aspect === 'trust' ? 'on' : ''} onClick={() => setAspect('trust')} title="Is it correct? Moves the author's standing.">accuracy</button>
+            <button class={aspect === 'relevance' ? 'on' : ''} onClick={() => setAspect('relevance')} title="Is it useful and on-topic here? Scores only this message.">relevance</button>
           </div>
           <div class="row">
-            <input type="range" min="-1" max="1" step="0.1" value={score} onInput={(ev) => setScore(+ev.currentTarget.value)} style="max-width:160px" />
+            <input type="range" min="-1" max="1" step="0.1" value={score} onInput={(ev) => setScore(+ev.currentTarget.value)} style="max-width:160px" aria-label="Score from −1 to 1" />
             <b class={score < 0 ? 'neg' : ''} style="min-width:2.6em;text-align:right">{fmtScore(score)}</b>
-            <input value={text} onInput={(ev) => setText(ev.currentTarget.value)} placeholder={aspect === 'trust' ? 'reason: misleading, well-sourced, replicated…' : 'reason: off-topic, exactly what was asked…'} />
+            <input value={text} onInput={(ev) => setText(ev.currentTarget.value)} placeholder={aspect === 'trust' ? 'Why: misleading, well sourced, replicated…' : 'Why: off-topic, exactly what was asked…'} />
             <button disabled={busy} onClick={() => run(async () => {
               const a = await call('rate', { event: e.id, score, reason: text, aspect });
-              done(aspect === 'trust' ? `Rated. Author's rep now ${a.rep}` : `Rated relevance. This message now ${a.rep}`);
+              done(aspect === 'trust' ? `Rated. The author's standing is now ${fmtScore(a.rep)}` : `Rated. This message's relevance is now ${fmtScore(a.rep)}`);
             })}>Rate</button>
           </div>
         </div>
@@ -102,7 +109,7 @@ export function CiteList() {
   if (!cites.value.length) return <span class="grow" />;
   return (
     <span class="grow muted small">
-      citing {cites.value.map((c) => <code key={c}>{short(c)}</code>)}{' '}
+      builds on {cites.value.map((c) => <code key={c}>{short(c)}</code>)}{' '}
       <button class="link" onClick={() => (cites.value = [])}>clear</button>
     </span>
   );
@@ -110,7 +117,7 @@ export function CiteList() {
 
 export function Card({ e, children }) {
   return (
-    <article class={'card' + (e.low_trust ? ' low' : '')}>
+    <article class={'card' + (e.low_trust ? ' low' : '')} style={{ '--strand': strand(e) }}>
       {children}
     </article>
   );

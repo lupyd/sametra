@@ -559,7 +559,7 @@ async fn chains_of_reasoning_across_humans_and_models() {
     assert_eq!(ids, [q.id.hex(), s1.id.hex(), s2.id.hex(), s3.id.hex(), s4.id.hex()].iter().map(String::as_str).collect::<Vec<_>>(), "oldest first; the aside is not part of this chain");
     let by = |i: &H32| c.nodes.iter().find(|x| x.item.as_ref().unwrap().id == i.hex()).unwrap();
     assert_eq!((by(&q.id).level, by(&s1.id).level, by(&s2.id).level, by(&s3.id).level, by(&s4.id).level), (-1, 0, 1, 1, 2));
-    assert_eq!((by(&s2.id).relation.as_str(), by(&s3.id).relation.as_str(), by(&s1.id).relation.as_str()), ("reply", "cites", ""));
+    assert_eq!((by(&s2.id).relation.as_str(), by(&s3.id).relation.as_str(), by(&s1.id).relation.as_str(), by(&q.id).relation.as_str()), ("reply", "cites", "reply", ""));
     assert_eq!(by(&s4.id).builds_on, [s3.id.hex()]);
     assert_eq!(by(&s1.id).builds_on, [q.id.hex()]);
     assert_eq!(by(&s3.id).item.as_ref().unwrap().author_model, "llama-4");
@@ -576,4 +576,15 @@ async fn chains_of_reasoning_across_humans_and_models() {
     assert_eq!(up, [q.id.hex(), s1.id.hex(), s3.id.hex(), s4.id.hex()].iter().map(String::as_str).collect::<Vec<_>>(), "everything it builds on, through citations and replies; branches off earlier steps are not part of it");
     assert_eq!(from_end.nodes.iter().map(|x| x.level).collect::<Vec<_>>(), [-3, -2, -1, 0]);
     assert!(n.err("chain", &pb::ChainRequest { id: "ab".repeat(32), depth: 0 }).await.1.contains("not found"));
+    // same-second steps: what a step builds on still comes first
+    let t = now();
+    let first = human.sign_at(K_POST, tags(&[&["c", "m"], &["title", "Same second"]]), "q".into(), t);
+    let answer = (0..50)
+        .map(|i| claude.sign_at(K_REPLY, tags(&[&["c", "m"], &["e", &first.id.hex(), "", "root"], &["e", &first.id.hex(), "", "reply"]]), format!("a{i}"), t))
+        .find(|a| a.id < first.id)
+        .expect("an answer whose id sorts before the question");
+    n.node.ingest(first.clone(), 9, false).unwrap();
+    n.node.ingest(answer.clone(), 9, false).unwrap();
+    let c: pb::ChainResponse = n.ok("chain", &pb::ChainRequest { id: answer.id.hex(), depth: 0 }).await;
+    assert_eq!(c.nodes[0].item.as_ref().unwrap().id, first.id.hex());
 }

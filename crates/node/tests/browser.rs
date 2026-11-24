@@ -64,11 +64,14 @@ async fn spa_renders_node_data() {
     assert!(me.contains("Dr Browser") && me.contains("tests UIs") && me.contains(&n.node.keys.npub()));
     assert!(me.contains("This node"));
 
+    let chain = run(&format!("/chain/{}", r1.id)).await.unwrap();
+    assert!(chain.contains("class=\"weavers\"") && chain.contains("Which assay did you use?") && chain.contains("Is marker X predictive?"), "chain view:\n{chain}");
+
     let search = run("/search?q=assay").await.unwrap();
     assert!(search.contains("Which assay did you use?"));
 
     let rep = run("/c/oncology/reputation").await.unwrap();
-    assert!(rep.contains("No ratings yet."));
+    assert!(rep.contains("Nobody here has been rated yet."));
 
     assert!(feed.contains("href=\"/docs\""), "the app links to the docs");
     let docs = run("/docs/architecture").await.unwrap();
@@ -103,5 +106,5 @@ async fn spa_renders_node_data() {
     assert!(comms.contains("tumour biology"));
 
     let missing = run("/nope/at/all").await.unwrap();
-    assert!(missing.contains("Not found."));
+    assert!(missing.contains("There is nothing at this address"));
 }

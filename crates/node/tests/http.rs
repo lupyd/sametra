@@ -214,7 +214,7 @@ async fn docs_are_static_pages_with_working_links() {
             continue;
         }
         let html = n.get(&page).await.text();
-        assert!(!html.contains("<script"), "{page}: docs ship no JavaScript");
+        assert!(!html.contains("<script src") && !html.contains("type=\"module\""), "{page}: docs load no script files (only the inline theme switch)");
         for href in html.split("href=\"").skip(1).filter_map(|s| s.split('"').next()) {
             if !href.starts_with('/') || href.starts_with("/_astro/") {
                 continue;

@@ -3,6 +3,8 @@ import { useState } from 'preact/hooks';
 import { call } from '../lib/api.js';
 import { navigate, query } from '../lib/router.js';
 import { ago, flash, fmtScore, short, tick } from '../lib/state.js';
+import { strand } from '../lib/strand.js';
+import { Meter } from './Item.jsx';
 import { useLoad } from './hooks.js';
 
 const done = (msg) => { flash(msg); tick.value++; };
@@ -12,14 +14,13 @@ export function CapabilityCard({ c, post, compact }) {
   const [open, setOpen] = useState(false);
   const s = c.spec;
   return (
-    <div class={'card cap' + (compact ? ' slim' : '')}>
+    <div class={'card cap' + (compact ? ' slim' : '')} style={{ '--strand': strand({ author_is_agent: c.provider_is_agent, author_model: c.provider_model, author: c.provider }) }}>
+      <span class="title">{s.name}</span>
       <div class="meta">
-        <b class="who">{s.name}</b>
-        <span class="tag">{s.kind}</span>
-        <span>by <a href={'/u/' + c.provider}>{c.provider_name}</a></span>
-        {c.provider_is_agent && <span class="tag">agent</span>}
-        <span class={'tag' + (c.rep < 0 ? ' bad' : '')} title={`does it deliver what it claims? ${c.ratings} ratings`}>delivers {c.rep}</span>
-        <span title="completed / requested">{c.completed}/{c.requests} done</span>
+        <span>{s.kind === 'tool' ? 'Tool' : 'Skill'} offered by <a class="who" href={'/u/' + c.provider}>{c.provider_name}</a></span>
+        {c.provider_is_agent && <span class="kind">{c.provider_model || 'AI agent'}</span>}
+        <Meter v={c.rep} label="delivers" title={`Does it deliver what it claims? From ${c.ratings} rating${c.ratings === 1 ? '' : 's'} by people it served`} />
+        <span title="Requests completed out of requests received">{c.completed} of {c.requests} done</span>
         {c.declined > 0 && <span>{c.declined} declined</span>}
       </div>
       {!compact && s.about && <div class="body">{s.about}</div>}
@@ -62,13 +63,13 @@ export function FindHelp() {
   return (
     <>
       <div class="bar"><h2 class="grow">Find help</h2></div>
-      <form class="card row" onSubmit={(e) => { e.preventDefault(); navigate('/help?q=' + encodeURIComponent(text.trim())); }}>
+      <form class="panel row" onSubmit={(e) => { e.preventDefault(); navigate('/help?q=' + encodeURIComponent(text.trim())); }}>
         <input value={text} onInput={(e) => setText(e.currentTarget.value)} placeholder="What do you need? e.g. mass spectrometry, survival analysis" />
         <label class="small nowrap"><input type="checkbox" checked={network} onChange={(e) => setNetwork(e.currentTarget.checked)} /> ask peers</label>
         <button>Search</button>
       </form>
       {error && <p class="err">{error.message}</p>}
-      {!data ? <p class="muted">Loading…</p> : data.capabilities.length === 0 ? <p class="muted">Nobody offers that yet. Post your need in a community and tag it.</p> :
+      {!data ? <p class="muted">Loading…</p> : data.capabilities.length === 0 ? <p class="empty">Nobody offers that yet. Post what you need in a community and list it under Needs; people who can help will find it.</p> :
         data.capabilities.map((c) => <CapabilityCard key={c.provider + c.spec.id} c={c} />)}
     </>
   );
@@ -108,7 +109,7 @@ function CapabilityEditor() {
   const [f, setF] = useState({ id: '', name: '', kind: 'skill', about: '', topics: '', communities: '', input_schema: '' });
   const set = (k) => (e) => setF({ ...f, [k]: e.currentTarget.value });
   return (
-    <div class="card">
+    <div class="panel">
       <h3>Offer a capability</h3>
       <p class="muted small">A <b>skill</b> describes what you can do (equipment, data, expertise). A <b>tool</b> is a strict call others make with JSON input.</p>
       <div class="row">
@@ -139,12 +140,12 @@ export function Inbox() {
       <div class="bar">
         <h2 class="grow">Inbox</h2>
         <div class="seg" role="tablist">
-          <button class={role === 'provider' ? 'on' : 'ghost'} onClick={() => setRole('provider')}>requests to me</button>
-          <button class={role === 'requester' ? 'on' : 'ghost'} onClick={() => setRole('requester')}>my requests</button>
+          <button class={role === 'provider' ? 'on' : ''} onClick={() => setRole('provider')}>requests to me</button>
+          <button class={role === 'requester' ? 'on' : ''} onClick={() => setRole('requester')}>my requests</button>
         </div>
       </div>
       {error && <p class="err">{error.message}</p>}
-      {!data ? <p class="muted">Loading…</p> : data.jobs.length === 0 ? <p class="muted">{role === 'provider' ? 'No requests yet. Offer capabilities on your profile.' : 'You have not requested anything yet. Try Find help.'}</p> :
+      {!data ? <p class="muted">Loading…</p> : data.jobs.length === 0 ? <p class="empty">{role === 'provider' ? 'No requests yet. Offer capabilities on your profile.' : 'You have not requested anything yet. Try Find help.'}</p> :
         data.jobs.map((j) => <JobCard key={j.id} j={j} />)}
     </>
   );

@@ -1,6 +1,7 @@
 ---
 // Static documentation pages: no JavaScript, same look as the app.
 import '../styles/global.css';
+import { THEME_BOOT } from '../lib/theme.js';
 import '../styles/docs.css';
 
 const { frontmatter } = Astro.props;
@@ -37,14 +38,33 @@ const next = flat[i + 1];
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="light dark" />
     <meta name="description" content={frontmatter.description} />
-    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='9' cy='16' r='5' fill='%231f6f5c'/><circle cx='23' cy='9' r='4' fill='%231f6f5c'/><circle cx='23' cy='23' r='4' fill='%231f6f5c'/><path d='M9 16L23 9M9 16l14 7M23 9v14' stroke='%231f6f5c' stroke-width='2'/></svg>" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <title>{frontmatter.title} · Sametra docs</title>
+    <script is:inline set:html={THEME_BOOT} />
   </head>
   <body class="docs">
     <header>
-      <a class="brand" href="/">Sametra</a>
+      <a class="brand" href="/">
+        <svg class="mark" width="26" height="26" viewBox="0 0 64 64" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <defs><path id="mark-lobe" d="M 24.6 25.2 C 26.5 18 28.5 11 32 11 C 39.5 11 43.5 27 38 36 C 34 40 30 40 26 36 C 24.2 33.2 23 31.5 22.2 29.8" /></defs>
+          <g transform="translate(32 33) scale(1.25) translate(-32 -33)" stroke-width="4.8">
+            <use href="#mark-lobe" /><use href="#mark-lobe" transform="rotate(120 32 33)" /><use href="#mark-lobe" transform="rotate(240 32 33)" />
+            <circle cx="32" cy="33" r="3.4" fill="var(--acc)" stroke="none" />
+          </g>
+        </svg>Sametra</a>
       <a class="here" href="/docs">Docs</a>
-      <a class="btn open" href="/">Open the app →</a>
+      <a class="btn open" href="/">Open the app</a>
+      <button class="theme" id="theme" aria-label="Switch theme" title="Switch theme">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 3a9 9 0 1 0 0 18z" fill="currentColor" /><circle cx="12" cy="12" r="9" /></svg>
+      </button>
+      <script is:inline>
+        document.getElementById('theme').addEventListener('click', function () {
+          var root = document.documentElement;
+          var dark = root.dataset.theme ? root.dataset.theme === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches;
+          root.dataset.theme = dark ? 'light' : 'dark';
+          try { localStorage.setItem('sametra-theme', root.dataset.theme); } catch (e) {}
+        });
+      </script>
     </header>
     <div class="dwrap">
       <nav class="dnav" aria-label="Documentation">

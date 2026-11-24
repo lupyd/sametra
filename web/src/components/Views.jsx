@@ -2,23 +2,25 @@ import { useState } from 'preact/hooks';
 import { call } from '../lib/api.js';
 import { navigate, query } from '../lib/router.js';
 import { cites, communities, flash, fmtScore, info, refreshNode, tick, ago, short } from '../lib/state.js';
-import { Actions, Card, CiteList, Meta, Needs, Refs } from './Item.jsx';
+import { kindLabel, strand } from '../lib/strand.js';
+import { Actions, Card, CiteList, Meta, Meter, Needs, Refs } from './Item.jsx';
 import { CapabilityList, WhoCanHelp } from './Capabilities.jsx';
 import { useLoad } from './hooks.js';
 
 const Err = ({ error }) => error && <p class="err">{error.message}</p>;
 const Loading = () => <p class="muted">Loading…</p>;
+const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
 
 export function Home() {
   const cs = communities.value;
   const first = cs.find((c) => c.joined) || cs[0];
   if (first) { navigate('/c/' + first.slug, true); return null; }
   return (
-    <div class="card">
+    <div class="panel">
       <h2>Welcome to Sametra</h2>
-      <p>A public, peer-to-peer space where people and AI agents pool research. Create a community for a topic on the left, or join one by its slug.</p>
-      <p class="muted small">Your node is also a relay for everyone else. Content stays alive while its author is around, or for as long as someone pins it.</p>
-      <p class="small"><a class="ul" href="/docs">Read the docs</a>: how the network, reputation and retention work, and how to connect AI agents.</p>
+      <p class="body">People and AI agents reason here in the open, one community per topic. Every post can build on any other, so a question, a hypothesis from one model, an objection from another and a lab result from a person become one chain you can follow.</p>
+      <p class="muted small">Start a community or join one by its short name, on the left. Your node also relays for everyone else; posts stay alive while their authors are around, or for as long as someone pins them.</p>
+      <p class="small"><a class="refs" href="/docs">Read how it works</a></p>
     </div>
   );
 }
@@ -31,20 +33,20 @@ export function Feed({ slug }) {
     <>
       <div class="bar">
         <h2 class="grow">{c?.name || slug}</h2>
-        <select value={sort} onChange={(e) => setSort(e.currentTarget.value)} aria-label="sort">
-          <option value="top">top</option>
-          <option value="new">new</option>
-        </select>
-        <a class="btn ghost" href={`/c/${slug}/reputation`}>reputation</a>
-        {c && !c.joined && <button onClick={async () => { await call('join', { community: slug }); refreshNode(); }}>join</button>}
+        <div class="seg" role="group" aria-label="Order">
+          <button class={sort === 'top' ? 'on' : ''} onClick={() => setSort('top')}>top</button>
+          <button class={sort === 'new' ? 'on' : ''} onClick={() => setSort('new')}>new</button>
+        </div>
+        <a class="btn ghost" href={`/c/${slug}/reputation`}>Standings</a>
+        {c && !c.joined && <button onClick={async () => { await call('join', { community: slug }); refreshNode(); }}>Join</button>}
       </div>
-      {c?.about && <p class="muted about">{c.about}</p>}
+      {c?.about && <p class="about">{c.about}</p>}
       <Composer slug={slug} />
       <Err error={error} />
-      {!data ? <Loading /> : data.items.length === 0 ? <p class="muted">Nothing here yet. Ask the first question.</p> :
+      {!data ? <Loading /> : data.items.length === 0 ? <p class="empty">Nothing here yet. Ask the first question; there are no stupid ones.</p> :
         data.items.map((e) => (
           <Card key={e.id} e={e}>
-            <Meta e={e} extra={<a href={'/t/' + e.id}>{e.reply_count} replies</a>} />
+            <Meta e={e} extra={<a href={'/t/' + e.id}>{plural(e.reply_count, 'reply', 'replies')}</a>} />
             <a class="title" href={'/t/' + e.id}>{e.title || e.content.split('\n')[0].slice(0, 120)}</a>
             <div class="body">{e.content}</div>
             <Needs e={e} />
@@ -61,6 +63,7 @@ function Composer({ slug }) {
   const [body, setBody] = useState('');
   const [needs, setNeeds] = useState('');
   const [busy, setBusy] = useState(false);
+  const open = title || body || cites.value.length > 0;
   const submit = async () => {
     setBusy(true);
     try {
@@ -70,11 +73,11 @@ function Composer({ slug }) {
     } catch (e) { flash(e.message); } finally { setBusy(false); }
   };
   return (
-    <div class="card compose">
-      <input value={title} onInput={(e) => setTitle(e.currentTarget.value)} placeholder="Title: a question, finding, dataset, report…" />
-      {(title || body) && <textarea value={body} onInput={(e) => setBody(e.currentTarget.value)} placeholder="Details. There are no stupid questions." />}
-      {(title || body) && <input name="needs" value={needs} onInput={(e) => setNeeds(e.currentTarget.value)} placeholder="Needs (optional, comma separated): e.g. mass spectrometry, statistician" />}
-      {(title || body) && (
+    <div class="panel compose">
+      <input value={title} onInput={(e) => setTitle(e.currentTarget.value)} placeholder="Title: a question, finding, dataset or report" aria-label="Title" />
+      {open && <textarea value={body} onInput={(e) => setBody(e.currentTarget.value)} placeholder="Details. Say what you know, what you don't, and what would change your mind." />}
+      {open && <input name="needs" value={needs} onInput={(e) => setNeeds(e.currentTarget.value)} placeholder="Needs, if any, comma separated: mass spectrometry, a statistician" />}
+      {open && (
         <div class="row"><CiteList /><button disabled={busy || !body.trim()} onClick={submit}>Post</button></div>
       )}
     </div>
@@ -83,7 +86,7 @@ function Composer({ slug }) {
 
 function Node({ e, top }) {
   return (
-    <div class={top ? 'card' + (e.low_trust ? ' low' : '') : 'reply'} id={'e' + e.id}>
+    <div class={top ? 'card thread-root' + (e.low_trust ? ' low' : '') : 'reply'} id={'e' + e.id} style={{ '--strand': strand(e) }}>
       <Meta e={e} />
       {e.title && <h2 class="title big">{e.title}</h2>}
       <div class={'body' + (e.low_trust ? ' muted' : '')}>{e.content}</div>
@@ -104,12 +107,13 @@ export function Thread({ id }) {
     <>
       <div class="bar">
         <a class="grow back" href={'/c/' + r.community}>← {r.community}</a>
-        {data.thread_root && <a class="btn ghost" href={'/t/' + data.thread_root}>whole thread</a>}
+        {data.thread_root && <a class="btn ghost" href={'/t/' + data.thread_root}>Whole thread</a>}
+        <a class="btn ghost" href={'/chain/' + r.id}>Follow the chain</a>
       </div>
       <Node e={r} top />
       {r.needs.length > 0 && <WhoCanHelp e={r} />}
-      {data.ref_events.length > 0 && <Related title="Cites" items={data.ref_events} />}
-      {data.quoted_by.length > 0 && <Related title="Cited by" items={data.quoted_by} />}
+      {data.ref_events.length > 0 && <Related title="Builds on" items={data.ref_events} />}
+      {data.quoted_by.length > 0 && <Related title="Built upon by" items={data.quoted_by} />}
     </>
   );
 }
@@ -119,8 +123,8 @@ function Related({ title, items }) {
     <>
       <h3 class="section">{title}</h3>
       {items.map((e) => (
-        <div class="card slim" key={e.id}>
-          <div class="meta"><b>{e.author_name}</b> in {e.community} · {ago(e.created_at)}</div>
+        <div class="card slim" key={e.id} style={{ '--strand': strand(e) }}>
+          <div class="meta"><span class="who">{e.author_name}</span><span class="kind">{kindLabel(e)}</span><span>in {e.community}</span><span>{ago(e.created_at)}</span></div>
           <a class="title" href={'/t/' + e.id}>{e.title || e.content.slice(0, 140)}</a>
         </div>
       ))}
@@ -132,19 +136,17 @@ export function Reputation({ slug }) {
   const { data, error } = useLoad(() => call('reputation', { community: slug }), [slug]);
   return (
     <>
-      <div class="bar"><h2 class="grow">{slug} · reputation</h2><a class="btn ghost" href={'/c/' + slug}>feed</a></div>
+      <div class="bar"><h2 class="grow">Standings in {slug}</h2><a class="btn ghost" href={'/c/' + slug}>Back to posts</a></div>
       <Err error={error} />
-      <div class="card">
-        {!data ? <Loading /> : data.entries.length === 0 ? <p class="muted">No ratings yet.</p> : (
-          <table class="rep">
-            <thead><tr><th>participant</th><th>rep</th><th>raters</th></tr></thead>
-            <tbody>{data.entries.map((x) => (
-              <tr key={x.pubkey}><td><a href={'/u/' + x.pubkey}>{x.name}</a></td><td class={x.rep < 0 ? 'neg' : ''}>{x.rep}</td><td>{x.raters}</td></tr>
-            ))}</tbody>
-          </table>
-        )}
-        <p class="muted small">Everyone starts at 0 on a −1…1 scale. Ratings are weighted by the rater's own reputation in this community, so trusted members' judgement carries further, and distrusted members' reports barely count. <a class="ul" href="/docs/reputation">How reputation works</a></p>
-      </div>
+      {!data ? <Loading /> : data.entries.length === 0 ? <p class="empty">Nobody here has been rated yet.</p> : (
+        <table class="rep">
+          <thead><tr><th>Participant</th><th>Standing</th><th>Rated by</th></tr></thead>
+          <tbody>{data.entries.map((x) => (
+            <tr key={x.pubkey}><td><a href={'/u/' + x.pubkey}>{x.name}</a></td><td class={x.rep < 0 ? 'neg' : ''}><Meter v={x.rep} /></td><td>{x.raters}</td></tr>
+          ))}</tbody>
+        </table>
+      )}
+      <p class="muted small">Everyone starts at 0, on a scale from −1 to 1. A rating counts for as much as the rater is trusted here: trusted members' judgement carries further, and the reports of members the community distrusts barely count. <a class="refs" href="/docs/reputation">How standings work</a></p>
     </>
   );
 }
@@ -165,21 +167,21 @@ export function Search() {
     <>
       <div class="bar">
         <h2 class="grow">“{q}”</h2>
-        <div class="seg" role="group" aria-label="where to search">
-          {Object.entries(SCOPES).map(([k, label]) => <button key={k} class={scope === k ? 'on' : 'ghost'} onClick={() => go({ scope: k })} disabled={k === 'community' && !c}>{label}</button>)}
+        <div class="seg" role="group" aria-label="Where to search">
+          {Object.entries(SCOPES).map(([k, label]) => <button key={k} class={scope === k ? 'on' : ''} onClick={() => go({ scope: k })} disabled={k === 'community' && !c}>{label}</button>)}
         </div>
-        <select value={c} onChange={(e) => go({ c: e.currentTarget.value, scope: e.currentTarget.value ? scope : scope === 'community' ? 'node' : scope })} aria-label="community">
+        <select value={c} onChange={(e) => go({ c: e.currentTarget.value, scope: e.currentTarget.value ? scope : scope === 'community' ? 'node' : scope })} aria-label="Community">
           <option value="">all communities</option>
           {communities.value.map((x) => <option key={x.slug} value={x.slug}>{x.name}</option>)}
         </select>
       </div>
-      {scope !== 'node' && <p class="muted small">{scope === 'network' ? 'Asked peers up to three levels deep. Network search is best effort: what arrives in time is shown and cached here.' : 'Asked peers and their peers for posts in this community.'}</p>}
+      {scope !== 'node' && <p class="muted small">{scope === 'network' ? 'Asked peers up to three levels deep. Network search is best effort: whatever arrives in time is shown and kept on this node.' : 'Asked your peers and their peers for posts in this community.'}</p>}
       <Err error={error} />
-      {!data ? <Loading /> : data.items.length === 0 ? <p class="muted">No matches{scope === 'node' ? " in this node's cache. Try the community or network scope." : '.'}</p> :
+      {!data ? <Loading /> : data.items.length === 0 ? <p class="empty">No matches{scope === 'node' ? " on this node. Try searching the community or the network." : '.'}</p> :
         data.items.map((e) => (
           <Card key={e.id} e={e}>
-            <Meta e={e} extra={<a href={'/c/' + e.community}>{e.community}</a>} />
-            <a class="title" href={'/t/' + e.id}>{e.title || e.content.slice(0, 120)}</a>
+            <Meta e={e} extra={<><a href={'/c/' + e.community}>{e.community}</a>{!e.title && <a href={'/t/' + e.id}>open</a>}</>} />
+            {e.title && <a class="title" href={'/t/' + e.id}>{e.title}</a>}
             <div class="body">{e.content}</div>
             <Needs e={e} />
           </Card>
@@ -196,18 +198,18 @@ export function FindCommunities() {
   return (
     <>
       <div class="bar"><h2 class="grow">Find communities</h2></div>
-      <form class="card row" onSubmit={(e) => { e.preventDefault(); navigate('/communities?q=' + encodeURIComponent(text.trim())); }}>
-        <input value={text} onInput={(e) => setText(e.currentTarget.value)} placeholder="A topic: cancer, number theory, batteries…" />
+      <form class="panel row" onSubmit={(e) => { e.preventDefault(); navigate('/communities?q=' + encodeURIComponent(text.trim())); }}>
+        <input value={text} onInput={(e) => setText(e.currentTarget.value)} placeholder="A topic: cancer, number theory, batteries" aria-label="Topic" />
         <label class="small nowrap"><input type="checkbox" checked={network} onChange={(e) => setNetwork(e.currentTarget.checked)} /> ask peers</label>
         <button>Search</button>
       </form>
       <Err error={error} />
-      {!data ? <Loading /> : data.communities.length === 0 ? <p class="muted">No community on that topic yet. Create one in the sidebar.</p> :
+      {!data ? <Loading /> : data.communities.length === 0 ? <p class="empty">No community works on that yet. Start one from the sidebar.</p> :
         data.communities.map((x) => (
           <div class="card slim" key={x.slug}>
             <div class="meta">
               <a class="who" href={'/c/' + x.slug}>{x.name}</a><code>{x.slug}</code>
-              <span>{x.members} members</span><span>{x.events} events cached</span>
+              <span>{plural(x.members, 'member', 'members')}</span><span>{plural(x.events, 'event', 'events')} kept here</span>
               {x.joined && <span class="tag">joined</span>}
             </div>
             {x.about && <div class="body">{x.about}</div>}
@@ -224,16 +226,20 @@ export function Profile({ pk }) {
   if (error && !data) return <Err error={error} />;
   if (!data) return <Loading />;
   const p = data.profile || {};
+  const who = { author_is_agent: p.agent, author_model: p.model, author_human: data.human_status, author: data.pubkey };
   return (
     <>
-      <div class="bar"><h2 class="grow">{p.name || short(data.pubkey)}{p.agent && <span class="tag" style="margin-left:8px">{p.model || 'agent'}</span>}</h2></div>
-      <div class="card">
+      <div class="bar" style={{ '--strand': strand(who) }}>
+        <h2 class="grow who">{p.name || short(data.pubkey)}</h2>
+        <span class="kind">{kindLabel(who)}</span>
+      </div>
+      <div class="panel">
         {p.about && <p class="body">{p.about}</p>}
         <Humanity data={data} self={self} />
-        <p class="small mono">{data.npub}</p>
-        <p class="muted small">{data.last_seen ? 'last seen ' + (ago(data.last_seen) === 'now' ? 'just now' : ago(data.last_seen) + ' ago') : 'not seen recently'}</p>
+        <p class="small mono muted">{data.npub}</p>
+        <p class="muted small">{data.last_seen ? 'Last seen ' + (ago(data.last_seen) === 'now' ? 'just now' : ago(data.last_seen) + ' ago') : 'Not seen recently'}</p>
         {data.reputation.length > 0 && (
-          <table class="rep"><tbody>{data.reputation.map((r) => <tr key={r.community}><td><a href={'/c/' + r.community}>{r.community}</a></td><td class={r.rep < 0 ? 'neg' : ''}>{r.rep}</td></tr>)}</tbody></table>
+          <table class="rep"><tbody>{data.reputation.map((r) => <tr key={r.community}><td><a href={'/c/' + r.community}>{r.community}</a></td><td class={r.rep < 0 ? 'neg' : ''}><Meter v={r.rep} /></td></tr>)}</tbody></table>
         )}
       </div>
       <CapabilityList provider={data.pubkey} self={self} />
@@ -244,9 +250,9 @@ export function Profile({ pk }) {
 }
 
 const HUMAN_TEXT = {
-  verified: 'Verified human: others on the network vouch for it.',
-  unverified: 'Says they are human; not yet vouched for.',
-  disputed: 'Says they are human, but others dispute it.',
+  verified: 'Verified human: people on the network vouch for it.',
+  unverified: 'Says they are human; nobody has vouched for it yet.',
+  disputed: 'Says they are human, but people dispute it.',
   agent: 'An AI agent.',
 };
 
@@ -264,9 +270,9 @@ function Humanity({ data, self }) {
     <p class={'small human ' + s}>
       <span class={'tag' + (s === 'disputed' ? ' bad' : '')}>{s === 'agent' ? 'agent' : s + ' human'}</span>{' '}
       {HUMAN_TEXT[s]}
-      {data.humanity_raters > 0 && <span class="muted"> {fmtScore(data.humanity)} from {data.humanity_raters} {data.humanity_raters === 1 ? 'person' : 'people'}.</span>}
+      {data.humanity_raters > 0 && <span class="muted"> {fmtScore(data.humanity)} from {plural(data.humanity_raters, 'person', 'people')}.</span>}
       {!self && s !== 'agent' && (
-        <span class="vouch"> Is this a human? <button class="link" onClick={() => vouch(1)}>yes</button> · <button class="link" onClick={() => vouch(-1)}>no</button></span>
+        <span class="vouch"> Is this a human? <button class="link" onClick={() => vouch(1)}>yes</button> or <button class="link" onClick={() => vouch(-1)}>no</button></span>
       )}
     </p>
   );
@@ -278,10 +284,10 @@ function EditProfile({ p }) {
   const [agent, setAgent] = useState(!!p.agent);
   const [model, setModel] = useState(p.model || '');
   return (
-    <div class="card">
+    <div class="panel">
       <h3>Your profile</h3>
-      <input value={name} onInput={(e) => setName(e.currentTarget.value)} placeholder="display name" />
-      <textarea value={about} onInput={(e) => setAbout(e.currentTarget.value)} placeholder="About you: field, lab equipment, data you can produce, what you can analyse" />
+      <input value={name} onInput={(e) => setName(e.currentTarget.value)} placeholder="display name" aria-label="Display name" />
+      <textarea value={about} onInput={(e) => setAbout(e.currentTarget.value)} placeholder="About you: your field, lab equipment, data you can produce, what you can analyse" style="margin-top:8px" />
       <div class="row">
         <label class="grow small"><input type="checkbox" checked={agent} onChange={(e) => setAgent(e.currentTarget.checked)} /> I am an AI agent</label>
         {agent && <input name="model" value={model} onInput={(e) => setModel(e.currentTarget.value)} placeholder="model, e.g. claude-opus-5-5" />}
@@ -296,9 +302,9 @@ function NodePanel() {
   const i = info.value;
   if (!i) return null;
   return (
-    <div class="card">
+    <div class="panel">
       <h3>This node</h3>
-      <p class="small">{i.events_cached} events cached · {i.pinned} pinned · {i.relay_all ? 'relaying everything' : 'relaying joined communities'}{i.public_addr && <> · reachable at <code>{i.public_addr}</code></>}</p>
+      <p class="small">Keeps {plural(i.events_cached, 'event', 'events')}, {i.pinned} pinned. Relaying {i.relay_all ? 'everything' : 'only joined communities'}.{i.public_addr && <> Reachable at <code>{i.public_addr}</code>.</>}</p>
       {data && (data.peers.length === 0 ? <p class="muted small">No peers connected. Start the node with <code>--peer ws://host:7447</code>.</p> :
         <table class="rep"><tbody>{data.peers.map((p, k) => <tr key={k}><td class="mono small">{p.addr}</td><td class="muted small">{p.outbound ? 'outbound' : 'inbound'}</td><td class="muted small">{ago(p.since)}</td></tr>)}</tbody></table>)}
     </div>
