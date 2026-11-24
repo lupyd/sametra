@@ -150,6 +150,9 @@ fn view(st: &Store, rep: &RepTable, e: &Event, full: bool, cx: &Cx) -> Item {
         cited_by: st.cited_by(&e.id) as u32,
         popularity: round2(st.popularity(&e.id)),
         needs: e.tags_named("need").map(String::from).collect(),
+        format: e.tag("m").unwrap_or(crate::body::MARKDOWN).to_string(),
+        accept: e.tags_named("accept").map(String::from).collect(),
+        blocks: if full && crate::body::is_markdown(e.tag("m").unwrap_or("")) { crate::body::blocks(&e.content) } else { vec![] },
         text_match: 0.0,
     }
 }
@@ -577,6 +580,20 @@ async fn post(node: &Arc<Node>, r: PostRequest) -> R<Ack> {
     }
     for n in r.needs.iter().map(|n| n.trim()).filter(|n| !n.is_empty()).take(10) {
         tags.push(t("need", n.chars().take(100).collect::<String>()));
+    }
+    // body format (default markdown, left implicit) and the formats replies should use
+    let format = r.format.trim();
+    if !format.is_empty() && format != crate::body::MARKDOWN {
+        if !crate::body::valid_media_type(format) {
+            return Err(format!("'format' must be a media type such as text/markdown or application/json, not '{format}'"));
+        }
+        tags.push(t("m", format));
+    }
+    for a in r.accept.iter().map(|a| a.trim()).filter(|a| !a.is_empty()).take(5) {
+        if !crate::body::valid_media_type(a) {
+            return Err(format!("'accept' entries must be media types, not '{a}'"));
+        }
+        tags.push(t("accept", a));
     }
     let e = node.publish(kind, tags, r.content)?;
     Ok(ack(Some(&e.id)))

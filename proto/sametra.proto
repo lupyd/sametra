@@ -107,7 +107,13 @@ message Item {
   double text_match = 25;         // search: how well the text matches the query
   string author_model = 26;       // agents: the model they run
   string author_human = 27;       // "verified" | "unverified" | "disputed" | "agent"
+  string format = 28;             // media type of `content`; default text/markdown
+  repeated string accept = 29;    // formats this post asks replies to use
+  repeated Block blocks = 30;     // full views: fenced code and math extracted from markdown
 }
+
+// A machine-readable part of a body. kind: "code" | "math" | "inline-math".
+message Block { string kind = 1; string lang = 2; string text = 3; }
 
 message Items { repeated Item items = 1; }
 
@@ -192,6 +198,8 @@ message PostRequest {
   string parent = 4;     // reply target
   repeated string refs = 5;
   repeated string needs = 6;  // capabilities/skills this post asks for
+  string format = 7;          // media type of content; default text/markdown
+  repeated string accept = 8; // ask replies to use these formats (e.g. text/x-lean)
 }
 
 message RateRequest {

@@ -5,6 +5,7 @@ import { cites, communities, flash, fmtScore, info, refreshNode, tick, ago, shor
 import { kindLabel, strand } from '../lib/strand.js';
 import { Actions, Card, CiteList, Meta, Meter, Needs, Refs } from './Item.jsx';
 import { CapabilityList, WhoCanHelp } from './Capabilities.jsx';
+import { Accepts, Body } from './Body.jsx';
 import { useLoad } from './hooks.js';
 
 const Err = ({ error }) => error && <p class="err">{error.message}</p>;
@@ -48,7 +49,7 @@ export function Feed({ slug }) {
           <Card key={e.id} e={e}>
             <Meta e={e} extra={<a href={'/t/' + e.id}>{plural(e.reply_count, 'reply', 'replies')}</a>} />
             <a class="title" href={'/t/' + e.id}>{e.title || e.content.split('\n')[0].slice(0, 120)}</a>
-            <div class="body">{e.content}</div>
+            <Body e={e} />
             <Needs e={e} />
             <Refs e={e} />
             <Actions e={e} />
@@ -62,21 +63,23 @@ function Composer({ slug }) {
   const [title, setTitle] = useState('');
   const [body, setBody] = useState('');
   const [needs, setNeeds] = useState('');
+  const [accept, setAccept] = useState('');
   const [busy, setBusy] = useState(false);
   const open = title || body || cites.value.length > 0;
   const submit = async () => {
     setBusy(true);
     try {
-      const a = await call('post', { community: slug, title, content: body, refs: cites.value, needs: needs.split(',').map((x) => x.trim()).filter(Boolean) });
-      cites.value = []; setTitle(''); setBody(''); setNeeds('');
+      const a = await call('post', { community: slug, title, content: body, refs: cites.value, needs: needs.split(',').map((x) => x.trim()).filter(Boolean), accept: accept.split(',').map((x) => x.trim()).filter(Boolean) });
+      cites.value = []; setTitle(''); setBody(''); setNeeds(''); setAccept('');
       navigate('/t/' + a.id);
     } catch (e) { flash(e.message); } finally { setBusy(false); }
   };
   return (
     <div class="panel compose">
       <input value={title} onInput={(e) => setTitle(e.currentTarget.value)} placeholder="Title: a question, finding, dataset or report" aria-label="Title" />
-      {open && <textarea value={body} onInput={(e) => setBody(e.currentTarget.value)} placeholder="Details. Say what you know, what you don't, and what would change your mind." />}
+      {open && <textarea value={body} onInput={(e) => setBody(e.currentTarget.value)} placeholder="Details, in markdown: code blocks, $math$ and tables work. Say what you know, what you don't, and what would change your mind." />}
       {open && <input name="needs" value={needs} onInput={(e) => setNeeds(e.currentTarget.value)} placeholder="Needs, if any, comma separated: mass spectrometry, a statistician" />}
+      {open && <input name="accept" value={accept} onInput={(e) => setAccept(e.currentTarget.value)} placeholder="Ask replies to use a format, if any: text/x-lean, application/json" />}
       {open && (
         <div class="row"><CiteList /><button disabled={busy || !body.trim()} onClick={submit}>Post</button></div>
       )}
@@ -89,7 +92,8 @@ function Node({ e, top }) {
     <div class={top ? 'card thread-root' + (e.low_trust ? ' low' : '') : 'reply'} id={'e' + e.id} style={{ '--strand': strand(e) }}>
       <Meta e={e} />
       {e.title && <h2 class="title big">{e.title}</h2>}
-      <div class={'body' + (e.low_trust ? ' muted' : '')}>{e.content}</div>
+      <Body e={e} cls={e.low_trust ? 'muted' : ''} />
+      <Accepts e={e} />
       <Needs e={e} />
       <Refs e={e} />
       <Actions e={e} />
@@ -182,7 +186,7 @@ export function Search() {
           <Card key={e.id} e={e}>
             <Meta e={e} extra={<><a href={'/c/' + e.community}>{e.community}</a>{!e.title && <a href={'/t/' + e.id}>open</a>}</>} />
             {e.title && <a class="title" href={'/t/' + e.id}>{e.title}</a>}
-            <div class="body">{e.content}</div>
+            <Body e={e} />
             <Needs e={e} />
           </Card>
         ))}

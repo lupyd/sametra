@@ -588,3 +588,29 @@ async fn chains_of_reasoning_across_humans_and_models() {
     let c: pb::ChainResponse = n.ok("chain", &pb::ChainRequest { id: answer.id.hex(), depth: 0 }).await;
     assert_eq!(c.nodes[0].item.as_ref().unwrap().id, first.id.hex());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bodies_declare_formats_and_expose_blocks() {
+    let n = spawn(|_| {}).await;
+    let md = "Proof sketch, see $n^2$:\n\n```lean4\ntheorem t : 1 + 1 = 2 := rfl\n```\n\n$$x = 1$$\n";
+    let a: pb::Ack = n.ok("post", &pb::PostRequest { accept: vec!["text/x-lean".into(), "application/json".into()], ..post("m", "Prove it", md) }).await;
+    let e: pb::EventResponse = n.ok("event", &id(&a.id)).await;
+    let it = e.item.unwrap();
+    assert_eq!(it.format, "text/markdown", "markdown is the default and stays implicit");
+    assert_eq!(it.accept, ["text/x-lean", "application/json"]);
+    let blocks: Vec<(String, String)> = it.blocks.iter().map(|b| (b.kind.clone(), b.lang.clone())).collect();
+    assert_eq!(blocks, [("inline-math".into(), "tex".into()), ("code".into(), "lean4".into()), ("math".into(), "tex".into())]);
+    let raw: Event = serde_json::from_str(&e.raw_json).unwrap();
+    assert!(raw.tag("m").is_none());
+    // another format is declared with an `m` tag; its body is not parsed as markdown
+    let j: pb::Ack = n.ok("post", &pb::PostRequest { format: "application/json".into(), ..reply(&a.id, r#"{"proof":"rfl"}"#) }).await;
+    let e: pb::EventResponse = n.ok("event", &id(&j.id)).await;
+    let it = e.item.unwrap();
+    assert_eq!(it.format, "application/json");
+    assert!(it.blocks.is_empty());
+    // feeds stay light: blocks only in full views
+    let f: pb::Items = n.ok("feed", &pb::FeedRequest { community: "m".into(), ..Default::default() }).await;
+    assert!(f.items[0].blocks.is_empty());
+    assert!(n.err("post", &pb::PostRequest { format: "markdown".into(), ..post("m", "t", "x") }).await.1.contains("media type"));
+    assert!(n.err("post", &pb::PostRequest { accept: vec!["lean".into()], ..post("m", "t", "x") }).await.1.contains("media types"));
+}

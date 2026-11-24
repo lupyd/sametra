@@ -157,7 +157,7 @@ describe('feed', () => {
     await type(byPlaceholder('Details'), 'Asking for a friend');
     expect(root.textContent).toContain('builds on cccccccc');
     await click(button('Post'));
-    expect(sent('post')).toEqual([{ community: 'math', title: 'Is P = NP?', content: 'Asking for a friend', parent: '', refs: ['c'.repeat(64)], needs: [] }]);
+    expect(sent('post')).toEqual([{ community: 'math', title: 'Is P = NP?', content: 'Asking for a friend', parent: '', refs: ['c'.repeat(64)], needs: [], format: '', accept: [] }]);
     expect(loc.value).toBe('/t/' + 'f'.repeat(64));
     expect(cites.value).toEqual([]);
   });
@@ -186,8 +186,8 @@ describe('thread', () => {
     await mount('/t/' + ROOT, { thread: () => thread() });
     expect(sent('thread')[0]).toEqual({ id: ROOT, thread: false });
     expect($('h2.title').textContent).toBe('A title');
-    expect($('#e' + R1 + ' > .body').textContent).toBe('first');
-    expect($('#e' + R1 + ' .replies #e' + R2 + ' > .body').textContent).toBe('nested');
+    expect($('#e' + R1 + ' > .body').textContent.trim()).toBe('first');
+    expect($('#e' + R1 + ' .replies #e' + R2 + ' > .body').textContent.trim()).toBe('nested');
     expect($('a.back').getAttribute('href')).toBe('/c/math');
     const sections = $$('h3.section').map((h) => h.textContent);
     expect(sections).toEqual(['Builds on', 'Built upon by']);
@@ -213,7 +213,7 @@ describe('thread', () => {
     await click(button('reply', top.querySelector('.acts')));
     await type(byPlaceholder('Reply'), 'my answer');
     await click(button('Reply'));
-    expect(sent('post')).toEqual([{ community: '', title: '', content: 'my answer', parent: ROOT, refs: [], needs: [] }]);
+    expect(sent('post')).toEqual([{ community: '', title: '', content: 'my answer', parent: ROOT, refs: [], needs: [], format: '', accept: [] }]);
     expect(toast.value).toBe('Replied');
     expect(byPlaceholder('Reply')).toBeUndefined();
   });
@@ -539,3 +539,19 @@ describe('theme and chains', () => {
   });
 });
 
+
+describe('formats', () => {
+  it('replies can use the format a post asks for; other formats show as source', async () => {
+    const asked = item({ accept: ['text/x-lean'], content: 'Prove **this**' });
+    const json = item({ id: '3'.repeat(64), kind: 1111, title: '', format: 'application/json', content: '{"a":1}' });
+    await mount('/t/' + ROOT, { thread: () => ({ root: { ...asked, replies: [json] }, quoted_by: [], ref_events: [], thread_root: '' }), post: () => ({ ok: true, id: 'n'.repeat(64) }) });
+    expect($('#e' + ROOT + ' > .body strong').textContent).toBe('this');
+    expect($('#e' + ROOT).textContent).toContain('replies in text/x-lean');
+    expect($('#e' + '3'.repeat(64) + ' pre.source').dataset.format).toBe('application/json');
+    await click(button('reply', $('#e' + ROOT + ' > .acts')));
+    expect(byPlaceholder('Reply in text/x-lean')).toBeDefined();
+    await type(byPlaceholder('Reply in'), 'theorem t : True := trivial');
+    await click(button('Reply'));
+    expect(sent('post')[0]).toMatchObject({ parent: ROOT, format: 'text/x-lean' });
+  });
+});

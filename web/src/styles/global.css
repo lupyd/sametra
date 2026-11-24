@@ -182,3 +182,22 @@ ol.chain > li::after { content: ""; position: absolute; left: 3px; top: 6px; wid
 ol.chain > li.focus::after { background: var(--strand); }
 ol.chain .joins { font-size: 12.5px; color: var(--mute); }
 ol.chain .joins a { color: var(--acc); }
+
+/* ---- message bodies: markdown -------------------------------------------- */
+.body.md { white-space: normal; }
+.body.md > :first-child { margin-top: 0; }
+.body.md > :last-child { margin-bottom: 0; }
+.body.md p, .body.md ul, .body.md ol, .body.md blockquote, .body.md table, .body.md pre { margin: 0 0 .7em; }
+.body.md ul, .body.md ol { padding-left: 1.4em; }
+.body.md h1, .body.md h2, .body.md h3, .body.md h4 { font-family: var(--sans); font-size: 1em; font-weight: 650; margin: 1em 0 .4em; }
+.body.md blockquote { border-left: 3px solid var(--line); padding-left: 12px; color: var(--mute); }
+.body.md a { color: var(--acc); text-decoration: underline; text-underline-offset: 2px; text-decoration-thickness: 1px; }
+.body.md a.mention { text-decoration: none; font-family: var(--sans); font-size: .92em; font-weight: 600; }
+.body.md pre, .body pre.source { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r); padding: 10px 12px; overflow-x: auto; white-space: pre; }
+.body.md pre code, .body pre.source code { background: none; padding: 0; color: var(--ink); font-size: 13px; overflow-wrap: normal; }
+.body.md :not(pre) > code { font-size: .86em; }
+.body.md table { border-collapse: collapse; font-family: var(--sans); font-size: 14px; display: block; overflow-x: auto; }
+.body.md th, .body.md td { border-bottom: 1px solid var(--line); padding: 5px 12px 5px 0; text-align: left; }
+.body.md hr { border: 0; border-top: 1px solid var(--line); }
+.math { font-family: var(--mono); font-size: .9em; color: var(--acc); }
+div.math { padding: 6px 0; overflow-x: auto; white-space: pre; }

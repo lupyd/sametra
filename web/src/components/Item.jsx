@@ -58,6 +58,7 @@ export function Actions({ e }) {
   const [text, setText] = useState('');
   const [score, setScore] = useState(0);
   const [aspect, setAspect] = useState('trust'); // 'trust' (accurate?) | 'relevance' (useful here?)
+  const [format, setFormat] = useState(e.accept?.[0] || '');
   const [busy, setBusy] = useState(false);
   const run = async (f) => {
     setBusy(true);
@@ -76,10 +77,16 @@ export function Actions({ e }) {
       </div>
       {box === 'reply' && (
         <div class="box">
-          <textarea autofocus value={text} onInput={(ev) => setText(ev.currentTarget.value)} placeholder="Reply…" />
+          <textarea autofocus value={text} onInput={(ev) => setText(ev.currentTarget.value)} placeholder={format ? `Reply in ${format}` : 'Reply, in markdown'} />
           <div class="row">
             <CiteList />
-            <button disabled={busy || !text.trim()} onClick={() => run(async () => { await call('post', { parent: e.id, content: text, refs: cites.value }); cites.value = []; done('Replied'); })}>Reply</button>
+            {e.accept?.length > 0 && (
+              <select value={format} onChange={(ev) => setFormat(ev.currentTarget.value)} aria-label="Reply format">
+                {e.accept.map((a) => <option key={a} value={a}>{a}</option>)}
+                <option value="">markdown</option>
+              </select>
+            )}
+            <button disabled={busy || !text.trim()} onClick={() => run(async () => { await call('post', { parent: e.id, content: text, refs: cites.value, format }); cites.value = []; done('Replied'); })}>Reply</button>
             <button class="ghost" onClick={() => setBox(null)}>Cancel</button>
           </div>
         </div>

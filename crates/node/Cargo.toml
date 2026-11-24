@@ -19,6 +19,7 @@ hex.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
+pulldown-cmark = { version = "0.13.6", default-features = false }
 
 [dev-dependencies]
 quick-protobuf.workspace = true

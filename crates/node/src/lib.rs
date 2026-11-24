@@ -8,6 +8,7 @@ pub use sametra_proto::{event, pb};
 pub use sametra_transport as transport;
 
 pub mod api;
+pub mod body;
 pub mod http;
 pub mod index;
 pub mod node;

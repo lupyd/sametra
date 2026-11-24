@@ -4,6 +4,7 @@ import { call } from '../lib/api.js';
 import { short } from '../lib/state.js';
 import { kindLabel, strand } from '../lib/strand.js';
 import { Meta, Needs } from './Item.jsx';
+import { Body } from './Body.jsx';
 import { useLoad } from './hooks.js';
 
 const JOINS = { reply: 'replies to', cites: 'builds on' };
@@ -44,7 +45,7 @@ export function Chain({ id }) {
               )}
               <Meta e={e} extra={<><span>in {e.community}</span><a href={'/t/' + e.id}>open</a></>} />
               {e.title && <a class="title" href={'/t/' + e.id}>{e.title}</a>}
-              <div class="body">{e.content}</div>
+              <Body e={e} />
               <Needs e={e} />
             </li>
           );

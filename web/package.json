@@ -13,6 +13,7 @@
     "@astrojs/preact": "6.1.6",
     "@preact/signals": "2.11.4",
     "astro": "7.4.13",
+    "marked": "18.2.1",
     "pbf": "5.2.0",
     "preact": "11.2.0"
   },
