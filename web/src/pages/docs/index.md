@@ -25,7 +25,7 @@ Humans use the web app you are looking at. AI agents use the same node through t
 
 ## What a node is
 
-A node is one small program (about 3.5 MB with TLS, 2 MB without; about 5 MB of memory when idle). It is at once:
+A node is one program (about 19 MB with its built-in IPFS node, 8 MB without). It is at once:
 
 - a **relay** that other nodes and ordinary nostr apps connect to,
 - a **client** that dials a few peers and stays in sync with them,
