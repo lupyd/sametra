@@ -1,36 +1,39 @@
 ---
 layout: ../../layouts/Docs.astro
 title: Retention & pinning
-description: Why posts fade when their author leaves, and how pinning keeps the work that matters.
+description: Posts live as long as some node keeps them. Each node decides what to forget; authors host their own work for as long as they like.
 ---
 
-Sametra has no permanent server, so "how long does a post live?" has a precise answer: as long as some node keeps it. A node keeps an event while **any** of these is true:
+Sametra has no permanent server, so "how long does a post live?" has a precise answer: as long as some node keeps it. Nothing expires because its author went quiet. Content fades only when the nodes holding it forget it, and **each node decides for itself what to forget**.
 
-1. its own identity wrote it,
-2. it is **pinned** on this node,
-3. it is small metadata (a profile, a community definition, a rating), which every node needs,
-4. its author has been seen on the network recently: any event or presence heartbeat within `--author-ttl-hours` (one week by default), **extended for popular content** (below).
+## What a node never forgets
 
-Everything else is evicted. On top of that, each node caps its cache at `--max-events` (200 000 by default); when it overflows, the **least popular** unprotected events go first, older before newer, down to 90 % of the cap.
+1. events its own identity wrote: **you host your own work for as long as you run a node**,
+2. events **pinned** on it,
+3. small metadata every node needs: profiles, community definitions, ratings, capabilities, file metadata.
 
-## Popular content lasts longer
+## What it forgets, and in which order
 
-Each node keeps a local, decaying usage counter for every event: being viewed (+1), fetched by a peer (+1) and returned by a search (+0.2). It halves every week without use. Citations by other posts count too, double. Together:
+Everything else stays until the node needs room. Each node caps its cache at `--max-events` (200 000 by default). When the cache overflows, the node drops its lowest-ranked events down to 90 % of the cap. How it ranks is its own choice, `--keep`:
 
-```
-keep score = ln(1 + popularity + 2 · citations)
-grace      = author TTL × min(10, 1 + keep score)
-```
+| strategy | keeps first |
+|---|---|
+| `balanced` (default) | standing (the author's [reputation](/docs/reputation) in the post's community, plus the post's own score) and use, minus age: `2·standing + ln(1 + popularity + 2·citations) − age in months` |
+| `reputation` | standing; use only breaks ties. Work by trusted people, and well-rated posts, stay longest |
+| `popularity` | what is used and cited, minus age |
+| `recent` | the newest |
 
-So a post nobody reads fades one week after its author leaves; a post that keeps being cited, read and found can stay up to ten weeks, and is the last to go when the cache is full. Popularity is local: each node only counts what it saw itself, so nobody can inflate it from outside. It is saved with the node's state.
+A node can also forget others' unpinned posts past an age it chooses, `--forget-after-days N`. Without it, age only matters through the ranking.
 
-Content that is used keeps getting refreshed, and content that is no longer used fades eventually. Only a pin keeps something for good.
+**Popularity** is a local, decaying count of how often an event was viewed (+1), fetched by a peer (+1) or returned by a search (+0.2); it halves every week without use. Citations by other posts count double. Popularity is local: each node only counts what it saw itself, so nobody can inflate it from outside. It is saved with the node's state.
+
+Because every node chooses, the network keeps what its members value: well-regarded and much-used work is held by many nodes and survives cache pressure everywhere, while unread, low-standing posts thin out. Strategies are a node's own business, so new ones can be added without anyone else changing.
 
 ## What that means in practice
 
-- **While you are around, your posts are everywhere.** Your node announces your presence with a heartbeat every two minutes, so other nodes keep your work.
-- **When you leave for good**, a week later nodes start dropping your unpinned posts. The network forgets, the way IPFS forgets unpinned content.
-- **Good work survives its author.** Anyone can pin a post or a whole thread. Their node then keeps it forever and serves it to anyone who asks; other nodes find it through [remote lookups](/docs/architecture#reaching-the-rest-of-the-network).
+- **Your posts live on your node for good**, and on every node that has room for them or values them.
+- **Leaving does not erase you.** Other nodes keep your work as long as their strategy ranks it high enough. If you stop running a node, your posts last as long as others keep them.
+- **Good work survives.** Anyone can pin a post or a whole thread; their node then keeps it and serves it to anyone who asks. Other nodes find it through [remote lookups](/docs/architecture#reaching-the-rest-of-the-network).
 - **Your own posts never leave your node.** Delete them if you want them gone everywhere.
 
 ## Pinning
@@ -47,4 +50,4 @@ Pins are stored in `state.pb` and survive restarts. A pin is a decision of *your
 
 ## Evicted means evicted
 
-Evictions are recorded in the log as tombstones, so an evicted event stays gone after a restart instead of being replayed from the log. A node that needs it again can always fetch it from a peer that still has it.
+Evictions are recorded in the log as tombstones, so an evicted event stays gone after a restart instead of being replayed from the log. A node that needs it again can fetch it from a peer that still has it.

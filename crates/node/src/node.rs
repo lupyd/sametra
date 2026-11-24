@@ -29,7 +29,10 @@ pub struct Config {
     pub relay_all: bool,
     pub max_events: usize,
     pub max_peers: usize,
-    pub author_ttl: u64,
+    /// What to forget first when the cache is full.
+    pub keep: Keep,
+    /// Forget unprotected events older than this (seconds); None: only when full.
+    pub max_age: Option<u64>,
     pub api_token: Option<String>,
     /// Serve HTTPS/WSS on the same port as plain HTTP/WS (PEM chain and key).
     pub tls_cert: Option<PathBuf>,
@@ -78,13 +81,40 @@ impl Default for Config {
             relay_all: true,
             max_events: 200_000,
             max_peers: 8,
-            author_ttl: 168 * 3600,
+            keep: Keep::Balanced,
+            max_age: None,
             api_token: None,
             tls_cert: None,
             tls_key: None,
             tls_ca: vec![],
             trusted: vec![],
         }
+    }
+}
+
+/// What a node forgets first when its cache is full: its own choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Keep {
+    /// standing (author reputation and post score) and use (citations, views, searches), minus age
+    Balanced,
+    /// standing first; use only breaks ties
+    Reputation,
+    /// use and citations, minus age
+    Popularity,
+    /// newest first
+    Recent,
+}
+
+impl std::str::FromStr for Keep {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Keep, String> {
+        Ok(match s {
+            "balanced" => Keep::Balanced,
+            "reputation" => Keep::Reputation,
+            "popularity" => Keep::Popularity,
+            "recent" => Keep::Recent,
+            _ => return Err(format!("--keep: '{s}' (use balanced, reputation, popularity or recent)")),
+        })
     }
 }
 
@@ -361,6 +391,31 @@ impl Node {
         self.ingest(e, ORIGIN_LOCAL, true).map(|(e, _)| e)
     }
 
+    /// This node's ranking of what to keep (see [`Keep`]). Reputation tables are
+    /// gathered first, so ranking needs no further locks; only when the cache is
+    /// full or an age limit is set does it cost anything.
+    pub fn ranking(&self) -> impl Fn(&Store, &Event) -> f64 + use<> {
+        let (full, keep) = (self.store.lock().unwrap().len() > self.cfg.max_events, self.cfg.keep);
+        let mut reps: HashMap<String, Arc<RepTable>> = HashMap::new();
+        if full && matches!(keep, Keep::Balanced | Keep::Reputation) {
+            let comms: Vec<String> = self.store.lock().unwrap().communities().map(|(c, _)| c.clone()).collect();
+            for c in comms {
+                let t = self.reputation(&c);
+                reps.insert(c, t);
+            }
+        }
+        move |s: &Store, e: &Event| {
+            // standing: the author's reputation where the post lives, plus the post's own score
+            let standing = || e.community().and_then(|c| reps.get(c)).map(|t| t.user(&e.pubkey) + t.event(&e.id)).unwrap_or(0.0);
+            match keep {
+                Keep::Balanced => 2.0 * standing() + s.usage_rank(e),
+                Keep::Reputation => 100.0 * standing() + 0.01 * s.usage_rank(e),
+                Keep::Popularity => s.usage_rank(e),
+                Keep::Recent => e.created_at as f64,
+            }
+        }
+    }
+
     pub fn reputation(&self, community: &str) -> Arc<RepTable> {
         if let Some(t) = self.rep_cache.lock().unwrap().get(community) {
             return t.clone();
@@ -481,9 +536,9 @@ impl Node {
         out
     }
 
-    /// Participants seen recently (within the author TTL) who carry `community`.
+    /// Participants seen recently (within `PRESENCE_TTL`) who carry `community`.
     pub fn members(&self, community: &str) -> usize {
-        let cut = now().saturating_sub(self.cfg.author_ttl);
+        let cut = now().saturating_sub(crate::store::PRESENCE_TTL);
         self.members.lock().unwrap().get(community).map(|m| m.values().filter(|t| **t >= cut).count()).unwrap_or(0)
     }
 
@@ -744,8 +799,10 @@ pub fn spawn_background(node: Arc<Node>) {
             n.store.lock().unwrap().flush();
             if i.is_multiple_of(12) {
                 let evicted = {
+                    let rank = n.ranking();
+                    let r = crate::store::Retention { max_events: n.cfg.max_events, max_age: n.cfg.max_age };
                     let mut st = n.store.lock().unwrap();
-                    let k = st.evict(&n.keys.pubkey, n.cfg.author_ttl, n.cfg.max_events);
+                    let k = st.evict(&n.keys.pubkey, &r, |s, e| rank(s, e));
                     if let Err(e) = st.compact_if_needed(false) {
                         tracing::warn!(error = %e, "compacting the event log failed");
                     }
@@ -758,7 +815,7 @@ pub fn spawn_background(node: Arc<Node>) {
                 let cut = now().saturating_sub(1200);
                 n.seen.lock().unwrap().retain(|_, t| *t > cut);
                 n.searches.lock().unwrap().retain(|_, t| *t + 120 > now());
-                let gone = now().saturating_sub(n.cfg.author_ttl);
+                let gone = now().saturating_sub(crate::store::PRESENCE_TTL);
                 n.members.lock().unwrap().retain(|_, m| {
                     m.retain(|_, t| *t >= gone);
                     !m.is_empty()

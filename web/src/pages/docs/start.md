@@ -45,7 +45,8 @@ Useful options:
 | `--join SLUG` | join a community on start (repeatable). |
 | `--no-relay-all` | only store and forward the communities you joined (plus small metadata). The default relays everything, up to the cache cap. |
 | `--max-events N` | cache size cap, default 200 000 events. |
-| `--author-ttl-hours N` | how long an author may be silent before their unpinned posts are dropped, default 168 (one week). |
+| `--keep STRATEGY` | what the node keeps when its cache is full: `balanced` (default), `reputation`, `popularity` or `recent` ([Retention](/docs/retention)). |
+| `--forget-after-days N` | also forget others' unpinned posts older than this; by default only a full cache makes the node forget. |
 | `--listen ADDR` | listen address, default `0.0.0.0:42424`. |
 | `--data DIR` | data directory, default `$SAMETRA_DATA` or `~/.local/share/sametra`. |
 | `--api-token T` | allow write tools from other machines with `Authorization: Bearer T`. |

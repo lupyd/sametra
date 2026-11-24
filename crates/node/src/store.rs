@@ -1,15 +1,14 @@
 //! In-memory indexed event cache backed by an append-only log.
 //!
-//! Retention model (see README): an event lives on this node while
-//!  * it was authored by this node's identity, or
-//!  * it is pinned here, or
-//!  * it is small metadata (profiles, community definitions, ratings, capabilities, file metadata), or
-//!  * its author has been seen on the network within `author_ttl`, extended for
-//!    popular content (cited, viewed, fetched, found by searches) by up to 10x
+//! Retention: content fades when nodes forget it, and each node decides what to
+//! forget. Whether the author is still around plays no part: an author keeps
+//! hosting their own posts for as long as they run a node.
 //!
-//! and the cache is under `max_events`; when it is over, the least popular and
-//! oldest unprotected events go first. Content whose author vanished therefore
-//! fades unless it is pinned somewhere; popular content just fades more slowly.
+//! Never forgotten here: this node's own events, events pinned here, and small
+//! metadata (profiles, community definitions, ratings, capabilities, file
+//! metadata). Everything else is kept until the node needs room (`max_events`)
+//! or it passes the node's own age limit (`max_age`, off by default); then the
+//! node's ranking (`rank`, see `node::Keep`) decides what goes first.
 
 use crate::event::*;
 use crate::index::{Hit, Index};
@@ -20,6 +19,17 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 pub type Ev = Arc<Event>;
+
+/// How long a participant counts as present after their last event or heartbeat
+/// (community member counts); it has no effect on what is kept.
+pub const PRESENCE_TTL: u64 = 7 * 86400;
+
+/// When a node forgets: over `max_events`, or older than `max_age` (seconds).
+#[derive(Debug, Clone)]
+pub struct Retention {
+    pub max_events: usize,
+    pub max_age: Option<u64>,
+}
 
 pub enum Insert {
     Stored(Ev),
@@ -314,35 +324,23 @@ impl Store {
     }
 
     /// Drop content of vanished authors and enforce the cache size cap.
-    pub fn evict(&mut self, own: &H32, author_ttl: u64, max_events: usize) -> usize {
+    pub fn evict(&mut self, own: &H32, r: &Retention, rank: impl Fn(&Store, &Event) -> f64) -> usize {
         let now = now();
         let protected = |s: &Store, e: &Event| e.pubkey == *own || s.pinned.contains(&e.id) || is_metadata(e.kind);
-        // popular content outlives its author for longer: up to 10x the TTL
-        let grace = |s: &Store, e: &Event| (1.0 + s.keep_score(&e.id)).min(10.0);
-        let dead: Vec<H32> = self
-            .ev
-            .values()
-            .filter(|e| !protected(self, e))
-            .filter(|e| {
-                let seen = self.last_seen.get(&e.pubkey).copied().unwrap_or(0);
-                (seen as f64 + author_ttl as f64 * grace(self, e)) < now as f64
-            })
-            .map(|e| e.id)
-            .collect();
+        // past this node's own age limit, if it has one
+        let dead: Vec<H32> = match r.max_age {
+            Some(age) => self.ev.values().filter(|e| !protected(self, e) && e.created_at + age < now).map(|e| e.id).collect(),
+            None => vec![],
+        };
         let mut n = dead.len();
         for id in dead {
             self.remove(&id);
             self.tombstone(&id);
         }
-        if self.ev.len() > max_events {
-            let target = max_events - max_events / 10;
-            // least popular first; among equals, oldest first (a month of age ~ one doubling of use)
-            let mut cands: Vec<(f64, H32)> = self
-                .ev
-                .values()
-                .filter(|e| !protected(self, e))
-                .map(|e| (self.keep_score(&e.id) - now.saturating_sub(e.created_at) as f64 / (30.0 * 86400.0), e.id))
-                .collect();
+        if self.ev.len() > r.max_events {
+            let target = r.max_events - r.max_events / 10;
+            // lowest-ranked first; ties by id, so every run agrees
+            let mut cands: Vec<(f64, H32)> = self.ev.values().filter(|e| !protected(self, e)).map(|e| (rank(self, e), e.id)).collect();
             cands.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
             let victims: Vec<H32> = cands.into_iter().take(self.ev.len() - target).map(|x| x.1).collect();
             n += victims.len();
@@ -352,7 +350,7 @@ impl Store {
             }
         }
         // forget presence of authors with nothing left here and long gone
-        let cutoff = now.saturating_sub(author_ttl);
+        let cutoff = now.saturating_sub(PRESENCE_TTL);
         let ev = &self.ev;
         if self.last_seen.len() > 4 * ev.len() + 1024 {
             let alive: HashSet<H32> = ev.values().map(|e| e.pubkey).collect();
@@ -364,6 +362,12 @@ impl Store {
             self.index.rebuild(evs.iter().map(|e| &**e));
         }
         n
+    }
+
+    /// Default ranking: how used and cited something is, minus its age (a month
+    /// of age weighs like one doubling of use).
+    pub fn usage_rank(&self, e: &Event) -> f64 {
+        self.keep_score(&e.id) - now().saturating_sub(e.created_at) as f64 / (30.0 * 86400.0)
     }
 
     // ---- popularity ----------------------------------------------------------
@@ -468,10 +472,11 @@ mod tests {
         let mut s = Store::open(dir.clone(), HashSet::new()).unwrap();
         let c = vec!["c".to_string(), "math".to_string()];
         let root = me.sign(K_POST, vec![c.clone()], "root".into());
-        let reply = other.sign(
+        let reply = other.sign_at(
             K_REPLY,
             vec![c.clone(), vec!["e".into(), root.id.hex(), "".into(), "root".into()], vec!["e".into(), root.id.hex(), "".into(), "reply".into()]],
             "reply".into(),
+            now() - 7200,
         );
         assert!(matches!(s.insert(root.clone()), Insert::Stored(_)));
         assert!(matches!(s.insert(reply.clone()), Insert::Stored(_)));
@@ -487,16 +492,18 @@ mod tests {
         s.insert(p2);
         assert!(s.replaceable(&other.pubkey, K_PROFILE, "").unwrap().content.contains("\"b\""));
 
-        // other's author went silent -> their reply is evicted, our root stays
+        // an author going silent changes nothing: nodes forget by their own rules
         s.last_seen.insert(other.pubkey, 1);
-        assert_eq!(s.evict(&me.pubkey, 3600, 1000), 1);
+        assert_eq!(s.evict(&me.pubkey, &keep(1000), Store::usage_rank), 0);
+        // a node that forgets after an hour drops the old reply, never its own root
+        let hour = Retention { max_events: 1000, max_age: Some(3600) };
+        assert_eq!(s.evict(&me.pubkey, &hour, Store::usage_rank), 1);
         assert!(s.contains(&root.id) && !s.contains(&reply.id));
 
         // pinned content survives
         s.insert(reply.clone());
         s.pin([reply.id], true);
-        s.last_seen.insert(other.pubkey, 1);
-        assert_eq!(s.evict(&me.pubkey, 3600, 1000), 0);
+        assert_eq!(s.evict(&me.pubkey, &hour, Store::usage_rank), 0);
 
         s.flush();
         drop(s);
@@ -659,10 +666,9 @@ mod tests {
         for p in &posts {
             s.insert(p.clone());
         }
-        s.touch(other.pubkey, now()); // author is alive: only the cap applies
-        assert_eq!(s.evict(&me.pubkey, 3600, 1000), 0);
+        assert_eq!(s.evict(&me.pubkey, &keep(1000), Store::usage_rank), 0);
         assert_eq!(s.len(), 23);
-        let n = s.evict(&me.pubkey, 3600, 10);
+        let n = s.evict(&me.pubkey, &keep(10), Store::usage_rank);
         assert_eq!(s.len(), 9, "trimmed to 90% of the cap");
         assert_eq!(n, 14);
         assert!(s.contains(&mine.id) && s.contains(&pinned.id) && s.contains(&profile.id));
@@ -670,18 +676,22 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    fn keep(max_events: usize) -> Retention {
+        Retention { max_events, max_age: None }
+    }
+
     #[test]
-    fn touch_keeps_authors_alive() {
-        let (mut s, dir) = open("touch");
+    fn silent_authors_are_not_forgotten() {
+        let (mut s, dir) = open("silent");
         let (me, other) = (Keys::generate(), Keys::generate());
         let old = at(&other, K_POST, tg(&[&["c", "m"]]), "old", 1000);
         s.insert(old.clone());
         assert_eq!(s.last_seen[&other.pubkey], 1000);
-        s.touch(other.pubkey, now()); // e.g. a heartbeat
-        s.touch(other.pubkey, 5); // never moves backwards
-        assert_eq!(s.evict(&me.pubkey, 3600, 1000), 0);
-        s.last_seen.insert(other.pubkey, now() - 7200);
-        assert_eq!(s.evict(&me.pubkey, 3600, 1000), 1);
+        s.touch(other.pubkey, 5); // presence never moves backwards
+        assert_eq!(s.last_seen[&other.pubkey], 1000);
+        // unseen for decades, still kept while there is room
+        assert_eq!(s.evict(&me.pubkey, &keep(1000), Store::usage_rank), 0);
+        assert!(s.contains(&old.id));
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -713,8 +723,7 @@ mod tests {
         for i in 0..400 {
             s.insert(at(&other, K_POST, tg(&[&["c", "m"]]), &format!("x{i}"), 100 + i));
         }
-        s.last_seen.insert(other.pubkey, 1);
-        assert_eq!(s.evict(&me.pubkey, 3600, 100_000), 400);
+        assert_eq!(s.evict(&me.pubkey, &Retention { max_events: 100_000, max_age: Some(3600) }, Store::usage_rank), 400);
         s.flush();
         let log = dir.join("events.pb");
         let before = fs::metadata(&log).unwrap().len();
@@ -766,22 +775,21 @@ mod tests {
     }
 
     #[test]
-    fn popular_content_outlives_its_author_longer() {
-        let (mut s, dir) = open("grace");
-        let (me, gone) = (Keys::generate(), Keys::generate());
-        let plain = at(&gone, K_POST, tg(&[&["c", "m"]]), "plain", 100);
-        let popular = at(&gone, K_POST, tg(&[&["c", "m"]]), "popular", 101);
-        s.insert(plain.clone());
-        s.insert(popular.clone());
-        s.bump(&popular.id, 20.0);
-        // author last seen 2 TTLs ago: plain content is gone, popular content stays
-        s.last_seen.insert(gone.pubkey, now() - 7200);
-        assert_eq!(s.evict(&me.pubkey, 3600, 1000), 1);
-        assert!(!s.contains(&plain.id) && s.contains(&popular.id));
-        // ...but not forever: grace is capped at 10 TTLs
-        s.last_seen.insert(gone.pubkey, now() - 11 * 3600);
-        assert_eq!(s.evict(&me.pubkey, 3600, 1000), 1);
-        assert!(!s.contains(&popular.id));
+    fn each_node_ranks_by_its_own_strategy() {
+        let (mut s, dir) = open("strategy");
+        let (me, a, b) = (Keys::generate(), Keys::generate(), Keys::generate());
+        let t = now();
+        let from_a: Vec<Event> = (0..6).map(|i| at(&a, K_POST, tg(&[&["c", "m"]]), &format!("a{i}"), t - 100 + i)).collect();
+        let from_b: Vec<Event> = (0..6).map(|i| at(&b, K_POST, tg(&[&["c", "m"]]), &format!("b{i}"), t - 50 + i)).collect();
+        for e in from_a.iter().chain(&from_b) {
+            s.insert(e.clone());
+        }
+        // a node that values A's work (say, by reputation) keeps A's posts, whatever their age
+        let favour_a = |_: &Store, e: &Event| if e.pubkey == a.pubkey { 1.0 } else { 0.0 };
+        s.evict(&me.pubkey, &keep(10), favour_a);
+        assert_eq!(s.len(), 9);
+        assert!(from_a.iter().all(|e| s.contains(&e.id)));
+        assert_eq!(from_b.iter().filter(|e| s.contains(&e.id)).count(), 3);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -801,8 +809,7 @@ mod tests {
             s.insert(at(&other, K_POST, tg(&[&["c", "x"], &["q", &old_cited.id.hex()]]), &format!("cite {}", s.len()), t));
         }
         s.bump(&hot.id, 50.0);
-        s.touch(other.pubkey, t);
-        s.evict(&me.pubkey, 3600, 10);
+        s.evict(&me.pubkey, &keep(10), Store::usage_rank);
         assert_eq!(s.len(), 9);
         assert!(s.contains(&old_cited.id), "cited content survives the cap");
         assert!(s.contains(&hot.id), "used content survives the cap");

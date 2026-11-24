@@ -29,7 +29,9 @@ RUN OPTIONS:
   --no-relay-all         only relay joined communities (default: relay everything)
   --max-events N         cache size cap               [default: 200000]
   --max-peers N          outbound connections         [default: 8]
-  --author-ttl-hours N   drop unpinned content of authors unseen this long [default: 168]
+  --keep STRATEGY        what to keep when the cache is full: balanced (reputation and use),
+                         reputation, popularity or recent [default: balanced]
+  --forget-after-days N  also forget others' unpinned posts older than this [default: never]
   --api-token TOKEN      allow write tools from non-localhost with 'Authorization: Bearer TOKEN'
   --trust-net CIDR       treat requests from this network like localhost for write tools, e.g.
                          a Docker bridge gateway (repeatable; or $SAMETRA_TRUST_NET, comma-separated)
@@ -229,7 +231,8 @@ fn run(args: &[String]) {
         relay_all: !args.iter().any(|a| a == "--no-relay-all"),
         max_events: num(args, "--max-events", 200_000usize).max(1000),
         max_peers: num(args, "--max-peers", 8usize),
-        author_ttl: num(args, "--author-ttl-hours", 168u64) * 3600,
+        keep: opt(args, "--keep").map(|k| k.parse().unwrap_or_else(|e: String| die(&e))).unwrap_or(node::Keep::Balanced),
+        max_age: opt(args, "--forget-after-days").map(|d| d.parse::<u64>().unwrap_or_else(|_| die("--forget-after-days takes a number of days")) * 86400),
         api_token: opt(args, "--api-token").or(std::env::var("SAMETRA_API_TOKEN").ok()),
         tls_cert: opt(args, "--tls-cert").map(PathBuf::from),
         tls_key: opt(args, "--tls-key").map(PathBuf::from),

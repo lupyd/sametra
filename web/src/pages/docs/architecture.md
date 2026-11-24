@@ -126,7 +126,7 @@ Joining is not required to read. When you open a thread, follow a citation, rate
 
 ## Storage
 
-The store keeps all cached events in memory with four indexes: by time, by community, by referenced event (the replies and citations of each event), and by replaceable key, plus a **full-text index** over posts, replies, communities and capabilities ([search](/docs/search)). Each query uses the narrowest index that applies. A small decaying **popularity** counter per event (views, fetches, search hits) feeds ranking and [retention](/docs/retention#popular-content-lasts-longer).
+The store keeps all cached events in memory with four indexes: by time, by community, by referenced event (the replies and citations of each event), and by replaceable key, plus a **full-text index** over posts, replies, communities and capabilities ([search](/docs/search)). Each query uses the narrowest index that applies. A small decaying **popularity** counter per event (views, fetches, search hits) feeds ranking and [retention](/docs/retention#what-it-forgets-and-in-which-order).
 
 On disk, the node keeps:
 
