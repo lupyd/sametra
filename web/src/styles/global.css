@@ -86,6 +86,9 @@ aside .c.find { color: var(--acc); }
 .bar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 14px; }
 .about { margin: -6px 0 18px; color: var(--mute); font-family: var(--serif); font-size: 16px; }
 .back { font-weight: 600; color: var(--mute); }
+.crumbs { display: flex; flex-wrap: wrap; gap: 4px 0; align-items: baseline; font-size: 14px; color: var(--mute); }
+.crumbs a + a::before { content: "/"; margin: 0 8px; color: var(--line); }
+.crumbs a:last-child { color: var(--ink); }
 .section { margin: 32px 0 10px; font-size: 15px; font-weight: 650; }
 
 /* ---- posts: a list on paper, each hanging on its author's strand ------- */

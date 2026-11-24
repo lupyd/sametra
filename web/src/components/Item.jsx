@@ -1,5 +1,6 @@
 import { useState } from 'preact/hooks';
 import { call } from '../lib/api.js';
+import { navigate } from '../lib/router.js';
 import { ago, cites, flash, fmtScore, short, tick } from '../lib/state.js';
 import { kindLabel, strand } from '../lib/strand.js';
 
@@ -54,7 +55,8 @@ export function Refs({ e }) {
 const done = (msg) => { flash(msg); tick.value++; };
 
 export function Actions({ e }) {
-  const [box, setBox] = useState(null); // 'reply' | 'rate' | null
+  const [box, setBox] = useState(null); // 'reply' | 'rate' | 'branch' | null
+  const [title, setTitle] = useState('');
   const [text, setText] = useState('');
   const [score, setScore] = useState(0);
   const [aspect, setAspect] = useState('trust'); // 'trust' (accurate?) | 'relevance' (useful here?)
@@ -72,6 +74,7 @@ export function Actions({ e }) {
         <button class="link" onClick={() => toggle('rate')}>rate</button>
         <button class="link" title="Cite this in your next post or reply" onClick={() => { if (!cites.value.includes(e.id)) cites.value = [...cites.value, e.id]; flash('Your next post will build on ' + short(e.id)); }}>build on</button>
         <a class="link" href={'/chain/' + e.id}>chain</a>
+        {e.root && <button class="link" title="Open a subtopic of this thread that builds on this reply" onClick={() => toggle('branch')}>branch</button>}
         <button class="link" onClick={() => run(async () => { const a = await call(e.pinned ? 'unpin' : 'pin', { id: e.id, thread: true }); done((e.pinned ? 'Unpinned ' : 'Pinned ') + a.count); })}>{e.pinned ? 'unpin' : 'pin'}</button>
         {e.mine && <button class="link" onClick={() => confirm('Retract this from the whole network?') && run(async () => { await call('delete', { id: e.id }); done('Retracted'); })}>delete</button>}
       </div>
@@ -88,6 +91,21 @@ export function Actions({ e }) {
             )}
             <button disabled={busy || !text.trim()} onClick={() => run(async () => { await call('post', { parent: e.id, content: text, refs: cites.value, format }); cites.value = []; done('Replied'); })}>Reply</button>
             <button class="ghost" onClick={() => setBox(null)}>Cancel</button>
+          </div>
+        </div>
+      )}
+      {box === 'branch' && (
+        <div class="box">
+          <input value={title} onInput={(ev) => setTitle(ev.currentTarget.value)} placeholder="Subtopic title" aria-label="Subtopic title" />
+          <textarea value={text} onInput={(ev) => setText(ev.currentTarget.value)} placeholder="What the subtopic will work out, in markdown" style="margin-top:8px" />
+          <div class="row">
+            <span class="grow muted small">Opens a subtopic of this thread that builds on this reply.</span>
+            <button disabled={busy || !title.trim() || !text.trim()} onClick={() => run(async () => {
+              const a = await call('post', { topic: e.root, title, content: text, refs: [e.id] });
+              setTitle('');
+              done('Subtopic opened');
+              navigate('/t/' + a.id);
+            })}>Open subtopic</button>
           </div>
         </div>
       )}

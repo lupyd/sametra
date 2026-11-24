@@ -44,14 +44,42 @@ impl Proc {
     }
 }
 
-fn run_node(data: &Path, port: u16, extra: &[&str]) -> Proc {
-    let p = cmd(data).args(["run", "--listen", &format!("127.0.0.1:{port}")]).args(extra).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+/// Start a node and wait until it listens. `port` 0 lets the OS pick a free port, read
+/// back from the node's start-up line (no race with other tests).
+fn run_node(data: &Path, port: u16, extra: &[&str]) -> (Proc, u16) {
+    let mut p = cmd(data)
+        .args(["run", "--listen", &format!("127.0.0.1:{port}")])
+        .args(extra)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let err = p.stderr.take().unwrap();
+    std::thread::spawn(move || {
+        let mut sent = false;
+        for line in BufReader::new(err).lines().map_while(Result::ok) {
+            if !sent && let Some(addr) = line.trim().strip_prefix("listening ") {
+                let port: u16 = addr.split(' ').next().and_then(|a| a.rsplit(':').next()).and_then(|x| x.parse().ok()).unwrap_or(0);
+                let _ = tx.send(Ok(port));
+                sent = true;
+            } else if !sent && line.starts_with("error:") {
+                let _ = tx.send(Err(line));
+                sent = true;
+            }
+        }
+    });
+    let port = match rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(Ok(port)) => port,
+        Ok(Err(e)) => panic!("node did not start: {e}"),
+        Err(_) => panic!("node did not start within 10 s"),
+    };
     let end = Instant::now() + Duration::from_secs(10);
     while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
-        assert!(Instant::now() < end, "node did not start");
+        assert!(Instant::now() < end, "node did not accept connections");
         std::thread::sleep(Duration::from_millis(20));
     }
-    Proc(p)
+    (Proc(p), port)
 }
 
 fn call(data: &Path, port: u16, tool: &str, args: Value) -> Result<Value, String> {
@@ -127,8 +155,7 @@ fn tools_lists_schemas() {
 #[test]
 fn call_subcommand_against_a_running_node() {
     let d = tempdir("call");
-    let port = free_port();
-    let _node = run_node(&d.0, port, &["--join", "math"]);
+    let (_node, port) = run_node(&d.0, 0, &["--join", "math"]);
     let info = call(&d.0, port, "info", json!({})).unwrap();
     assert_eq!(info["joined"], json!(["math"]));
     let a = call(&d.0, port, "post", json!({"community": "math", "title": "Q", "content": "Why?"})).unwrap();
@@ -158,8 +185,7 @@ fn call_subcommand_against_a_running_node() {
 #[test]
 fn mcp_stdio_server() {
     let d = tempdir("mcp");
-    let port = free_port();
-    let _node = run_node(&d.0, port, &[]);
+    let (_node, port) = run_node(&d.0, 0, &[]);
     let mut p = cmd(&d.0).args(["mcp", "--api", &format!("http://127.0.0.1:{port}")]).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
     let mut stdin = p.stdin.take().unwrap();
     let mut stdout = BufReader::new(p.stdout.take().unwrap());
@@ -222,8 +248,7 @@ fn mcp_stdio_server() {
 #[test]
 fn restart_keeps_events_state_and_identity() {
     let d = tempdir("restart");
-    let port = free_port();
-    let node = run_node(&d.0, port, &[]);
+    let (node, port) = run_node(&d.0, 0, &[]);
     let info = call(&d.0, port, "info", json!({})).unwrap();
     let a = call(&d.0, port, "post", json!({"community": "bio", "title": "Persist me", "content": "x"})).unwrap();
     let id = a["id"].as_str().unwrap().to_string();
@@ -234,8 +259,7 @@ fn restart_keeps_events_state_and_identity() {
     for f in ["key", "state.pb", "memory.pb", "store/events.pb"] {
         assert!(d.0.join(f).exists(), "{f}");
     }
-    let port = free_port();
-    let _node = run_node(&d.0, port, &[]);
+    let (_node, port) = run_node(&d.0, 0, &[]);
     let info2 = call(&d.0, port, "info", json!({})).unwrap();
     assert_eq!(info2["pubkey"], info["pubkey"]);
     assert_eq!(info2["pinned"], 1);
@@ -250,8 +274,8 @@ fn restart_keeps_events_state_and_identity() {
 fn bootstrap_peer_and_gossip_between_processes() {
     let (da, db) = (tempdir("boot-a"), tempdir("boot-b"));
     let (pa, pb) = (free_port(), free_port());
-    let _a = run_node(&da.0, pa, &["--public", &format!("ws://127.0.0.1:{pa}")]);
-    let _b = run_node(&db.0, pb, &["--peer", &format!("ws://127.0.0.1:{pa}"), "--threads", "1"]);
+    let (_a, _) = run_node(&da.0, pa, &["--public", &format!("ws://127.0.0.1:{pa}")]);
+    let (_b, _) = run_node(&db.0, pb, &["--peer", &format!("ws://127.0.0.1:{pa}"), "--threads", "1"]);
     assert!(wait(Duration::from_secs(20), || call(&db.0, pb, "info", json!({})).unwrap()["peers"] == 1), "b dialed its bootstrap peer");
     let a = call(&da.0, pa, "post", json!({"community": "m", "title": "hello b", "content": "x"})).unwrap();
     let id = a["id"].as_str().unwrap().to_string();
@@ -279,8 +303,7 @@ fn tls_node_and_https_calls() {
     assert_eq!(code, 2);
     assert!(stderr.contains("both"), "{stderr}");
 
-    let port = free_port();
-    let _node = run_node(&d.0, port, &["--tls-cert", cert.to_str().unwrap(), "--tls-key", key.to_str().unwrap()]);
+    let (_node, port) = run_node(&d.0, 0, &["--tls-cert", cert.to_str().unwrap(), "--tls-key", key.to_str().unwrap()]);
     let https = format!("https://localhost:{port}");
     let call_tls = |tool: &str, args: Value, ca: bool| {
         let mut c = cmd(&d.0);

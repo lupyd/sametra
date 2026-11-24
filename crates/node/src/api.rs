@@ -153,6 +153,9 @@ fn view(st: &Store, rep: &RepTable, e: &Event, full: bool, cx: &Cx) -> Item {
         format: e.tag("m").unwrap_or(crate::body::MARKDOWN).to_string(),
         accept: e.tags_named("accept").map(String::from).collect(),
         blocks: if full && crate::body::is_markdown(e.tag("m").unwrap_or("")) { crate::body::blocks(&e.content) } else { vec![] },
+        topic: e.topic_parent().filter(|_| e.kind == K_POST).map(|p| p.hex()).unwrap_or_default(),
+        subtopics: if e.kind == K_POST { subtopics_of(st, &e.id).len() as u32 } else { 0 },
+        root: e.root().filter(|_| e.kind == K_REPLY).map(|p| p.hex()).unwrap_or_default(),
         text_match: 0.0,
     }
 }
@@ -163,6 +166,14 @@ pub const LOW_TRUST: f64 = -0.3;
 /// Feed and reply order: trust and relevance of the message, author standing
 /// (each worth up to 10 points at full strength), discussion and citations,
 /// minus a point per day of age.
+/// Topics opened under `id`, oldest first.
+fn subtopics_of(st: &Store, id: &H32) -> Vec<Ev> {
+    let mut v: Vec<Ev> = st.referencing(id).into_iter().filter(|e| e.kind == K_POST && e.topic_parent() == Some(*id)).collect();
+    v.sort_by_key(|e| (e.created_at, e.id));
+    v.dedup_by_key(|e| e.id);
+    v
+}
+
 fn rank(rep: &RepTable, e: &Event, replies: usize, cites: usize) -> f64 {
     let age_h = now().saturating_sub(e.created_at) as f64 / 3600.0;
     10.0 * (rep.event(&e.id) + rep.relevance(&e.id) + 0.5 * rep.user(&e.pubkey)) + (1.0 + replies as f64).ln() + 0.5 * (1.0 + cites as f64).ln() - age_h / 24.0
@@ -321,19 +332,27 @@ async fn leave(node: &Arc<Node>, r: CommunityRequest) -> R<Ack> {
 }
 
 async fn feed(node: &Arc<Node>, r: FeedRequest) -> R<Items> {
-    let c = slug(&r.community)?;
+    let c = match opt_slug(&r.community) {
+        Some(c) => Some(slug(c)?),
+        None => None,
+    };
     let limit = if r.limit == 0 { 30 } else { r.limit.min(500) } as usize;
-    let rep = node.reputation(&c);
+    let rep = node.reputation(c.as_deref().unwrap_or(""));
     let cx = Cx::of(node);
     let st = node.store.lock().unwrap();
+    let f = match &c {
+        Some(c) => c_filter(Some(vec![K_POST]), c),
+        None => Filter { kinds: Some(vec![K_POST]), ..Default::default() },
+    };
     let mut items: Vec<(f64, Item)> = st
-        .query(&c_filter(Some(vec![K_POST]), &c), 5000)
+        .query(&f, 5000)
         .iter()
+        .filter(|e| e.topic_parent().is_none()) // subtopics are listed under their topic
         .map(|e| {
             let n = st.descendant_count(&e.id, 10_000);
             let mut v = view(&st, &rep, e, false, &cx);
             v.reply_count = n as u32;
-            (if r.sort == "new" { e.created_at as f64 } else { rank(&rep, e, n, v.cited_by as usize) }, v)
+            (if r.sort == "new" { e.created_at as f64 } else { rank(&rep, e, n + v.subtopics as usize, v.cited_by as usize) }, v)
         })
         .collect();
     items.sort_by(|x, y| y.0.total_cmp(&x.0));
@@ -348,6 +367,22 @@ async fn thread(node: &Arc<Node>, r: IdRequest) -> R<ThreadResponse> {
         let f = Filter { tags: vec![("e".into(), vec![id.hex()])], limit: Some(5000), ..Default::default() };
         node.remote_fetch(vec![f], Duration::from_millis(1500)).await;
     }
+    // enclosing topics: of this topic, or of the topic a reply belongs to
+    let mut path: Vec<Ev> = vec![];
+    let mut up = if root.kind == K_REPLY { root.root() } else { root.topic_parent() };
+    if root.kind == K_REPLY && let Some(t) = up.and_then(|t| node.store.lock().unwrap().get(&t).cloned()) {
+        path.push(t.clone());
+        up = t.topic_parent();
+    }
+    while let Some(t) = up {
+        if path.len() >= 12 || path.iter().any(|p| p.id == t) {
+            break;
+        }
+        let Some(e) = get_or_fetch(node, &t).await.filter(|e| e.kind == K_POST) else { break };
+        up = e.topic_parent();
+        path.push(e);
+    }
+    path.reverse();
     let rep = node.reputation(root.community().unwrap_or(""));
     let cx = Cx::of(node);
     let st = node.store.lock().unwrap();
@@ -358,6 +393,8 @@ async fn thread(node: &Arc<Node>, r: IdRequest) -> R<ThreadResponse> {
         quoted_by: st.referencing(&id).iter().filter(|e| e.tags_named("q").any(|q| q == idh)).map(|e| view(&st, &rep, e, false, &cx)).collect(),
         ref_events: root.tags_named("q").filter_map(H32::from_hex).filter_map(|r| st.get(&r).map(|e| view(&st, &rep, e, false, &cx))).collect(),
         thread_root: root.root().filter(|r| *r != root.id && root.kind == K_REPLY).map(|r| r.hex()).unwrap_or_default(),
+        topic_path: path.iter().map(|e| view(&st, &rep, e, false, &cx)).collect(),
+        subtopics: subtopics_of(&st, &root.id).iter().map(|e| view(&st, &rep, e, false, &cx)).collect(),
     })
 }
 
@@ -386,6 +423,9 @@ async fn chain(node: &Arc<Node>, r: ChainRequest) -> R<ChainResponse> {
         let mut v: Vec<(H32, &'static str)> = vec![];
         if e.kind == K_REPLY && let Some(p) = e.parent() {
             v.push((p, "reply"));
+        }
+        if e.kind == K_POST && let Some(p) = e.topic_parent() {
+            v.push((p, "subtopic"));
         }
         v.extend(e.tags_named("q").filter_map(H32::from_hex).map(|q| (q, "cites")));
         v
@@ -438,6 +478,8 @@ async fn chain(node: &Arc<Node>, r: ChainRequest) -> R<ChainResponse> {
                     }
                     let rel = if c.kind == K_REPLY && c.parent() == Some(e.id) {
                         "reply"
+                    } else if c.kind == K_POST && c.topic_parent() == Some(e.id) {
+                        "subtopic"
                     } else if c.tags_named("q").any(|q| q == h) {
                         "cites"
                     } else {
@@ -561,17 +603,42 @@ async fn post(node: &Arc<Node>, r: PostRequest) -> R<Ack> {
     if let Some(p) = opt_slug(&r.parent) {
         let pid = hex_id(p, "parent")?;
         let parent = get_or_fetch(node, &pid).await.ok_or("parent event not found")?;
-        let c = opt_slug(&r.community).or(parent.community()).ok_or("community required")?;
         let root = if parent.kind == K_POST { pid } else { parent.root().unwrap_or(pid) };
-        tags.push(t("c", slug(c)?));
+        // replies stay in their topic's community; independent topics have none
+        if let Some(c) = opt_slug(&r.community).or(parent.community()) {
+            tags.push(t("c", slug(c)?));
+        }
         tags.push(vec!["e".into(), root.hex(), "".into(), "root".into()]);
         tags.push(vec!["e".into(), pid.hex(), "".into(), "reply".into()]);
         tags.push(t("p", parent.pubkey.hex()));
         kind = K_REPLY;
     } else {
-        tags.push(t("c", slug(&r.community)?));
+        // a topic: under another topic (a subtopic, inheriting its community), in a
+        // community, or on its own
+        let parent_topic = match opt_slug(&r.topic) {
+            Some(tp) => {
+                let tid = hex_id(tp, "topic")?;
+                let topic = get_or_fetch(node, &tid).await.ok_or("topic not found")?;
+                if topic.kind != K_POST {
+                    return Err("'topic' must be a topic (a post), not a reply".into());
+                }
+                if r.title.trim().is_empty() {
+                    return Err("a subtopic needs a 'title'".into());
+                }
+                Some(topic)
+            }
+            None => None,
+        };
+        let community = opt_slug(&r.community).map(String::from).or_else(|| parent_topic.as_ref().and_then(|t| t.community().map(String::from)));
+        if let Some(c) = community {
+            tags.push(t("c", slug(&c)?));
+        }
         if !r.title.trim().is_empty() {
             tags.push(t("title", r.title.trim().chars().take(200).collect::<String>()));
+        }
+        if let Some(tp) = &parent_topic {
+            tags.push(vec!["e".into(), tp.id.hex(), "".into(), "topic".into()]);
+            tags.push(t("p", tp.pubkey.hex()));
         }
         kind = K_POST;
     }

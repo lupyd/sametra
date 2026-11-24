@@ -7,7 +7,7 @@ import { Meta, Needs } from './Item.jsx';
 import { Body } from './Body.jsx';
 import { useLoad } from './hooks.js';
 
-const JOINS = { reply: 'replies to', cites: 'builds on' };
+const JOINS = { reply: 'replies to', cites: 'builds on', subtopic: 'is a subtopic of' };
 
 export function Chain({ id }) {
   const { data, error } = useLoad(() => call('chain', { id, depth: 6 }), [id]);

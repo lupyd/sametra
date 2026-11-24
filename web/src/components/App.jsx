@@ -9,6 +9,7 @@ import { Feed, FindCommunities, Home, Profile, Reputation, Search, Thread } from
 
 const ROUTES = [
   ['/', Home],
+  ['/all', Feed],
   ['/c/:slug', Feed],
   ['/c/:slug/reputation', Reputation],
   ['/t/:id', Thread],
@@ -79,6 +80,7 @@ function Sidebar({ path, plural }) {
     <>
       <h3>Communities</h3>
       <nav>
+        <a href="/all" class={'c' + (path === '/all' ? ' on' : '')}><span>All topics</span></a>
         {communities.value.length === 0 && <p class="muted small">You have not joined any yet.</p>}
         {communities.value.map((c) => (
           <a key={c.slug} href={'/c/' + c.slug} class={'c' + (path.startsWith('/c/' + c.slug) ? ' on' : '')} title={c.joined ? c.about : 'Not joined: ' + (c.about || c.slug)}>

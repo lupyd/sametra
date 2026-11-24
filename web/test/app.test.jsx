@@ -49,9 +49,9 @@ describe('shell', () => {
     await mount('/c/math');
     expect($('header .me').textContent).toBe('Me');
     const links = $$('aside nav a');
-    expect(links.map((a) => a.getAttribute('href'))).toEqual(['/c/math', '/c/bio']);
-    expect(links[0].className).toContain('on');
-    expect(links[1].textContent).toContain('○ Biology'); // not joined
+    expect(links.map((a) => a.getAttribute('href'))).toEqual(['/all', '/c/math', '/c/bio']);
+    expect(links[1].className).toContain('on');
+    expect(links[2].textContent).toContain('○ Biology'); // not joined
     expect($('aside').textContent).toContain('Connected to 1 peer. 7 events kept on this node.');
     expect($('header button.theme')).not.toBeNull();
     expect($$('header nav.top a').map((a) => a.getAttribute('href'))).toEqual(['/help', '/inbox', '/docs']);
@@ -65,7 +65,10 @@ describe('shell', () => {
   });
 
   it('home welcomes a fresh node', async () => {
-    await mount('/', { communities: () => ({ communities: [] }) });
+    await mount('/', { communities: () => ({ communities: [] }), feed: () => ({ items: [] }) });
+    expect(loc.value).toBe('/all');
+    expect(sent('feed').at(-1)).toMatchObject({ community: '' });
+    await settle(); // the all-topics feed loads after the redirect
     expect(root.textContent).toContain('Welcome to Sametra');
     expect(root.textContent).toContain('You have not joined any yet.');
     expect($('main a[href="/docs"]').textContent).toBe('Read how it works');
@@ -157,7 +160,7 @@ describe('feed', () => {
     await type(byPlaceholder('Details'), 'Asking for a friend');
     expect(root.textContent).toContain('builds on cccccccc');
     await click(button('Post'));
-    expect(sent('post')).toEqual([{ community: 'math', title: 'Is P = NP?', content: 'Asking for a friend', parent: '', refs: ['c'.repeat(64)], needs: [], format: '', accept: [] }]);
+    expect(sent('post')).toEqual([{ community: 'math', title: 'Is P = NP?', content: 'Asking for a friend', parent: '', refs: ['c'.repeat(64)], needs: [], format: '', accept: [], topic: '' }]);
     expect(loc.value).toBe('/t/' + 'f'.repeat(64));
     expect(cites.value).toEqual([]);
   });
@@ -190,7 +193,7 @@ describe('thread', () => {
     expect($('#e' + R1 + ' .replies #e' + R2 + ' > .body').textContent.trim()).toBe('nested');
     expect($('a.back').getAttribute('href')).toBe('/c/math');
     const sections = $$('h3.section').map((h) => h.textContent);
-    expect(sections).toEqual(['Builds on', 'Built upon by']);
+    expect(sections).toEqual(['Subtopics', 'Builds on', 'Built upon by']);
     expect($('a[href="/chain/' + ROOT + '"]')).not.toBeNull();
     expect(root.textContent).toContain('A cited source');
     expect(root.textContent).toContain('A citing thread');
@@ -213,7 +216,7 @@ describe('thread', () => {
     await click(button('reply', top.querySelector('.acts')));
     await type(byPlaceholder('Reply'), 'my answer');
     await click(button('Reply'));
-    expect(sent('post')).toEqual([{ community: '', title: '', content: 'my answer', parent: ROOT, refs: [], needs: [], format: '', accept: [] }]);
+    expect(sent('post')).toEqual([{ community: '', title: '', content: 'my answer', parent: ROOT, refs: [], needs: [], format: '', accept: [], topic: '' }]);
     expect(toast.value).toBe('Replied');
     expect(byPlaceholder('Reply')).toBeUndefined();
   });
@@ -553,5 +556,48 @@ describe('formats', () => {
     await type(byPlaceholder('Reply in'), 'theorem t : True := trivial');
     await click(button('Reply'));
     expect(sent('post')[0]).toMatchObject({ parent: ROOT, format: 'text/x-lean' });
+  });
+});
+
+describe('topics', () => {
+  const P = 'p'.repeat(64), S = 's'.repeat(64), R = 'r'.repeat(64);
+  const sub = item({ id: S, title: 'Case: X finite', topic: ROOT, subtopics: 2 });
+
+  it('shows where a topic sits and opens subtopics under it', async () => {
+    await mount('/t/' + ROOT, {
+      thread: () => ({ root: item({ subtopics: 1, replies: [item({ id: R, kind: 1111, title: '', content: 'needs a lemma', root: ROOT, parent: ROOT })] }), topic_path: [item({ id: P, title: 'Classify all X' })], subtopics: [sub], quoted_by: [], ref_events: [], thread_root: '' }),
+      post: () => ({ ok: true, id: 'n'.repeat(64) }),
+    });
+    expect($$('.crumbs a').map((a) => a.textContent)).toEqual(['math', 'Classify all X']);
+    expect($('#subtopics').textContent).toContain('Case: X finite');
+    expect($('#subtopics').textContent).toContain('2 subtopics');
+    await type(byPlaceholder('Open a subtopic'), 'Case: X empty');
+    await type(byPlaceholder('What it is about'), 'trivial?');
+    await click(button('Open subtopic', $('#subtopics')));
+    expect(sent('post')[0]).toMatchObject({ topic: ROOT, title: 'Case: X empty', content: 'trivial?' });
+    expect(loc.value).toBe('/t/' + 'n'.repeat(64));
+  });
+
+  it('a reply can branch into a subtopic that builds on it', async () => {
+    await mount('/t/' + ROOT, {
+      thread: () => ({ root: item({ replies: [item({ id: R, kind: 1111, title: '', content: 'needs a lemma', root: ROOT, parent: ROOT })] }), topic_path: [], subtopics: [], quoted_by: [], ref_events: [], thread_root: '' }),
+      post: () => ({ ok: true, id: 'b'.repeat(64) }),
+    });
+    expect(button('branch', $('#e' + ROOT + ' > .acts'))).toBeUndefined();
+    await click(button('branch', $('#e' + R + ' > .acts')));
+    await type(byPlaceholder('Subtopic title'), 'The lemma');
+    await type(byPlaceholder('What the subtopic'), 'prove it');
+    await click(button('Open subtopic', $('#e' + R)));
+    expect(sent('post')[0]).toMatchObject({ topic: ROOT, title: 'The lemma', refs: [R] });
+    expect(loc.value).toBe('/t/' + 'b'.repeat(64));
+  });
+
+  it('all topics lists everything, with each topic\'s community', async () => {
+    await mount('/all', { feed: () => ({ items: [item({ community: 'bio', subtopics: 3 }), item({ id: '9'.repeat(64), community: '' })] }) });
+    expect(sent('feed').at(-1)).toMatchObject({ community: '' });
+    expect($('main h2').textContent).toBe('All topics');
+    expect($('article .meta a[href="/c/bio"]')).not.toBeNull();
+    expect($('article').textContent).toContain('3 subtopics');
+    expect(button('Standings')).toBeUndefined();
   });
 });

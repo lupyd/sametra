@@ -157,6 +157,10 @@ impl Event {
             .or(es.last())?;
         H32::from_hex(&pick[1])
     }
+    /// Subtopics: the topic this one was opened under (`e` tag marked "topic").
+    pub fn topic_parent(&self) -> Option<H32> {
+        self.tags.iter().find(|t| t.len() >= 4 && t[0] == "e" && t[3] == "topic").and_then(|t| H32::from_hex(&t[1]))
+    }
     pub fn root(&self) -> Option<H32> {
         self.tags
             .iter()

@@ -110,6 +110,9 @@ message Item {
   string format = 28;             // media type of `content`; default text/markdown
   repeated string accept = 29;    // formats this post asks replies to use
   repeated Block blocks = 30;     // full views: fenced code and math extracted from markdown
+  string topic = 31;              // subtopics: the topic this one belongs under
+  uint32 subtopics = 32;          // topics opened under this one
+  string root = 33;               // replies: the topic they are part of
 }
 
 // A machine-readable part of a body. kind: "code" | "math" | "inline-math".
@@ -146,7 +149,7 @@ message CreateCommunityRequest { string slug = 1; string name = 2; string about 
 message CommunityRequest { string community = 1; }
 
 message FeedRequest {
-  string community = 1;
+  string community = 1;  // empty: topics from every community, and independent ones
   string sort = 2;    // "top" (default) | "new"
   uint32 limit = 3;   // default 30
 }
@@ -161,6 +164,8 @@ message ThreadResponse {
   repeated Item quoted_by = 2;   // events citing the root
   repeated Item ref_events = 3;  // events the root cites
   string thread_root = 4;        // set when `root` is itself a reply
+  repeated Item topic_path = 5;  // enclosing topics, outermost first
+  repeated Item subtopics = 6;   // topics opened under this one
 }
 
 // The chain of reasoning around a post: what it builds on (replies' parents and
@@ -200,6 +205,7 @@ message PostRequest {
   repeated string needs = 6;  // capabilities/skills this post asks for
   string format = 7;          // media type of content; default text/markdown
   repeated string accept = 8; // ask replies to use these formats (e.g. text/x-lean)
+  string topic = 9;           // open a subtopic under this topic (title required)
 }
 
 message RateRequest {

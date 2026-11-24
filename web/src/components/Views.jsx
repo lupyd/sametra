@@ -14,8 +14,13 @@ const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
 
 export function Home() {
   const cs = communities.value;
+  if (!info.value) return <Loading />; // wait for the node's communities
   const first = cs.find((c) => c.joined) || cs[0];
-  if (first) { navigate('/c/' + first.slug, true); return null; }
+  navigate(first ? '/c/' + first.slug : '/all', true);
+  return null;
+}
+
+function Welcome() {
   return (
     <div class="panel">
       <h2>Welcome to Sametra</h2>
@@ -26,28 +31,28 @@ export function Home() {
   );
 }
 
-export function Feed({ slug }) {
+export function Feed({ slug = '' }) {
   const [sort, setSort] = useState('top');
   const { data, error } = useLoad(() => call('feed', { community: slug, sort, limit: 100 }), [slug, sort]);
-  const c = communities.value.find((x) => x.slug === slug);
+  const c = slug && communities.value.find((x) => x.slug === slug);
   return (
     <>
       <div class="bar">
-        <h2 class="grow">{c?.name || slug}</h2>
+        <h2 class="grow">{slug ? c?.name || slug : 'All topics'}</h2>
         <div class="seg" role="group" aria-label="Order">
           <button class={sort === 'top' ? 'on' : ''} onClick={() => setSort('top')}>top</button>
           <button class={sort === 'new' ? 'on' : ''} onClick={() => setSort('new')}>new</button>
         </div>
-        <a class="btn ghost" href={`/c/${slug}/reputation`}>Standings</a>
+        {slug && <a class="btn ghost" href={`/c/${slug}/reputation`}>Standings</a>}
         {c && !c.joined && <button onClick={async () => { await call('join', { community: slug }); refreshNode(); }}>Join</button>}
       </div>
-      {c?.about && <p class="about">{c.about}</p>}
+      {slug ? c?.about && <p class="about">{c.about}</p> : <p class="about">Every topic this node knows about, from all communities and none. A topic started here belongs to no community.</p>}
       <Composer slug={slug} />
       <Err error={error} />
-      {!data ? <Loading /> : data.items.length === 0 ? <p class="empty">Nothing here yet. Ask the first question; there are no stupid ones.</p> :
+      {!data ? <Loading /> : data.items.length === 0 ? (slug ? <p class="empty">Nothing here yet. Ask the first question; there are no stupid ones.</p> : <Welcome />) :
         data.items.map((e) => (
           <Card key={e.id} e={e}>
-            <Meta e={e} extra={<a href={'/t/' + e.id}>{plural(e.reply_count, 'reply', 'replies')}</a>} />
+            <Meta e={e} extra={<><a href={'/t/' + e.id}>{plural(e.reply_count, 'reply', 'replies')}</a>{e.subtopics > 0 && <a href={'/t/' + e.id + '#subtopics'}>{plural(e.subtopics, 'subtopic', 'subtopics')}</a>}{!slug && e.community && <a href={'/c/' + e.community}>{e.community}</a>}</>} />
             <a class="title" href={'/t/' + e.id}>{e.title || e.content.split('\n')[0].slice(0, 120)}</a>
             <Body e={e} />
             <Needs e={e} />
@@ -110,15 +115,52 @@ export function Thread({ id }) {
   return (
     <>
       <div class="bar">
-        <a class="grow back" href={'/c/' + r.community}>← {r.community}</a>
+        <nav class="grow crumbs" aria-label="Enclosing topics">
+          <a class="back" href={r.community ? '/c/' + r.community : '/all'}>{r.community || 'All topics'}</a>
+          {data.topic_path.map((t) => <a key={t.id} href={'/t/' + t.id}>{t.title || short(t.id)}</a>)}
+        </nav>
         {data.thread_root && <a class="btn ghost" href={'/t/' + data.thread_root}>Whole thread</a>}
         <a class="btn ghost" href={'/chain/' + r.id}>Follow the chain</a>
       </div>
       <Node e={r} top />
+      {r.kind === 11 && <Subtopics topic={r} items={data.subtopics} />}
       {r.needs.length > 0 && <WhoCanHelp e={r} />}
       {data.ref_events.length > 0 && <Related title="Builds on" items={data.ref_events} />}
       {data.quoted_by.length > 0 && <Related title="Built upon by" items={data.quoted_by} />}
     </>
+  );
+}
+
+/** Topics opened under this one, and a form to open another. */
+function Subtopics({ topic, items }) {
+  const [title, setTitle] = useState('');
+  const [body, setBody] = useState('');
+  const [busy, setBusy] = useState(false);
+  return (
+    <section id="subtopics">
+      <h3 class="section">Subtopics</h3>
+      {items.length === 0 && <p class="muted small">Split a part of this problem into its own topic. It stays linked here, and can grow subtopics of its own.</p>}
+      {items.map((e) => (
+        <div class="card slim" key={e.id} style={{ '--strand': strand(e) }}>
+          <div class="meta"><span class="who">{e.author_name}</span><span class="kind">{kindLabel(e)}</span>{e.subtopics > 0 && <span>{plural(e.subtopics, 'subtopic', 'subtopics')}</span>}<span>{ago(e.created_at)}</span></div>
+          <a class="title" href={'/t/' + e.id}>{e.title}</a>
+        </div>
+      ))}
+      <div class="panel compose">
+        <input value={title} onInput={(e) => setTitle(e.currentTarget.value)} placeholder="Open a subtopic: name the part you want to work on" aria-label="Subtopic title" />
+        {title && <textarea value={body} onInput={(e) => setBody(e.currentTarget.value)} placeholder="What it is about, in markdown" />}
+        {title && (
+          <div class="row"><CiteList /><button disabled={busy || !body.trim()} onClick={async () => {
+            setBusy(true);
+            try {
+              const a = await call('post', { topic: topic.id, title, content: body, refs: cites.value });
+              cites.value = []; setTitle(''); setBody('');
+              navigate('/t/' + a.id);
+            } catch (e) { flash(e.message); } finally { setBusy(false); }
+          }}>Open subtopic</button></div>
+        )}
+      </div>
+    </section>
   );
 }
 

@@ -114,7 +114,9 @@ async fn posting_threads_and_citations() {
 async fn post_validation() {
     let n = spawn(|_| {}).await;
     assert!(n.err("post", &post("bio", "t", "  ")).await.1.contains("content"));
-    assert!(n.err("post", &post("", "t", "x")).await.1.contains("slug"));
+    assert!(n.err("post", &post("Bad Slug", "t", "x")).await.1.contains("slug"));
+    let free: pb::Ack = n.ok("post", &post("", "Independent", "a topic in no community")).await;
+    assert!(n.has(&free.id), "communities are optional");
     assert!(n.err("post", &reply("zz", "x")).await.1.contains("parent"));
     assert!(n.err("post", &reply(&"ab".repeat(32), "x")).await.1.contains("not found"));
     let bad_ref = pb::PostRequest { refs: vec!["nope".into()], ..post("bio", "t", "x") };
@@ -160,7 +162,9 @@ async fn feed_sorting_limits_and_truncation() {
     assert_eq!(none.items.len(), 3);
     let empty: pb::Items = n.ok("feed", &pb::FeedRequest { community: "nothing".into(), ..Default::default() }).await;
     assert!(empty.items.is_empty());
-    assert_eq!(n.err("feed", &pb::FeedRequest::default()).await.0, 400);
+    assert_eq!(n.err("feed", &pb::FeedRequest { community: "Bad Slug".into(), ..Default::default() }).await.0, 400);
+    let everything: pb::Items = n.ok("feed", &pb::FeedRequest::default()).await;
+    assert_eq!(everything.items.len(), 3, "an empty community lists every topic");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -578,7 +582,11 @@ async fn chains_of_reasoning_across_humans_and_models() {
     assert!(n.err("chain", &pb::ChainRequest { id: "ab".repeat(32), depth: 0 }).await.1.contains("not found"));
     // same-second steps: what a step builds on still comes first
     let t = now();
-    let first = human.sign_at(K_POST, tags(&[&["c", "m"], &["title", "Same second"]]), "q".into(), t);
+    // a question whose id is in the upper half, so an answer that sorts before it is easy to find
+    let first = (0..200)
+        .map(|i| human.sign_at(K_POST, tags(&[&["c", "m"], &["title", "Same second"]]), format!("q{i}"), t))
+        .find(|q| q.id.0[0] >= 0x80)
+        .unwrap();
     let answer = (0..50)
         .map(|i| claude.sign_at(K_REPLY, tags(&[&["c", "m"], &["e", &first.id.hex(), "", "root"], &["e", &first.id.hex(), "", "reply"]]), format!("a{i}"), t))
         .find(|a| a.id < first.id)
@@ -613,4 +621,60 @@ async fn bodies_declare_formats_and_expose_blocks() {
     assert!(f.items[0].blocks.is_empty());
     assert!(n.err("post", &pb::PostRequest { format: "markdown".into(), ..post("m", "t", "x") }).await.1.contains("media type"));
     assert!(n.err("post", &pb::PostRequest { accept: vec!["lean".into()], ..post("m", "t", "x") }).await.1.contains("media types"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn topics_nest_recursively() {
+    let n = spawn(|_| {}).await;
+    let sub = |topic: &str, title: &str| pb::PostRequest { topic: topic.into(), title: title.into(), content: "details".into(), ..Default::default() };
+    // a problem in a community, split into subproblems, one split again
+    let root: pb::Ack = n.ok("post", &post("math", "Classify all X", "big problem")).await;
+    let a: pb::Ack = n.ok("post", &sub(&root.id, "Case: X finite")).await;
+    let b: pb::Ack = n.ok("post", &sub(&root.id, "Case: X infinite")).await;
+    let b1: pb::Ack = n.ok("post", &sub(&b.id, "Infinite, countable")).await;
+    // an independent topic, and a subtopic of it (no community anywhere)
+    let free: pb::Ack = n.ok("post", &post("", "Open question", "on its own")).await;
+    let free_sub: pb::Ack = n.ok("post", &sub(&free.id, "A part of it")).await;
+
+    let t: pb::ThreadResponse = n.ok("thread", &id(&b.id)).await;
+    assert_eq!(t.topic_path.iter().map(|x| x.title.as_str()).collect::<Vec<_>>(), ["Classify all X"]);
+    assert_eq!(t.subtopics.iter().map(|x| x.id.as_str()).collect::<Vec<_>>(), [b1.id.as_str()]);
+    let it = t.root.unwrap();
+    assert_eq!((it.topic.as_str(), it.subtopics, it.community.as_str()), (root.id.as_str(), 1, "math"), "subtopics inherit the community");
+    let deep: pb::ThreadResponse = n.ok("thread", &id(&b1.id)).await;
+    assert_eq!(deep.topic_path.iter().map(|x| x.id.as_str()).collect::<Vec<_>>(), [root.id.as_str(), b.id.as_str()], "outermost first");
+    let top: pb::ThreadResponse = n.ok("thread", &id(&root.id)).await;
+    assert_eq!(top.subtopics.len(), 2);
+    assert!(top.topic_path.is_empty());
+    assert_eq!(top.root.unwrap().subtopics, 2);
+
+    // feeds list topics, not subtopics; an empty community means every topic
+    let f: pb::Items = n.ok("feed", &pb::FeedRequest { community: "math".into(), sort: "new".into(), ..Default::default() }).await;
+    assert_eq!(f.items.iter().map(|x| x.id.as_str()).collect::<Vec<_>>(), [root.id.as_str()]);
+    let all: pb::Items = n.ok("feed", &pb::FeedRequest { sort: "new".into(), ..Default::default() }).await;
+    let mut ids: Vec<&str> = all.items.iter().map(|x| x.id.as_str()).collect();
+    ids.sort();
+    let mut want = [free.id.as_str(), root.id.as_str()];
+    want.sort();
+    assert_eq!(ids, want, "both root topics, no subtopics (same second, so order is not defined)");
+    let fs: pb::ThreadResponse = n.ok("thread", &id(&free_sub.id)).await;
+    assert!(fs.root.unwrap().community.is_empty());
+
+    // a reply can branch into a subtopic of its thread, citing the reply
+    let r: pb::Ack = n.ok("post", &reply(&a.id, "this case needs a lemma")).await;
+    let branch: pb::Ack = n.ok("post", &pb::PostRequest { refs: vec![r.id.clone()], ..sub(&a.id, "Lemma for finite X") }).await;
+    let rt: pb::ThreadResponse = n.ok("thread", &id(&r.id)).await;
+    assert_eq!(rt.root.as_ref().unwrap().root, a.id, "replies know their topic");
+    assert_eq!(rt.topic_path.iter().map(|x| x.id.as_str()).collect::<Vec<_>>(), [root.id.as_str(), a.id.as_str()]);
+    // chains follow subtopic links both ways
+    let c: pb::ChainResponse = n.ok("chain", &pb::ChainRequest { id: a.id.clone(), depth: 0 }).await;
+    let rel = |x: &str| c.nodes.iter().find(|nd| nd.item.as_ref().unwrap().id == x).map(|nd| nd.relation.clone());
+    assert_eq!(rel(&a.id).as_deref(), Some("subtopic"));
+    assert_eq!(rel(&branch.id).as_deref(), Some("subtopic"));
+    assert!(rel(&root.id).is_some() && rel(&r.id).is_some());
+
+    // validation
+    assert!(n.err("post", &sub(&r.id, "x")).await.1.contains("not a reply"));
+    assert!(n.err("post", &pb::PostRequest { title: String::new(), ..sub(&root.id, "") }).await.1.contains("title"));
+    assert!(n.err("post", &sub(&"ab".repeat(32), "x")).await.1.contains("topic not found"));
 }
