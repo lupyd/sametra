@@ -30,7 +30,8 @@ COPY --from=build /usr/local/bin/sametra /usr/local/bin/sametra-mcp /usr/local/b
 USER sametra
 ENV SAMETRA_DATA=/data
 VOLUME /data
-EXPOSE 42424
+# HTTP, API, app and client relay on TCP; libp2p (QUIC) between nodes on UDP
+EXPOSE 42424/tcp 42424/udp
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
   CMD ["sametra", "call", "info", "--api", "http://127.0.0.1:42424"]
 ENTRYPOINT ["sametra"]

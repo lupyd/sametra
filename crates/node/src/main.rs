@@ -21,10 +21,13 @@ USAGE:
    --print; see `sametra mcp --help`)
 
 RUN OPTIONS:
-  --listen ADDR          listen address              [default: 0.0.0.0:42424]
+  --listen ADDR          HTTP, API, app and client relay on TCP; nodes connect over libp2p
+                         (QUIC) on the UDP port with the same number [default: 0.0.0.0:42424]
   --data DIR             data directory              [default: $SAMETRA_DATA or ~/.local/share/sametra]
-  --peer URL             bootstrap peer, ws://host:port or wss://host (repeatable)
-  --public URL           address others can dial you at (ws:// or wss://); announced to the network
+  --peer ADDR            bootstrap peer: host:port (QUIC on that UDP port) or a multiaddr
+                         such as /ip4/1.2.3.4/udp/42424/quic-v1/p2p/<id> (repeatable)
+  --public ADDR          address others can dial you at (host:port or multiaddr); makes the node
+                         a Kademlia server
   --follow ID            keep this post and everything under it (repeatable; matters with
                          --no-relay-all)
   --no-relay-all         keep only what this node follows, mentions and small metadata
@@ -45,7 +48,6 @@ RUN OPTIONS:
 TLS (optional; the port then serves both plain and TLS connections):
   --tls-cert FILE        certificate chain (PEM) for HTTPS/WSS on --listen
   --tls-key FILE         private key (PEM)
-  --tls-ca FILE          extra CA (PEM) to trust when dialing wss:// peers (repeatable)
 
 IPFS (files, through a Kubo daemon running beside the node; see docker-compose.yml):
   --ipfs-api URL         Kubo's RPC API      [default: $SAMETRA_IPFS_API or http://127.0.0.1:5001]
@@ -244,7 +246,6 @@ fn run(args: &[String]) {
         api_token: opt(args, "--api-token").or(std::env::var("SAMETRA_API_TOKEN").ok()),
         tls_cert: opt(args, "--tls-cert").map(PathBuf::from),
         tls_key: opt(args, "--tls-key").map(PathBuf::from),
-        tls_ca: opts(args, "--tls-ca").into_iter().map(PathBuf::from).collect(),
         trusted: opts(args, "--trust-net")
             .into_iter()
             .chain(std::env::var("SAMETRA_TRUST_NET").unwrap_or_default().split(',').filter(|s| !s.trim().is_empty()).map(String::from))
@@ -280,10 +281,14 @@ fn run(args: &[String]) {
     }
     .unwrap();
     rt.block_on(async move {
+        let mut cfg = cfg;
         let listen = cfg.listen.clone();
-        let node = node::Node::new(cfg, keys).unwrap_or_else(|e| die(&format!("starting node: {e}")));
         let listener = tokio::net::TcpListener::bind(&listen).await.unwrap_or_else(|e| die(&format!("bind {listen}: {e}")));
         let local = listener.local_addr().map(|a| a.to_string()).unwrap_or(listen);
+        let listen_port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
+        // QUIC takes the UDP port with the same number (also when port 0 picked one)
+        cfg.listen = local.clone();
+        let node = node::Node::new(cfg, keys).unwrap_or_else(|e| die(&format!("starting node: {e}")));
         let cached = node.store.lock().unwrap().len();
         let tls = node.cfg.tls_cert.is_some();
         // the banner is for people; with JSON logs the same facts go out as one event
@@ -329,6 +334,11 @@ fn run(args: &[String]) {
             }
             let _ = node.embedder.set(emb.clone());
             sametra_node::embed::spawn(node.clone(), emb);
+        }
+        node.start_p2p().unwrap_or_else(|e| die(&format!("starting the network: {e}")));
+        if !json_logs {
+            let id = node.p2p.get().map(|p| p.peer_id.to_string()).unwrap_or_default();
+            eprintln!("  p2p       QUIC on udp/{} (peer {id})", listen_port);
         }
         node::spawn_background(node.clone());
         tokio::select! {

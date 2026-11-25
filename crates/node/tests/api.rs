@@ -9,7 +9,7 @@ const E: pb::Empty = pb::Empty {};
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn info_and_peers() {
     let n = spawn(|c| {
-        c.public_addr = Some("ws://me.example:42424".into());
+        c.public_addr = Some("me.example:42424".into());
         c.follow = vec![H32([7; 32])];
     })
     .await;
@@ -20,7 +20,7 @@ async fn info_and_peers() {
     assert_eq!((i.events_cached, i.pinned, i.peers), (0, 0, 0));
     assert_eq!(i.following, [H32([7; 32]).hex()]);
     assert!(i.relay_all);
-    assert_eq!(i.public_addr, "ws://me.example:42424");
+    assert_eq!(i.public_addr, "me.example:42424");
     let p: pb::PeersResponse = n.ok("peers", &E).await;
     assert!(p.peers.is_empty());
 }
@@ -387,7 +387,7 @@ async fn fetch_and_lookups_reach_peers() {
     assert!(eventually(std::time::Duration::from_secs(5), || a.has(&rr.id)).await, "reply reached a");
     let peers: pb::PeersResponse = b.ok("peers", &E).await;
     assert_eq!(peers.peers.len(), 1);
-    assert!(peers.peers[0].outbound && peers.peers[0].addr == a.ws);
+    assert!(peers.peers[0].outbound && peers.peers[0].addr == a.p2p_addr().await.to_string());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

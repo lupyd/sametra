@@ -71,6 +71,21 @@ message Frame {
   uint32 hops = 8;    // REQ with a search: how many more hops peers may forward it
 }
 
+// ---------------------------------------------------------------- peer to peer
+// Node to node traffic runs over libp2p (QUIC). Events spread by GossipSub
+// (payload: one encoded Event; topics sametra/1/meta, sametra/1/all,
+// sametra/1/tree/<root hex>). Lookups use request-response, protocol
+// /sametra/req/1: one PeerRequest, one PeerResponse.
+message PeerRequest {
+  repeated Filter filters = 1;
+  uint32 hops = 2;        // a search: how many more hops the peer may forward it
+  string search_id = 3;   // loop guard for forwarded searches
+}
+message PeerResponse {
+  repeated Event events = 1;
+  string error = 2;
+}
+
 // Post embeddings this node computed (DATA/vectors.pb; never sent on the network).
 // q: the unit vector scaled by 127, one signed byte per dimension.
 message Vector { bytes id = 1; bytes q = 2; }

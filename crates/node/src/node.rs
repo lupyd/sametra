@@ -10,11 +10,11 @@ use crate::rep::{self, Model, RepTable};
 use crate::store::{Ev, Insert, Store};
 use futures_util::{SinkExt, StreamExt};
 use sametra_transport::codec::{Msg, Wire, parse_frame};
-use sametra_transport::{Dialer, Message, WebSocketStream};
+use sametra_transport::{Message, WebSocketStream};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use crate::pb;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -38,8 +38,6 @@ pub struct Config {
     /// Serve HTTPS/WSS on the same port as plain HTTP/WS (PEM chain and key).
     pub tls_cert: Option<PathBuf>,
     pub tls_key: Option<PathBuf>,
-    /// Extra CA certificates (PEM) trusted when dialing wss:// peers.
-    pub tls_ca: Vec<PathBuf>,
     /// Networks treated like localhost for write tools (e.g. the Docker bridge
     /// gateway the host's requests come from). Host and Origin checks still apply.
     pub trusted: Vec<(std::net::IpAddr, u8)>,
@@ -87,7 +85,6 @@ impl Default for Config {
             api_token: None,
             tls_cert: None,
             tls_key: None,
-            tls_ca: vec![],
             trusted: vec![],
         }
     }
@@ -119,12 +116,9 @@ impl std::str::FromStr for Keep {
     }
 }
 
-/// Commands other tasks can send down a connection.
+/// Commands other tasks can send down a client connection.
 pub enum Out {
-    /// subscription id, filters, hops a search may still travel
-    Req(String, Vec<Filter>, u32),
-    Close(String),
-    /// results of a forwarded search for a subscription, followed by EOSE
+    /// results of a network search for a subscription, followed by EOSE
     Events(String, Vec<Ev>),
 }
 
@@ -134,21 +128,15 @@ pub fn search_timeout(hops: u32) -> Duration {
     Duration::from_millis(600 * (hops as u64 + 1) + 400)
 }
 /// Peers asked per lookup (bounds fan-out).
-const FANOUT: usize = 16;
+pub(crate) const FANOUT: usize = 16;
+/// Searches travel at most this many hops beyond the first peer.
+pub const MAX_HOPS: u32 = sametra_transport::codec::MAX_HOPS;
 
-pub struct PeerHandle {
+/// A WebSocket client (browser, agent, tool) of the relay.
+pub struct Client {
     pub tx: mpsc::Sender<Out>,
-    pub outbound: bool,
-    /// remote speaks sametra binary frames (always true for peers we dialed)
-    pub sametra: Arc<AtomicBool>,
     pub addr: String,
     pub since: u64,
-}
-
-#[derive(Default)]
-struct AddrInfo {
-    fails: u32,
-    next_try: u64,
 }
 
 pub struct Node {
@@ -157,9 +145,12 @@ pub struct Node {
     pub store: Mutex<Store>,
     /// Posts whose subtrees this node keeps when it does not relay everything.
     pub following: Mutex<BTreeSet<H32>>,
-    pub peers: Mutex<HashMap<u64, PeerHandle>>,
-    book: Mutex<HashMap<String, AddrInfo>>,
-    pub pending: Mutex<HashMap<String, mpsc::Sender<Option<Ev>>>>,
+    /// WebSocket clients of the relay (nodes talk to each other over libp2p)
+    pub clients: Mutex<HashMap<u64, Client>>,
+    /// peer addresses that worked, saved for the next start
+    saved_peers: Mutex<Vec<String>>,
+    /// the libp2p swarm (absent outside a tokio runtime, e.g. in unit tests)
+    pub p2p: std::sync::OnceLock<Arc<crate::p2p::P2p>>,
     seen: Mutex<HashMap<H32, u64>>, // recent ephemeral ids
     /// message scores and contextual standing, rebuilt when ratings change
     model_cache: Mutex<Option<(Arc<Model>, u64)>>,
@@ -181,7 +172,6 @@ pub struct Node {
     human_cache: Mutex<Option<Arc<RepTable>>>,
     tx: broadcast::Sender<(Ev, u64)>,
     next_conn: AtomicU64,
-    dialer: Dialer,
     /// Present when the node serves TLS (`tls_cert` + `tls_key`).
     #[cfg(feature = "tls")]
     pub tls: Option<sametra_transport::tls::TlsAcceptor>,
@@ -194,9 +184,13 @@ pub struct Node {
 pub type CapScores = HashMap<(H32, String), (f64, usize)>;
 
 pub const ORIGIN_LOCAL: u64 = 0;
+/// Arrived by gossip from another node.
+pub const ORIGIN_P2P: u64 = u64::MAX;
+/// Came back from a lookup or catch-up: stored, not spread again.
+pub const ORIGIN_SYNC: u64 = u64::MAX - 1;
 /// Relayed by every node, whatever it follows: small metadata, and capability
 /// jobs (so requests and results find their way through scoped nodes).
-const GLOBAL_KINDS: [u32; 8] = [K_PROFILE, K_RATING, K_DELETE, K_CAPABILITY, K_JOB, K_JOB_RESULT, K_JOB_FEEDBACK, K_FILE];
+pub(crate) const GLOBAL_KINDS: [u32; 8] = [K_PROFILE, K_RATING, K_DELETE, K_CAPABILITY, K_JOB, K_JOB_RESULT, K_JOB_FEEDBACK, K_FILE];
 
 /// How much standing in one tree counts in another, when the posts have no
 /// embeddings to compare (see embed::Closeness).
@@ -204,7 +198,6 @@ pub const FAR: f64 = 0.1;
 
 impl Node {
     pub fn new(cfg: Config, keys: Keys) -> std::io::Result<Arc<Node>> {
-        let dialer = Dialer::new(&cfg.tls_ca).map_err(std::io::Error::other)?;
         #[cfg(feature = "tls")]
         let tls = match (&cfg.tls_cert, &cfg.tls_key) {
             (Some(c), Some(k)) => Some(sametra_transport::tls::acceptor(c, k).map_err(std::io::Error::other)?),
@@ -222,10 +215,7 @@ impl Node {
         store.load_popularity(&state.popularity);
         let mut following: BTreeSet<H32> = state.following.iter().filter_map(|b| Some(H32(b.as_slice().try_into().ok()?))).collect();
         following.extend(cfg.follow.iter().copied());
-        let mut book: HashMap<String, AddrInfo> = state.peers.into_iter().map(|p| (p, AddrInfo::default())).collect();
-        for p in &cfg.peers {
-            book.entry(p.clone()).or_default();
-        }
+        let saved_peers = state.peers;
         let memory = std::fs::read(cfg.data.join("memory.pb"))
             .ok()
             .and_then(|b| pb::decode::<pb::MemoryResponse>(&b).ok())
@@ -238,9 +228,9 @@ impl Node {
             keys,
             store: Mutex::new(store),
             following: Mutex::new(following),
-            peers: Mutex::new(HashMap::new()),
-            book: Mutex::new(book),
-            pending: Mutex::new(HashMap::new()),
+            clients: Mutex::new(HashMap::new()),
+            saved_peers: Mutex::new(saved_peers),
+            p2p: std::sync::OnceLock::new(),
             seen: Mutex::new(HashMap::new()),
             model_cache: Mutex::new(None),
             vectors: Arc::new(std::sync::RwLock::new(crate::embed::Vectors::load(&vectors_path))),
@@ -254,7 +244,6 @@ impl Node {
             human_cache: Mutex::new(None),
             tx,
             next_conn: AtomicU64::new(1),
-            dialer,
             #[cfg(feature = "tls")]
             tls,
             #[cfg(feature = "ipfs")]
@@ -262,6 +251,35 @@ impl Node {
         });
         node.save_state();
         Ok(node)
+    }
+
+    /// Join the network (libp2p). Call once the node is set up (IPFS attached),
+    /// inside a tokio runtime.
+    pub fn start_p2p(self: &Arc<Self>) -> std::io::Result<()> {
+        if self.p2p.get().is_some() {
+            return Ok(());
+        }
+        let p2p = crate::p2p::start(self).map_err(std::io::Error::other)?;
+        let _ = self.p2p.set(p2p);
+        self.update_topics();
+        Ok(())
+    }
+
+    /// Peer addresses saved by the last run.
+    pub fn saved_peers(&self) -> Vec<String> {
+        self.saved_peers.lock().unwrap().clone()
+    }
+    /// The addresses worth trying next time (saved with the node state).
+    pub fn remember_peers(&self, addrs: Vec<String>) {
+        *self.saved_peers.lock().unwrap() = addrs;
+    }
+    /// Is this a search id we have not handled in the last minute? (loop guard)
+    pub fn fresh_search(&self, sid: &str) -> bool {
+        let mut seen = self.searches.lock().unwrap();
+        let t = now();
+        let fresh = seen.get(sid).is_none_or(|at| at + 60 < t);
+        seen.insert(sid.to_string(), t);
+        fresh
     }
 
     /// Persist followed posts, address book and pins (NodeState protobuf, atomic replace).
@@ -272,7 +290,7 @@ impl Node {
         };
         let st = pb::NodeState {
             following: self.following.lock().unwrap().iter().map(|h| h.0.to_vec()).collect(),
-            peers: self.book.lock().unwrap().iter().filter(|(_, i)| i.fails < 8).map(|(a, _)| a.clone()).collect(),
+            peers: self.saved_peers.lock().unwrap().clone(),
             pins,
             popularity,
             notifications_read: self.notifications_read.load(Ordering::Relaxed),
@@ -332,14 +350,9 @@ impl Node {
                     let (ipfs, tag) = (ipfs.clone(), tag.clone());
                     rt.spawn(async move { ipfs.learn(&tag).await });
                 }
-                if e.pubkey != self.keys.pubkey
-                    && let Some(addr) = e.tag("r").filter(|a| a.starts_with("ws://") || a.starts_with("wss://")) {
-                        let mut book = self.book.lock().unwrap();
-                        if book.len() < 2000 && !book.contains_key(addr) {
-                            tracing::debug!(%addr, "learned a peer address");
-                            book.insert(addr.to_string(), Default::default());
-                        }
-                    }
+            }
+            if origin != ORIGIN_SYNC && origin != ORIGIN_P2P {
+                self.gossip(&e, None);
             }
             let e = Arc::new(e);
             let _ = self.tx.send((e.clone(), origin));
@@ -380,6 +393,15 @@ impl Node {
                     for cid in crate::files::linked_cids(e.text()) {
                         let ipfs = ipfs.clone();
                         rt.spawn(async move { ipfs.cache(cid).await });
+                    }
+                }
+                // spread it, unless it came back from a lookup (old news to the
+                // network) or by gossip (the receiving side bridges topics)
+                if origin != ORIGIN_SYNC && origin != ORIGIN_P2P {
+                    self.gossip(&e, None);
+                    // a scoped node listens to the trees it takes part in
+                    if e.kind == K_POST && e.pubkey == self.keys.pubkey && !self.cfg.relay_all {
+                        self.update_topics();
                     }
                 }
                 let _ = self.tx.send((e.clone(), origin));
@@ -494,10 +516,11 @@ impl Node {
     }
 
     fn heartbeat_event(&self) -> Event {
-        let mut tags = vec![];
-        if let Some(a) = &self.cfg.public_addr {
-            tags.push(vec!["r".to_string(), a.clone()]);
-        }
+        // a nonce: two heartbeats in one second are still two messages
+        let mut nonce = [0u8; 8];
+        getrandom::getrandom(&mut nonce).unwrap();
+        #[cfg_attr(not(feature = "ipfs"), allow(unused_mut))]
+        let mut tags = vec![vec!["nonce".to_string(), hex::encode(nonce)]];
         // our IPFS daemon, so Sametra nodes connect theirs and swap files directly
         #[cfg(feature = "ipfs")]
         tags.extend(self.ipfs.get().and_then(|i| i.heartbeat_tag()));
@@ -507,85 +530,24 @@ impl Node {
         let _ = self.ingest(self.heartbeat_event(), ORIGIN_LOCAL, true);
     }
 
-    /// What we want from relays we dial.
-    fn sync_filters(&self, since: u64) -> Vec<Filter> {
-        let hb = Filter { kinds: Some(vec![K_HEARTBEAT]), since: Some(now()), ..Default::default() };
+    /// What we ask a peer for when it connects: what we may have missed.
+    pub(crate) fn sync_filters(&self, since: u64) -> Vec<Filter> {
         if self.cfg.relay_all {
-            return vec![Filter { since: Some(since), limit: Some(20000), ..Default::default() }, hb];
+            return vec![Filter { since: Some(since), limit: Some(5000), ..Default::default() }];
         }
         let following: Vec<String> = self.following.lock().unwrap().iter().map(H32::hex).collect();
-        let mut f = vec![Filter { kinds: Some(GLOBAL_KINDS.to_vec()), since: Some(since), ..Default::default() }, hb];
+        let mut f = vec![Filter { kinds: Some(GLOBAL_KINDS.to_vec()), since: Some(since), ..Default::default() }];
         f.push(Filter { tags: vec![("p".into(), vec![self.keys.pubkey.hex()])], since: Some(since), ..Default::default() });
         // mentions of anyone: relayed by every node so they reach the people named
         f.push(Filter { tags: vec![("l".into(), vec!["mention".into(), "addressed".into()])], since: Some(since), ..Default::default() });
         // followed posts and everything under them (every post names its ancestors)
         if !following.is_empty() {
             f.push(Filter { ids: Some(following.clone()), ..Default::default() });
-            f.push(Filter { tags: vec![("e".into(), following)], since: Some(since), limit: Some(20000), ..Default::default() });
+            f.push(Filter { tags: vec![("e".into(), following)], since: Some(since), limit: Some(5000), ..Default::default() });
         }
         f
     }
 
-    /// Ask every connected sametra peer; collect results until all answered EOSE or timeout.
-    pub async fn remote_fetch(&self, filters: Vec<Filter>, timeout: Duration) -> Vec<Ev> {
-        self.ask_peers(filters, timeout, 0, None, None).await
-    }
-
-    /// Search the network: peers answer from their index and forward the query
-    /// up to `hops` more hops. Lossy by design: whatever arrives in time.
-    pub async fn remote_search(&self, filters: Vec<Filter>, hops: u32) -> Vec<Ev> {
-        let hops = hops.min(sametra_transport::codec::MAX_HOPS);
-        let mut rnd = [0u8; 8];
-        getrandom::getrandom(&mut rnd).unwrap();
-        let sid = format!("q-{}", hex::encode(rnd));
-        self.searches.lock().unwrap().insert(sid.clone(), now());
-        self.ask_peers(filters, search_timeout(hops), hops, None, Some(sid)).await
-    }
-
-    /// Send `filters` to up to FANOUT sametra peers (except `exclude`) and collect
-    /// the events they return until every one sent EOSE or `timeout` passed.
-    pub async fn ask_peers(&self, filters: Vec<Filter>, timeout: Duration, hops: u32, exclude: Option<u64>, sid: Option<String>) -> Vec<Ev> {
-        let sid = sid.unwrap_or_else(|| {
-            let mut rnd = [0u8; 8];
-            getrandom::getrandom(&mut rnd).unwrap();
-            format!("fetch-{}", hex::encode(rnd))
-        });
-        let (tx, mut rx) = mpsc::channel(4096);
-        self.pending.lock().unwrap().insert(sid.clone(), tx);
-        let txs: Vec<_> = self
-            .peers
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(id, p)| p.sametra.load(Ordering::Relaxed) && Some(**id) != exclude)
-            .take(FANOUT)
-            .map(|(_, p)| p.tx.clone())
-            .collect();
-        let mut waiting = txs.iter().filter(|t| t.try_send(Out::Req(sid.clone(), filters.clone(), hops)).is_ok()).count();
-        let asked = waiting;
-        let mut out = Vec::new();
-        let started = tokio::time::Instant::now();
-        let deadline = started + timeout;
-        while waiting > 0 {
-            match tokio::time::timeout_at(deadline, rx.recv()).await {
-                Ok(Some(Some(e))) => out.push(e),
-                Ok(Some(None)) => waiting -= 1,
-                _ => break,
-            }
-        }
-        self.pending.lock().unwrap().remove(&sid);
-        for t in txs {
-            let _ = t.try_send(Out::Close(sid.clone()));
-        }
-        let mut seen = HashSet::new();
-        out.retain(|e| seen.insert(e.id));
-        tracing::debug!(%sid, hops, asked, unanswered = waiting, found = out.len(), ms = started.elapsed().as_millis() as u64, "asked peers");
-        out
-    }
-
-    pub fn peer_list(&self) -> Vec<pb::Peer> {
-        self.peers.lock().unwrap().values().map(|p| pb::Peer { addr: p.addr.clone(), outbound: p.outbound, since: p.since }).collect()
-    }
 }
 
 /// Is the event addressed to people wherever they are: it @mentions someone
@@ -612,11 +574,11 @@ where
 {
     let ws = sametra_transport::accept(stream, part).await;
     tracing::debug!(%addr, "inbound websocket");
-    run_conn(node, ws, false, addr.clone()).await;
+    run_conn(node, ws, addr.clone()).await;
     tracing::debug!(%addr, "inbound websocket closed");
 }
 
-async fn run_conn<S>(node: Arc<Node>, ws: WebSocketStream<S>, outbound: bool, addr: String)
+async fn run_conn<S>(node: Arc<Node>, ws: WebSocketStream<S>, addr: String)
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -624,20 +586,12 @@ where
     let (mut sink, mut stream) = ws.split();
     let (tx, mut rx) = mpsc::channel::<Out>(256);
     let own_tx = tx.clone();
-    // every link speaks the binary protocol; there are no other kinds of client
-    let sametra = Arc::new(AtomicBool::new(true));
-    node.peers.lock().unwrap().insert(id, PeerHandle { tx, outbound, sametra: sametra.clone(), addr: addr.clone(), since: now() });
+    node.clients.lock().unwrap().insert(id, Client { tx, addr: addr.clone(), since: now() });
     let mut brx = node.tx.subscribe();
     let mut subs: HashMap<String, Vec<Filter>> = HashMap::new();
     let mut ping = tokio::time::interval(Duration::from_secs(30));
     let mut budget = (now(), 0u32); // crude per-second rate limit for published EVENTs
     let wire = Wire;
-
-    if outbound {
-        let since = node.store.lock().unwrap().iter().next().map(|e| e.created_at.saturating_sub(3600)).unwrap_or(0);
-        let _ = sink.send(wire.req("sync", &node.sync_filters(since), 0)).await;
-        node.heartbeat();
-    }
 
     loop {
         tokio::select! {
@@ -659,7 +613,7 @@ where
                         budget.1 += 1;
                         let eid = e.id;
                         if budget.1 == 201 {
-                            tracing::warn!(conn = id, %addr, "peer is publishing over 200 events/s; refusing the rest of this second");
+                            tracing::warn!(conn = id, %addr, "client is publishing over 200 events/s; refusing the rest of this second");
                         }
                         let (ok, m) = if budget.1 > 200 {
                             (false, "rate-limited: slow down".to_string())
@@ -673,20 +627,10 @@ where
                                 }
                             }
                         };
-                        // peers flooding to us don't need acks; nostr clients do
-                        // peers flooding to us need no acks, refusals do
-                        if !ok { let _ = sink.send(wire.ok(&eid, ok, &m)).await; }
-                    }
-                    Msg::SubEvent(sid, e) => {
-                        let pend = node.pending.lock().unwrap().get(&sid).cloned();
-                        if let Ok((e, _)) = node.ingest(e, id, pend.is_some())
-                            && let Some(p) = pend { let _ = p.try_send(Some(e)); }
-                    }
-                    Msg::Eose(sid) => {
-                        if let Some(p) = node.pending.lock().unwrap().get(&sid) { let _ = p.try_send(None); }
+                        if sink.send(wire.ok(&eid, ok, &m)).await.is_err() { break; }
                     }
                     Msg::Req(sid, filters, hops) => {
-                        // searches are one-shot (answered, maybe forwarded, then EOSE); others stay live
+                        // searches are one-shot (answered, maybe asked of the network, then EOSE); others stay live
                         let search = filters.iter().any(|f| f.search.is_some());
                         if sid.len() > 64 || (!search && subs.len() >= 32 && !subs.contains_key(&sid)) {
                             let _ = sink.send(wire.closed(&sid, "error: too many subscriptions")).await;
@@ -717,19 +661,12 @@ where
                         }
                         if failed { break; }
                         if search {
-                            let fresh = {
-                                let mut seen = node.searches.lock().unwrap();
-                                let t = now();
-                                let fresh = seen.get(&sid).is_none_or(|at| at + 60 < t);
-                                seen.insert(sid.clone(), t);
-                                fresh
-                            };
-                            let slot = (hops > 0 && fresh).then(|| node.search_slots.clone().try_acquire_owned().ok()).flatten();
+                            let slot = (hops > 0).then(|| node.search_slots.clone().try_acquire_owned().ok()).flatten();
                             if let Some(slot) = slot {
                                 let (n, back, sid) = (node.clone(), own_tx.clone(), sid.clone());
                                 tokio::spawn(async move {
                                     let _slot = slot;
-                                    let found = n.ask_peers(filters, search_timeout(hops - 1), hops - 1, Some(id), Some(sid.clone())).await;
+                                    let found = n.remote_search(filters, hops - 1).await;
                                     let _ = back.send(Out::Events(sid, found)).await;
                                 });
                             } else if sink.send(wire.eose(&sid)).await.is_err() {
@@ -738,45 +675,25 @@ where
                             continue;
                         }
                         if sink.send(wire.eose(&sid)).await.is_err() { break; }
-                        // introduce ourselves to new subscribers so they learn our address now
-                        if subs.is_empty() && !outbound {
-                            let hb = node.heartbeat_event();
-                            if filters.iter().any(|f| f.matches(&hb)) { let _ = sink.send(wire.event(&sid, &hb)).await; }
-                        }
                         subs.insert(sid, filters);
                     }
                     Msg::Close(sid) => { subs.remove(&sid); }
-                    Msg::Ignore => {}
+                    Msg::SubEvent(..) | Msg::Eose(_) | Msg::Ignore => {}
                     Msg::Bad => { let _ = sink.send(wire.notice("error: bad message")).await; }
                 }
             }
             Some(cmd) = rx.recv() => {
-                let m = match cmd {
-                    Out::Req(sid, fs, hops) => Some(wire.req(&sid, &fs, hops)),
-                    Out::Close(sid) => Some(wire.close(&sid)),
-                    Out::Events(sid, evs) => {
-                        let mut failed = false;
-                        for e in &evs {
-                            if sink.feed(wire.event(&sid, e)).await.is_err() { failed = true; break; }
-                        }
-                        if failed { break; }
-                        Some(wire.eose(&sid))
-                    }
-                };
-                if let Some(m) = m && sink.send(m).await.is_err() { break; }
+                let Out::Events(sid, evs) = cmd;
+                let mut failed = false;
+                for e in &evs {
+                    if sink.feed(wire.event(&sid, e)).await.is_err() { failed = true; break; }
+                }
+                if failed || sink.send(wire.eose(&sid)).await.is_err() { break; }
             }
             r = brx.recv() => match r {
                 Ok((e, origin)) if origin != id => {
-                    let mut matched = false;
                     for (sid, fs) in &subs {
-                        if fs.iter().any(|f| f.matches(&e)) {
-                            matched = true;
-                            if sink.feed(wire.event(sid, &e)).await.is_err() { break; }
-                        }
-                    }
-                    // relays we dialed don't subscribe to us: push new events to them
-                    if outbound && !matched {
-                        let _ = sink.feed(wire.publish(&e)).await;
+                        if fs.iter().any(|f| f.matches(&e)) && sink.feed(wire.event(sid, &e)).await.is_err() { break; }
                     }
                     if sink.flush().await.is_err() { break; }
                 }
@@ -787,39 +704,12 @@ where
             _ = ping.tick() => { if sink.send(Message::Ping(Default::default())).await.is_err() { break; } }
         }
     }
-    node.peers.lock().unwrap().remove(&id);
+    node.clients.lock().unwrap().remove(&id);
 }
 
 // ---- background tasks ------------------------------------------------------
 
 pub fn spawn_background(node: Arc<Node>) {
-    // dialer
-    let n = node.clone();
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(10));
-        loop {
-            tick.tick().await;
-            let connected: Vec<String> = n.peers.lock().unwrap().values().filter(|p| p.outbound).map(|p| p.addr.clone()).collect();
-            if connected.len() >= n.cfg.max_peers {
-                continue;
-            }
-            let t = now();
-            let mut cands: Vec<String> = n
-                .book
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|(a, i)| i.next_try <= t && !connected.contains(a) && Some(*a) != n.cfg.public_addr.as_ref())
-                .map(|(a, _)| a.clone())
-                .collect();
-            cands.truncate(n.cfg.max_peers - connected.len());
-            for addr in cands {
-                let n = n.clone();
-                tokio::spawn(async move { dial(n, addr).await });
-            }
-        }
-    });
-
     // heartbeat
     let n = node.clone();
     tokio::spawn(async move {
@@ -864,36 +754,6 @@ pub fn spawn_background(node: Arc<Node>) {
     });
 }
 
-/// Connect to a relay and run the link until it drops (also used by tests).
-pub async fn dial(node: Arc<Node>, addr: String) {
-    let r = tokio::time::timeout(Duration::from_secs(10), node.dialer.connect(&addr)).await;
-    let ws = match r {
-        Ok(Ok(ws)) => ws,
-        failed => {
-            let mut book = node.book.lock().unwrap();
-            let i = book.entry(addr.clone()).or_default();
-            i.fails += 1;
-            i.next_try = now() + (15u64 << i.fails.min(8)).min(3600);
-            let error = failed.map(|r| r.err().unwrap_or_default()).unwrap_or_else(|_| "timed out".into());
-            let retry_in = i.next_try.saturating_sub(now());
-            if i.fails == 1 {
-                tracing::warn!(%addr, %error, retry_in, "dial failed");
-            } else {
-                tracing::debug!(%addr, %error, fails = i.fails, retry_in, "dial failed again");
-            }
-            return;
-        }
-    };
-    tracing::info!(%addr, "connected to peer");
-    if let Some(i) = node.book.lock().unwrap().get_mut(&addr) {
-        i.fails = 0;
-    }
-    run_conn(node.clone(), ws, true, addr.clone()).await;
-    tracing::info!(%addr, "disconnected from peer");
-    if let Some(i) = node.book.lock().unwrap().get_mut(&addr) {
-        i.next_try = now() + 5;
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -906,7 +766,7 @@ mod tests {
         d
     }
     fn node_with(name: &str, f: impl FnOnce(&mut Config)) -> Arc<Node> {
-        let mut cfg = Config { data: tmpdir(name), ..Default::default() };
+        let mut cfg = Config { data: tmpdir(name), listen: "127.0.0.1:0".into(), ..Default::default() };
         f(&mut cfg);
         Node::new(cfg, Keys::generate()).unwrap()
     }
@@ -961,37 +821,33 @@ mod tests {
         assert!(sf.iter().any(|f| f.tags == vec![("e".to_string(), vec![topic.id.hex()])] && f.since == Some(5)), "everything under it names it");
         assert!(sf.iter().any(|f| f.ids == Some(vec![topic.id.hex()])), "and the post itself");
         assert!(sf.iter().any(|f| f.kinds.as_ref().is_some_and(|k| k.contains(&K_RATING))));
-        assert!(sf.iter().any(|f| f.kinds == Some(vec![K_HEARTBEAT])));
+        // it listens to the trees it follows or wrote in, and to metadata
+        let mine = n.publish(K_POST, vec![], "my own topic".into()).unwrap();
+        let t = n.wanted_topics();
+        assert!(t.contains(crate::p2p::META) && !t.contains(crate::p2p::ALL));
+        assert!(t.contains(&crate::p2p::tree_topic(&topic.id)) && t.contains(&crate::p2p::tree_topic(&mine.id)));
     }
 
     #[test]
     fn sync_filters_relay_all() {
         let n = node_with("syncall", |_| {});
         let sf = n.sync_filters(42);
-        assert_eq!(sf.len(), 2);
+        assert_eq!(sf.len(), 1);
         assert!(sf[0].kinds.is_none() && sf[0].tags.is_empty() && sf[0].since == Some(42));
+        assert_eq!(n.wanted_topics(), [crate::p2p::ALL.to_string(), crate::p2p::META.to_string()].into());
     }
 
     #[test]
-    fn heartbeats_feed_presence_and_address_book() {
+    fn heartbeats_feed_presence() {
         let n = node_with("hb", |_| {});
         let k = Keys::generate();
-        let hb = |addr: &str| k.sign(K_HEARTBEAT, vec![vec!["r".into(), addr.into()]], String::new());
-        let e = hb("ws://10.0.0.1:42424");
+        let e = k.sign(K_HEARTBEAT, vec![], String::new());
         assert!(n.ingest(e.clone(), 1, false).unwrap().1);
         assert!(!n.ingest(e, 1, false).unwrap().1, "seen ephemeral ids are dropped");
-        assert!(n.book.lock().unwrap().contains_key("ws://10.0.0.1:42424"));
         assert!(n.store.lock().unwrap().last_seen.get(&k.pubkey).is_some_and(|t| *t + 5 >= now()));
         assert_eq!(n.store.lock().unwrap().len(), 0, "heartbeats are not stored");
-        n.ingest(hb("http://evil"), 1, false).unwrap();
-        assert!(!n.book.lock().unwrap().contains_key("http://evil"), "only ws(s) addresses");
-        let stale = k.sign_at(K_HEARTBEAT, vec![vec!["r".into(), "ws://old:1".into()]], String::new(), now() - 3600);
+        let stale = k.sign_at(K_HEARTBEAT, vec![], String::new(), now() - 3600);
         assert!(n.ingest(stale, 1, false).unwrap_err().contains("stale"));
-        assert!(!n.book.lock().unwrap().contains_key("ws://old:1"));
-        // our own heartbeat never adds ourselves to the book
-        let me = node_with("hb2", |c| c.public_addr = Some("ws://me:1".into()));
-        me.heartbeat();
-        assert!(!me.book.lock().unwrap().contains_key("ws://me:1"));
     }
 
     #[test]
@@ -1054,26 +910,22 @@ mod tests {
         let dir = tmpdir("persist");
         let keys = Keys::generate();
         let secret = keys.secret_hex();
-        let cfg = || Config { data: dir.clone(), peers: vec!["ws://boot:1".into()], ..Default::default() };
+        let cfg = || Config { data: dir.clone(), ..Default::default() };
         let n = Node::new(cfg(), keys).unwrap();
         let e = n.publish(K_POST, c("m"), "x".into()).unwrap();
         n.following.lock().unwrap().insert(e.id);
         n.store.lock().unwrap().pin([e.id], true);
-        n.book.lock().unwrap().insert("ws://learned:2".into(), AddrInfo::default());
-        n.book.lock().unwrap().insert("ws://dead:3".into(), AddrInfo { fails: 9, next_try: 0 });
+        n.remember_peers(vec!["/ip4/10.0.0.2/udp/42424/quic-v1".into()]);
         n.memory.lock().unwrap().insert("k".into(), "v".into());
         n.save_state();
         n.save_memory();
         n.store.lock().unwrap().flush();
         drop(n);
-        let n = Node::new(Config { peers: vec![], ..cfg() }, Keys::parse(&secret).unwrap()).unwrap();
+        let n = Node::new(cfg(), Keys::parse(&secret).unwrap()).unwrap();
         assert!(n.following.lock().unwrap().contains(&e.id));
         assert!(n.store.lock().unwrap().pinned.contains(&e.id));
         assert!(n.store.lock().unwrap().get(&e.id).is_some());
-        let book = n.book.lock().unwrap();
-        assert!(book.contains_key("ws://boot:1") && book.contains_key("ws://learned:2"));
-        assert!(!book.contains_key("ws://dead:3"), "repeatedly failing peers are forgotten");
-        drop(book);
+        assert_eq!(n.saved_peers(), ["/ip4/10.0.0.2/udp/42424/quic-v1"], "peers that worked are tried first next time");
         assert_eq!(n.memory.lock().unwrap().get("k").map(String::as_str), Some("v"));
         assert!(!dir.join("state.tmp").exists());
         let _ = std::fs::remove_dir_all(dir);
@@ -1097,6 +949,5 @@ mod tests {
         let t = std::time::Instant::now();
         assert!(n.remote_fetch(vec![Filter::default()], Duration::from_secs(5)).await.is_empty());
         assert!(t.elapsed() < Duration::from_secs(1));
-        assert!(n.pending.lock().unwrap().is_empty());
     }
 }

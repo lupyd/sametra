@@ -270,6 +270,10 @@ impl Keys {
             Self::from_secret(&hex::decode(&s).map_err(|e| e.to_string())?)
         }
     }
+    /// The raw secret key (the node's libp2p identity is derived from it).
+    pub fn secret_bytes(&self) -> [u8; 32] {
+        self.sk.to_bytes().into()
+    }
     pub fn secret_hex(&self) -> String {
         hex::encode(self.sk.to_bytes())
     }

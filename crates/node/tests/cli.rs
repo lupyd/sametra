@@ -281,8 +281,8 @@ fn restart_keeps_events_state_and_identity() {
 fn bootstrap_peer_and_gossip_between_processes() {
     let (da, db) = (tempdir("boot-a"), tempdir("boot-b"));
     let (pa, pb) = (free_port(), free_port());
-    let (_a, _) = run_node(&da.0, pa, &["--public", &format!("ws://127.0.0.1:{pa}")]);
-    let (_b, _) = run_node(&db.0, pb, &["--peer", &format!("ws://127.0.0.1:{pa}"), "--threads", "1"]);
+    let (_a, _) = run_node(&da.0, pa, &["--public", &format!("127.0.0.1:{pa}")]);
+    let (_b, _) = run_node(&db.0, pb, &["--peer", &format!("127.0.0.1:{pa}"), "--threads", "1"]);
     assert!(wait(Duration::from_secs(20), || call(&db.0, pb, "info", json!({})).unwrap()["peers"] == 1), "b dialed its bootstrap peer");
     let a = call(&da.0, pa, "post", json!({"title": "hello b", "content": "x"})).unwrap();
     let id = a["id"].as_str().unwrap().to_string();
@@ -293,7 +293,7 @@ fn bootstrap_peer_and_gossip_between_processes() {
         call(&da.0, pa, "thread", json!({"id": id})).unwrap()["root"]["replies"].as_array().is_some_and(|v| v.iter().any(|x| x["id"] == rid.as_str()))
     }));
     let peers = call(&db.0, pb, "peers", json!({})).unwrap();
-    assert_eq!(peers["peers"][0]["addr"], format!("ws://127.0.0.1:{pa}"));
+    assert!(peers["peers"][0]["addr"].as_str().unwrap().starts_with(&format!("/ip4/127.0.0.1/udp/{pa}/quic-v1/p2p/")), "{peers}");
     assert_eq!(peers["peers"][0]["outbound"], true);
 }
 
@@ -404,9 +404,9 @@ fn connect_asks_each_harness_cli() {
     assert_eq!(a[5], "--");
     assert!(a[6].ends_with("sametra"));
     assert_eq!(a[7..], ["mcp", "--node", "--data", data.to_str().unwrap()]);
-    let (code, _, _) = connect(&["codex", "--data", data.to_str().unwrap(), "--peer", "ws://boot:42424"]);
+    let (code, _, _) = connect(&["codex", "--data", data.to_str().unwrap(), "--peer", "boot:42424"]);
     assert_eq!(code, 0);
-    assert!(argv().join(" ").ends_with(&format!("mcp --node --data {} --peer ws://boot:42424", data.display())));
+    assert!(argv().join(" ").ends_with(&format!("mcp --node --data {} --peer boot:42424", data.display())));
     let (code, _, _) = connect(&["opencode", "--url", "http://127.0.0.1:7448/mcp"]);
     assert_eq!(code, 0);
     assert_eq!(argv(), ["mcp", "add", "sametra", "--url", "http://127.0.0.1:7448/mcp"]);
@@ -576,7 +576,7 @@ fn files_through_kubo_move_between_nodes() {
     let (ka, kb) = (Kubo::start(&swarm), Kubo::start(&swarm));
     let (a, b) = (tempdir("ipfs-a"), tempdir("ipfs-b"));
     let (_na, pa) = run_node(&a.0, 0, &["--ipfs-api", &ka.api()]);
-    let (_nb, pb) = run_node(&b.0, 0, &["--ipfs-api", &kb.api(), "--peer", &format!("ws://127.0.0.1:{pa}")]);
+    let (_nb, pb) = run_node(&b.0, 0, &["--ipfs-api", &kb.api(), "--peer", &format!("127.0.0.1:{pa}")]);
     let info = call(&a.0, pa, "info", json!({})).unwrap();
     assert_eq!(info["ipfs_peer"], ka.peer_id.as_str());
     assert_eq!(info["ipfs_api"], ka.api());

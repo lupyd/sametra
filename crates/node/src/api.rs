@@ -220,7 +220,7 @@ async fn info(node: &Arc<Node>, _: Empty) -> R<InfoResponse> {
         pinned: st.pinned.len() as u32,
         following: node.following.lock().unwrap().iter().map(H32::hex).collect(),
         relay_all: node.cfg.relay_all,
-        peers: node.peers.lock().unwrap().len() as u32,
+        peers: node.peer_count() as u32,
         public_addr: node.cfg.public_addr.clone().unwrap_or_default(),
         unread: addressed_to_me(&st, &node.keys.pubkey, node.notifications_read.load(std::sync::atomic::Ordering::Relaxed), 1000).len() as u32,
         ..ipfs
@@ -389,6 +389,8 @@ async fn follow(node: &Arc<Node>, r: FollowRequest) -> R<Ack> {
     node.save_state();
     let f = vec![Filter { ids: Some(vec![id.hex()]), ..Default::default() }, Filter { tags: vec![("e".into(), vec![id.hex()])], limit: Some(2000), ..Default::default() }];
     let n = node.remote_fetch(f, Duration::from_secs(3)).await.len();
+    // listen to its tree from now on (its root is known once we hold it)
+    node.update_topics();
     Ok(Ack { count: n as u32, ..ack(Some(&id)) })
 }
 
@@ -396,6 +398,7 @@ async fn unfollow(node: &Arc<Node>, r: FollowRequest) -> R<Ack> {
     let id = hex_id(&r.id, "id")?;
     node.following.lock().unwrap().remove(&id);
     node.save_state();
+    node.update_topics();
     Ok(ack(Some(&id)))
 }
 
@@ -404,7 +407,7 @@ async fn feed(node: &Arc<Node>, r: FeedRequest) -> R<Items> {
     let parent = opt_slug(&r.parent).map(|p| hex_id(p, "parent")).transpose()?;
     let limit = if r.limit == 0 { 30 } else { r.limit.min(500) } as usize;
     if let Some(p) = parent
-        && !node.peers.lock().unwrap().is_empty()
+        && node.peer_count() > 0
     {
         let f = Filter { tags: vec![("e".into(), vec![p.hex()])], limit: Some(2000), ..Default::default() };
         node.remote_fetch(vec![f], Duration::from_millis(1500)).await;
@@ -435,7 +438,7 @@ async fn thread(node: &Arc<Node>, r: IdRequest) -> R<ThreadResponse> {
     let id = hex_id(&r.id, "id")?;
     let root = get_or_fetch(node, &id).await.ok_or("event not found on this node or its peers")?;
     node.store.lock().unwrap().bump(&id, 1.0); // viewed
-    if !node.peers.lock().unwrap().is_empty() {
+    if node.peer_count() > 0 {
         let f = Filter { tags: vec![("e".into(), vec![id.hex()])], limit: Some(5000), ..Default::default() };
         node.remote_fetch(vec![f], Duration::from_millis(1500)).await;
     }
@@ -518,7 +521,7 @@ async fn chain(node: &Arc<Node>, r: ChainRequest) -> R<ChainResponse> {
         frontier = next;
     }
     // downstream: replies and citing posts
-    if !node.peers.lock().unwrap().is_empty() {
+    if node.peer_count() > 0 {
         let f = Filter { tags: vec![("e".into(), vec![id.hex()])], limit: Some(500), ..Default::default() };
         let q = Filter { tags: vec![("q".into(), vec![id.hex()])], limit: Some(500), ..Default::default() };
         node.remote_fetch(vec![f, q], Duration::from_millis(1500)).await;

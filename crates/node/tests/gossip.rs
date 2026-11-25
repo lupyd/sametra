@@ -92,22 +92,24 @@ async fn scoped_nodes_only_keep_what_they_follow() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn heartbeats_spread_dialable_addresses() {
-    // a announces the address it listens on
-    let a = spawn(|c| c.public_addr = Some(format!("ws://{}", c.listen))).await;
-    let a_ws = a.ws.clone();
-    let (b, c) = (spawn(|_| {}).await, spawn(|_| {}).await);
-    c.connect(&b).await;
-    b.connect(&a).await; // a greets its new subscriber b with a heartbeat; b relays it to c
-    let book = |n: &TestNode| {
-        n.node.save_state();
-        pb::decode::<pb::NodeState>(&std::fs::read(n.dir.0.join("state.pb")).unwrap()).unwrap().peers
-    };
-    assert!(eventually(T, || book(&c).contains(&a_ws)).await, "c learned a's address two hops away");
-    assert!(eventually(T, || book(&b).contains(&a_ws)).await);
-    assert!(!book(&a).contains(&a_ws), "never ourselves");
-    // and presence: a's author is now 'seen' on c, keeping a's content alive there
-    assert!(c.node.store.lock().unwrap().last_seen.contains_key(&a.node.keys.pubkey));
+async fn peers_are_discovered_through_kademlia() {
+    // public nodes (Kademlia servers) that only know one bootstrap node
+    let public = |c: &mut sametra_node::node::Config| c.public_addr = Some(c.listen.clone());
+    let a = spawn(public).await;
+    let (b, c) = (spawn(public).await, spawn(public).await);
+    b.connect(&a).await;
+    c.connect(&a).await;
+    // c finds b through a's routing table, and dials it
+    let (pb_, pc) = (b.node.p2p.get().unwrap().clone(), c.node.p2p.get().unwrap().clone());
+    assert!(eventually(Duration::from_secs(30), || pc.peers().iter().any(|(id, _)| *id == pb_.peer_id)).await, "c met b without being told about it");
+    // working addresses are saved for the next start
+    assert!(eventually(T, || {
+        c.node.save_state();
+        !pb::decode::<pb::NodeState>(&std::fs::read(c.dir.0.join("state.pb")).unwrap()).unwrap().peers.is_empty()
+    })
+    .await);
+    // and presence: heartbeats travel by gossip, so a's author is 'seen' on c
+    assert!(eventually(T, || c.node.store.lock().unwrap().last_seen.contains_key(&a.node.keys.pubkey)).await);
 }
 
 // ---- plain nostr clients (NIP-01 JSON) --------------------------------------
@@ -160,10 +162,13 @@ async fn client_publish_and_refusals() {
     let mut ws = client(&n).await;
     let k = Keys::generate();
     let e = k.sign(K_POST, tags(&[&["title", "from a client"]]), "hi".into());
-    // accepted events need no answer; refusals get one
+    // every publish is answered: accepted, duplicate, or refused and why
     send(&mut ws, publish(&e)).await;
+    let r = recv(&mut ws).await;
+    assert_eq!((r.type_pb, r.ok, r.message.as_str()), (pb::F_OK, true, ""));
     send(&mut ws, publish(&e)).await;
-    assert!(quiet(&mut ws, Duration::from_millis(300)).await, "accepted and duplicate events are not acknowledged");
+    let r = recv(&mut ws).await;
+    assert_eq!((r.ok, r.message.as_str()), (true, "duplicate:"));
     let mut forged = k.sign(K_POST, vec![], "x".into());
     forged.content = b"changed".to_vec();
     send(&mut ws, publish(&forged)).await;
@@ -171,7 +176,7 @@ async fn client_publish_and_refusals() {
     assert_eq!((r.type_pb, r.ok, r.event_id), (pb::F_OK, false, forged.id.0.to_vec()));
     assert!(r.message.starts_with("invalid:"));
     send(&mut ws, publish(&k.sign(K_HEARTBEAT, vec![], String::new()))).await;
-    assert!(quiet(&mut ws, Duration::from_millis(200)).await, "ephemeral events are accepted and relayed");
+    assert!(recv(&mut ws).await.ok, "ephemeral events are accepted and relayed");
     ws.send(Message::binary(vec![0xff, 0xff, 0xff])).await.unwrap();
     assert_eq!(recv(&mut ws).await.type_pb, pb::F_NOTICE);
     // the post is visible through the API like any other
@@ -301,13 +306,8 @@ async fn clients_on_different_nodes_see_each_other() {
     let got = Event::from_pb(m.event.unwrap()).unwrap();
     assert_eq!(got, e);
     assert!(got.validate().is_ok());
-    // subscribers asking for presence get the node's heartbeat
-    let mut hb = client(&a).await;
-    send(&mut hb, req("p", of_kinds(&[K_HEARTBEAT]))).await;
-    assert_eq!(recv(&mut hb).await.type_pb, pb::F_EOSE);
-    let m = recv(&mut hb).await;
-    let e = Event::from_pb(m.event.unwrap()).unwrap();
-    assert_eq!((e.kind, e.pubkey), (K_HEARTBEAT, a.node.keys.pubkey));
+    let ok = recv(&mut on_a).await;
+    assert_eq!((ok.type_pb, ok.ok, ok.event_id), (pb::F_OK, true, e.id.0.to_vec()), "the publisher is told it was accepted");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

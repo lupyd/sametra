@@ -43,19 +43,19 @@ async fn tls_node(c: &Cert) -> TestNode {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn wss_gossip_between_nodes() {
+async fn tls_nodes_talk_to_each_other_over_quic() {
+    // HTTPS is for browsers and clients; node to node traffic is libp2p over
+    // QUIC (TLS 1.3 with the nodes' own keys), whatever the HTTP side does
     let cert = Cert::new();
     let a = tls_node(&cert).await;
-    let ca = cert.cert();
-    let b = spawn(move |c| c.tls_ca = vec![ca]).await;
-    let url = format!("wss://localhost:{}", a.addr.port());
-    b.connect_url(&a, &url).await;
+    let b = spawn(|_| {}).await;
+    b.connect(&a).await;
     let from_a: pb::Ack = a.ok("post", &post("over tls", "x")).await;
     assert!(eventually(T, || b.has(&from_a.id)).await);
     let from_b: pb::Ack = b.ok("post", &post("back over tls", "x")).await;
     assert!(eventually(T, || a.has(&from_b.id)).await);
     let peers: pb::PeersResponse = b.ok("peers", &pb::Empty {}).await;
-    assert_eq!(peers.peers[0].addr, url);
+    assert!(peers.peers[0].addr.starts_with("/ip4/127.0.0.1/udp/") && peers.peers[0].addr.contains("/quic-v1/p2p/"), "{}", peers.peers[0].addr);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -120,12 +120,6 @@ async fn untrusted_certificates_are_refused() {
     let other = Cert::new();
     let e = Dialer::new(&[other.cert()]).unwrap().connect(&url).await.err().unwrap();
     assert!(e.contains("TLS"), "{e}");
-    // a node without the CA never gets the link
-    let b = spawn(|_| {}).await;
-    tokio::spawn(sametra_node::node::dial(b.node.clone(), url));
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert!(b.node.peers.lock().unwrap().is_empty());
-    assert!(a.node.peers.lock().unwrap().values().all(|p| !p.sametra.load(std::sync::atomic::Ordering::Relaxed)));
 }
 
 #[test]
@@ -143,7 +137,6 @@ fn tls_configuration_errors() {
         c.tls_key = Some(cert.key());
     })
     .is_some(), "a key is not a certificate");
-    assert!(mk(&|c| c.tls_ca = vec![PathBuf::from("/nonexistent/ca.pem")]).unwrap().contains("ca.pem"));
     assert!(mk(&|c| {
         c.tls_cert = Some(cert.cert());
         c.tls_key = Some(cert.key());

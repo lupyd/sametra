@@ -6,7 +6,7 @@ pub mod kubo;
 
 use quick_protobuf::{MessageRead, MessageWrite};
 use sametra_node::event::{Event, K_POST, Keys, ancestry_tags};
-use sametra_node::node::{self, Config, Node};
+use sametra_node::node::{Config, Node};
 use sametra_node::{http, pb};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -69,6 +69,7 @@ pub async fn spawn_with(keys: Keys, dir: TempDir, f: impl FnOnce(&mut Config)) -
     let mut cfg = Config { listen: addr.to_string(), data: dir.0.clone(), ..Default::default() };
     f(&mut cfg);
     let node = Node::new(cfg, keys).unwrap();
+    node.start_p2p().unwrap();
     let server = tokio::spawn(http::serve(node.clone(), listener));
     TestNode { node, addr, ws: format!("ws://{addr}"), dir, server }
 }
@@ -120,23 +121,22 @@ impl TestNode {
         }
     }
 
-    /// Dial `other` and wait until both ends see the link as a sametra peer.
-    pub async fn connect(&self, other: &TestNode) {
-        self.connect_url(other, &other.ws.clone()).await
+    /// This node's libp2p address (QUIC on loopback, with its peer id).
+    pub async fn p2p_addr(&self) -> sametra_node::p2p::Multiaddr {
+        let p = self.node.p2p.get().expect("p2p running").clone();
+        assert!(eventually(Duration::from_secs(10), || !p.listen_addrs().is_empty()).await, "p2p never listened");
+        p.listen_addrs()[0].clone()
     }
 
-    /// Like `connect`, through an explicit address (e.g. `wss://localhost:port`).
-    pub async fn connect_url(&self, other: &TestNode, url: &str) {
-        tokio::spawn(node::dial(self.node.clone(), url.to_string()));
-        let (me, them) = (self.node.clone(), other.node.clone());
-        assert!(
-            eventually(Duration::from_secs(10), || {
-                me.peers.lock().unwrap().values().any(|p| p.outbound && p.addr == url)
-                    && them.peers.lock().unwrap().values().any(|p| !p.outbound && p.sametra.load(Ordering::Relaxed))
-            })
-            .await,
-            "link to {url} did not come up"
-        );
+    /// Dial `other` and wait until both ends are connected and see each other's
+    /// gossip subscriptions (so what one publishes reaches the other).
+    pub async fn connect(&self, other: &TestNode) {
+        let addr = other.p2p_addr().await;
+        let (me, them) = (self.node.p2p.get().unwrap().clone(), other.node.p2p.get().unwrap().clone());
+        me.dial(addr.clone());
+        let meta = sametra_node::p2p::META.to_string();
+        let sees = |a: &sametra_node::p2p::P2p, b: &sametra_node::p2p::P2p| a.peers().iter().any(|(id, i)| *id == b.peer_id && i.topics.contains(&meta));
+        assert!(eventually(Duration::from_secs(10), || sees(&me, &them) && sees(&them, &me)).await, "link to {addr} did not come up");
     }
 
     /// Raw HTTPS request (trusting `ca`), whole response.

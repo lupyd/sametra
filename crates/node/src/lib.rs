@@ -16,6 +16,7 @@ pub mod index;
 #[cfg(feature = "ipfs")]
 pub mod ipfs;
 pub mod node;
+pub mod p2p;
 pub mod rep;
 pub mod schema;
 pub mod store;

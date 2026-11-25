@@ -5,8 +5,9 @@
 #   docker compose exec sametra sametra call info
 #
 # To join a network, add peers to the node's command, e.g.
-#   command: ["run", "--listen", "0.0.0.0:42424", "--peer", "wss://node.example"]
-# and for a public node also "--public", "wss://your.host" and IPFS_ANNOUNCE below.
+#   command: ["run", "--listen", "0.0.0.0:42424", "--peer", "node.example:42424"]
+# and for a public node also "--public", "your.host:42424" and IPFS_ANNOUNCE below.
+# Nodes talk to each other over libp2p (QUIC) on UDP 42424, published below.
 #
 # Optional: embeddings, so standing carries across posts on close subjects.
 #   docker compose --profile embed up -d
@@ -55,6 +56,8 @@ services:
       # the app, the API, the nostr relay and /ipfs/ on one port; only on this
       # machine by default (write tools trust localhost; see the docs on security)
       - "127.0.0.1:42424:42424"
+      # libp2p (QUIC): other nodes reach this one here
+      - "42424:42424/udp"
     volumes:
       - sametra:/data
 
