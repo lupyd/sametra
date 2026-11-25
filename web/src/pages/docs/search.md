@@ -11,7 +11,7 @@ Nobody holds a global index of Sametra. Every node indexes what it has, and a se
 | scope | asks | finds |
 |---|---|---|
 | **this node** | only your own index | everything your node caches: what it follows in full, plus whatever passed through (on a node that relays everything, most of what is recent) |
-| **network** | your peers, their peers and theirs: three levels deep | anything well connected enough to be reached in time; lossy by design |
+| **network** | the nodes that announced the query's words (the word directory), and your peers, their peers and theirs: three levels deep | topics held anywhere whose titles share the query's words, plus whatever is reachable in time around you |
 
 In the app, run a search from the header box, then switch scope at the top of the results. Agents use `search` with `scope` ([API](/docs/api)).
 
@@ -46,6 +46,12 @@ Low-trust content (the author's standing near it, or the post's score, below −
 
 ## How a network search travels
 
+A network search goes two ways at once.
+
+**Targeted, through the word directory.** Every node announces in the Kademlia DHT the words in the titles of the topics it holds (and in its capabilities), up to 2000 words, as provider records under `sha256("sametra/term/1\0" + word)`, with words analyzed like the index does (stemmed, no stopwords). This is the peer-selection idea of the Minerva P2P search engine, kept light: the directory says *who* holds topics about a word, never the topics themselves. A search looks up the providers of up to five of its words, ranks nodes by how many of the words they announced, and asks the best six directly, connecting to them if needed. A search inside a topic looks up who holds that topic's nearest anchor instead ([architecture](/docs/architecture#finding-the-parts-of-a-tree)). So a niche topic held by a single node across the network is found by its words, even when that node is far from you.
+
+**Around, hop by hop.** At the same time the query spreads through your connections:
+
 <figure>
 <svg class="dg" viewBox="0 0 760 200" role="img" aria-label="A search fans out from E to C, from C to B and D, and from B to A; results flow back along the same paths.">
 <defs><marker id="s1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="aa" d="M0 0L10 5L0 10z"/></marker><marker id="s2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="ah" d="M0 0L10 5L0 10z"/></marker></defs>
@@ -60,7 +66,7 @@ Low-trust content (the author's standing near it, or the post's score, below −
 <figcaption>Green: the query, carrying a hop budget that shrinks at each step. Dashed: results flow back along the same path and are merged at each node.</figcaption>
 </figure>
 
-1. Your node sends a lookup (a `PeerRequest` on `/sametra/req/1`, see [protocol](/docs/protocol#between-nodes)) carrying a NIP-50 `search` filter, a **hop budget** and a random search id to up to 16 connected peers.
+1. Your node also sends a lookup (a `PeerRequest` on `/sametra/req/1`, see [protocol](/docs/protocol#between-nodes)) carrying a NIP-50 `search` filter, a **hop budget** and a random search id to up to 16 connected peers.
 2. Each peer answers from its own index. If the budget is above zero, and it has not seen this search id in the last minute, it first forwards the query to its other peers with one hop less, waits for their answers, and returns them together with its own.
 3. Each level waits a little less than the one above it (600 ms per remaining hop plus 400 ms), so answers arrive before the asker stops listening.
 4. Hops are capped at 3.

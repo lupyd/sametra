@@ -250,14 +250,17 @@ impl Store {
             return out;
         }
         if let Some(q) = &f.search {
-            // NIP-50: every token must match; results in relevance order, not time order
+            // NIP-50: every word must match (as the index analyzes them: stemmed,
+            // without stopwords); results in relevance order, not time order. The
+            // rest of the filter still applies.
+            let rest = Filter { search: None, ..f.clone() };
             return self
                 .index
                 .search(q, 5000)
                 .into_iter()
                 .filter(|h| h.all)
                 .filter_map(|h| self.ev.get(&h.id))
-                .filter(|e| f.matches(e))
+                .filter(|e| rest.matches(e))
                 .take(limit)
                 .cloned()
                 .collect();

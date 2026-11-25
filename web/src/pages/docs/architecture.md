@@ -149,6 +149,8 @@ Nodes rarely hold whole trees. A scoped node keeps the posts it follows and ever
 
 A newcomer that knows a single bootstrap node can so reach the chunk of a tree held by a node it has never heard of, even after the author has gone offline.
 
+The same provider records also form a **word directory**: nodes announce the words in the titles of the topics they hold, and a network search asks the nodes that announced its words ([search](/docs/search#how-a-network-search-travels)).
+
 ### Reaching the rest of the network
 
 Lookups use a request-response protocol, `/sametra/req/1`: one protobuf `PeerRequest` (filters, and for a search a hop budget and a search id, or one round of a reconciliation) answered by one `PeerResponse` (the matching events from the peer's store, the next reconciliation message, or an error). Catch-up and subtree fetches use it too.

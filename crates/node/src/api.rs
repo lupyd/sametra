@@ -597,7 +597,7 @@ async fn search(node: &Arc<Node>, r: SearchRequest) -> R<Items> {
     if q.is_empty() {
         return Err("missing 'query'".into());
     }
-    if tokens(&q).next().is_none() {
+    if crate::index::analyze(&q).is_empty() {
         return Err("'query' needs a word of at least two letters that is not a stopword".into());
     }
     let within = opt_slug(&r.within).map(|w| hex_id(w, "within")).transpose()?;

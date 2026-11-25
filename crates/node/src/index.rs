@@ -30,6 +30,38 @@ const TOKENIZER: &str = "sametra";
 /// The indexing thread's memory budget (tantivy's minimum).
 const WRITER_BYTES: usize = 15_000_000;
 
+fn analyzer() -> TextAnalyzer {
+    TextAnalyzer::builder(SimpleTokenizer::default())
+        .filter(RemoveLongFilter::limit(40))
+        .filter(LowerCaser)
+        .filter(StopWordFilter::new(Language::English).expect("English stopwords"))
+        .filter(Stemmer::new(Language::English))
+        .build()
+}
+
+/// The words of `text` as the index sees them (lowercased, stemmed, no
+/// stopwords), each once, in order.
+pub fn analyze(text: &str) -> Vec<String> {
+    static A: std::sync::OnceLock<Mutex<TextAnalyzer>> = std::sync::OnceLock::new();
+    let mut a = A.get_or_init(|| Mutex::new(analyzer())).lock().unwrap();
+    let mut ts = a.token_stream(text);
+    let mut out: Vec<String> = Vec::new();
+    while ts.advance() {
+        let t = ts.token().text.clone();
+        if t.len() >= 2 && !out.contains(&t) {
+            out.push(t);
+        }
+    }
+    out
+}
+
+/// The DHT key under which nodes announce that they hold topics with this
+/// (analyzed) word in their title: the word directory.
+pub fn term_key(term: &str) -> H32 {
+    use sha2::Digest;
+    H32(sha2::Sha256::digest([b"sametra/term/1\0".as_slice(), term.as_bytes()].concat()).into())
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Hit {
     pub id: H32,
@@ -63,12 +95,7 @@ impl Index {
         let f_title = sb.add_text_field("title", text.clone());
         let f_body = sb.add_text_field("body", text);
         let index = tantivy::Index::create_in_ram(sb.build());
-        let analyzer = TextAnalyzer::builder(SimpleTokenizer::default())
-            .filter(RemoveLongFilter::limit(40))
-            .filter(LowerCaser)
-            .filter(StopWordFilter::new(Language::English).expect("English stopwords"))
-            .filter(Stemmer::new(Language::English))
-            .build();
+        let analyzer = analyzer();
         index.tokenizers().register(TOKENIZER, analyzer.clone());
         let writer = index.writer_with_num_threads(1, WRITER_BYTES).expect("index writer");
         let reader = index.reader().expect("index reader");

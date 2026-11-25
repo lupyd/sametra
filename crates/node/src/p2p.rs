@@ -49,6 +49,10 @@ const MAX_RESPONSE: u64 = 32 << 20;
 const MAX_GOSSIP: usize = 256 << 10;
 /// Anchors a node announces at most (the ones it holds most under, and what it follows).
 const MAX_PROVIDED: usize = 1000;
+/// Words a node announces in the word directory, at most.
+const MAX_TERMS: usize = 2000;
+/// Peers a targeted search asks directly (those announcing the most query words).
+const SEARCH_TARGETS: usize = 6;
 /// Largest reconciliation message the asker sends (Negentropy frame size limit).
 const NEG_FRAME: u64 = 256 << 10;
 /// Round trips of one reconciliation, at most.
@@ -149,7 +153,8 @@ pub struct State {
     pub listen: Vec<Multiaddr>,
     /// topics this node subscribes to
     pub topics: BTreeSet<String>,
-    /// anchors this node announces in the DHT (it holds posts under them)
+    /// keys this node announces in the DHT: anchors it holds posts under, and
+    /// the word directory (words in the titles of the topics it holds)
     pub provided: BTreeSet<H32>,
 }
 
@@ -553,7 +558,7 @@ async fn run(mut swarm: libp2p::Swarm<Behaviour>, mut rx: mpsc::UnboundedReceive
                 // every minute (and soon after start): announce the anchors we hold posts under
                 if ticks % 6 == 1 {
                     let (n, p) = (n.clone(), p2p.clone());
-                    tokio::task::spawn_blocking(move || p.set_provided(n.anchors_held(MAX_PROVIDED)));
+                    tokio::task::spawn_blocking(move || p.set_provided(n.to_provide()));
                 }
                 ticks += 1;
             }
@@ -702,6 +707,13 @@ impl Node {
     pub async fn ask_peers(&self, filters: Vec<Filter>, timeout: Duration, hops: u32, exclude: Option<PeerId>, sid: Option<String>) -> Vec<Ev> {
         let Some(p2p) = self.p2p.get().cloned() else { return vec![] };
         let peers: Vec<PeerId> = p2p.peers().into_iter().map(|x| x.0).filter(|p| Some(*p) != exclude).take(crate::node::FANOUT).collect();
+        self.ask(&peers, filters, timeout, hops, sid).await
+    }
+
+    /// Send `filters` to these peers (connecting if needed) and collect, store
+    /// and return what they answer within `timeout`.
+    pub async fn ask(&self, peers: &[PeerId], filters: Vec<Filter>, timeout: Duration, hops: u32, sid: Option<String>) -> Vec<Ev> {
+        let Some(p2p) = self.p2p.get().cloned() else { return vec![] };
         let req = pb::PeerRequest { filters: filters.iter().map(Filter::to_pb).collect(), hops, search_id: sid.unwrap_or_default(), ..Default::default() };
         let started = tokio::time::Instant::now();
         let asks = peers.iter().map(|p| {
@@ -813,7 +825,34 @@ impl Node {
     pub fn announce_anchors(self: &Arc<Self>) {
         let Some(p) = self.p2p.get().cloned() else { return };
         let n = self.clone();
-        tokio::task::spawn_blocking(move || p.set_provided(n.anchors_held(MAX_PROVIDED)));
+        tokio::task::spawn_blocking(move || p.set_provided(n.to_provide()));
+    }
+
+    /// What to announce in the DHT: the anchors we hold posts under, and the
+    /// word directory: for the words in the titles of those anchors (and in the
+    /// names and topics of our capabilities), `term_key(word)`.
+    pub fn to_provide(&self) -> BTreeSet<H32> {
+        let anchors = self.anchors_held(MAX_PROVIDED);
+        let mut words: Vec<String> = Vec::new();
+        {
+            let st = self.store.lock().unwrap();
+            let titled = anchors.iter().filter_map(|a| st.get(a)).filter_map(|e| e.tag("title").map(String::from));
+            let mine = st.query(&Filter { kinds: Some(vec![K_CAPABILITY]), authors: Some(vec![self.keys.pubkey.hex()]), ..Default::default() }, 100);
+            let caps = mine.iter().map(|e| e.searchable_text());
+            for text in titled.chain(caps) {
+                for w in crate::index::analyze(&text) {
+                    if words.len() >= MAX_TERMS {
+                        break;
+                    }
+                    if !words.contains(&w) {
+                        words.push(w);
+                    }
+                }
+            }
+        }
+        let mut out = anchors;
+        out.extend(words.iter().map(|w| crate::index::term_key(w)));
+        out
     }
 
     /// The anchors to announce: what we follow, then those we hold the most
@@ -847,13 +886,54 @@ impl Node {
 
     /// Search the network: peers answer from their index and forward the query
     /// up to `hops` more hops. Lossy by design: whatever arrives in time.
+    ///
+    /// Two ways at once: **targeted**, to the peers that announced the query's
+    /// words in the word directory (or, for a search within a subtree, its
+    /// nearest anchor), which answer from their index; and **around**, to the
+    /// connected peers, which may forward it `hops` further.
     pub async fn remote_search(&self, filters: Vec<Filter>, hops: u32) -> Vec<Ev> {
         let hops = hops.min(crate::node::MAX_HOPS);
         let mut rnd = [0u8; 8];
         getrandom::getrandom(&mut rnd).unwrap();
         let sid = format!("q-{}", hex::encode(rnd));
         self.fresh_search(&sid);
-        self.ask_peers(filters, crate::node::search_timeout(hops), hops, None, Some(sid)).await
+        let targeted = async {
+            let targets = self.search_targets(&filters).await;
+            if targets.is_empty() {
+                return vec![];
+            }
+            self.ask(&targets, filters.clone(), crate::node::search_timeout(0) + Duration::from_secs(2), 0, None).await
+        };
+        let around = self.ask_peers(filters.clone(), crate::node::search_timeout(hops), hops, None, Some(sid));
+        let (a, b) = libp2p::futures::future::join(targeted, around).await;
+        let mut seen = HashSet::new();
+        a.into_iter().chain(b).filter(|e| seen.insert(e.id)).collect()
+    }
+
+    /// Who to ask about a search: the peers that announced the most of its words
+    /// (Minerva-style peer selection over the word directory), or that hold the
+    /// subtree it is limited to.
+    pub async fn search_targets(&self, filters: &[Filter]) -> Vec<PeerId> {
+        let Some(p2p) = self.p2p.get().cloned() else { return vec![] };
+        let Some(q) = filters.iter().find_map(|f| f.search.clone()) else { return vec![] };
+        let within = filters.iter().flat_map(|f| f.tags.iter()).find(|(n, _)| n == "e").and_then(|(_, v)| v.first()).and_then(|v| H32::from_hex(v));
+        let keys: Vec<H32> = match within {
+            Some(w) => {
+                let anchor = self.store.lock().unwrap().get(&w).and_then(|e| e.anchors().last().copied()).unwrap_or(w);
+                vec![anchor]
+            }
+            None => crate::index::analyze(&q).iter().take(5).map(|w| crate::index::term_key(w)).collect(),
+        };
+        let lists = tokio::time::timeout(Duration::from_secs(4), libp2p::futures::future::join_all(keys.iter().map(|k| p2p.find_providers(*k)))).await.unwrap_or_default();
+        let mut count: HashMap<PeerId, usize> = HashMap::new();
+        for l in lists {
+            for p in l {
+                *count.entry(p).or_default() += 1;
+            }
+        }
+        let mut by: Vec<(PeerId, usize)> = count.into_iter().collect();
+        by.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        by.into_iter().take(SEARCH_TARGETS).map(|x| x.0).collect()
     }
 }
 

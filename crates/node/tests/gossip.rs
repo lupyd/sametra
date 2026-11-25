@@ -454,3 +454,31 @@ async fn chunks_of_a_tree_are_found_where_they_are() {
     let t: pb::ThreadResponse = newcomer.ok("thread", &id(&sub.id)).await;
     assert_eq!(t.root.unwrap().replies.len(), 1);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn search_finds_topics_through_the_word_directory() {
+    let public = |c: &mut sametra_node::node::Config| c.public_addr = Some(c.listen.clone());
+    let scoped = |c: &mut sametra_node::node::Config| {
+        c.public_addr = Some(c.listen.clone());
+        c.relay_all = false;
+    };
+    // a node holding a niche topic, known only to a bootstrap node that holds nothing
+    let holder = spawn(public).await;
+    let t: pb::Ack = holder.ok("post", &post("Zebrafish fin regeneration", "blastema formation after amputation")).await;
+    let boot = spawn(scoped).await;
+    holder.connect(&boot).await;
+    holder.node.announce_anchors();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    // a newcomer that only knows the bootstrap node searches the network
+    let newcomer = spawn(scoped).await;
+    newcomer.connect(&boot).await;
+    let hp = holder.node.p2p.get().unwrap().peer_id;
+    assert!(!newcomer.node.p2p.get().unwrap().peers().iter().any(|(p, _)| *p == hp));
+    let s = |q: &str| pb::SearchRequest { query: q.into(), scope: "network".into(), ..Default::default() };
+    let r: pb::Items = newcomer.ok("search", &s("regenerating zebrafish")).await;
+    assert_eq!(r.items.first().map(|i| i.id.as_str()), Some(t.id.as_str()), "found where it is held, through the words of its title");
+    assert!(newcomer.has(&t.id), "and cached here");
+    // the directory knows words, not phrases: an unknown word finds nothing
+    let none: pb::Items = newcomer.ok("search", &s("axolotl")).await;
+    assert!(none.items.is_empty());
+}
