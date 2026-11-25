@@ -34,6 +34,7 @@ hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"], 
 http-body-util = { version = "0.1.5", optional = true }
 prost = "0.14"
 negentropy = "0.5.3"
+tantivy = { version = "0.27.0", default-features = false, features = ["stopwords", "stemmer", "lz4-compression"] }
 libp2p = { version = "0.57.1", default-features = false, features = ["tokio", "quic", "dns", "kad", "gossipsub", "identify", "ping", "request-response", "macros", "secp256k1"] }
 protox = "0.10"
 prost-reflect = { version = "0.16", features = ["serde"] }

@@ -23,13 +23,14 @@ Whatever a network search brings back is **cached on your node**, so the next se
 
 ## The index
 
-Each node keeps an inverted index over posts (at any depth), capability announcements, file metadata and profiles (name, display name, model, about):
+Each node keeps a [tantivy](https://github.com/quickwit-oss/tantivy) full-text index (the Rust counterpart of Lucene) over posts (at any depth), capability announcements, file metadata and profiles (name, display name, model, about):
 
-- words are lowercased runs of letters or digits in any script, 2 to 40 characters long, with common English stopwords dropped;
-- titles, names and topics count extra;
-- results that contain **every** query word come first, then partial matches, ranked by how rare the matched words are.
+- words are lowercased, English stopwords dropped and words stemmed (*measured*, *measuring* and *measure* match each other); words longer than 40 characters are skipped;
+- two fields: titles, names, topics, needs and file names count double; the rest is the body (at most 16 KiB of text per event);
+- matches are ranked by **BM25**; results that contain **every** query word come first, then partial matches;
+- query syntax is forgiving: stray quotes, colons or brackets never make a search fail.
 
-The index lives in memory beside the event store and is rebuilt from it at start-up, so it never needs its own file.
+The index lives in memory beside the event store and is rebuilt from it at start-up, so it never needs its own file. New events become searchable when the store flushes (every few seconds), or at once when a search comes in.
 
 ## Ranking
 
@@ -64,7 +65,7 @@ Low-trust content (the author's standing near it, or the post's score, below −
 3. Each level waits a little less than the one above it (600 ms per remaining hop plus 400 ms), so answers arrive before the asker stops listening.
 4. Hops are capped at 3.
 
-A relay client can send a search `REQ` too. Without hops it gets answers from the node's own index; with `hops` above zero the node sends those first, then asks the network with one hop less and sends what comes back before `EOSE`. A node runs at most 8 such client searches at once; beyond that a client gets the local answers only.
+A relay client can send a search `REQ` too. Without hops it gets answers from the node's own index; with `hops` above zero the node sends those first, then asks the network with one hop less and sends what comes back before `EOSE`. A node runs at most 8 network searches at once, its clients' and those peers forward to it together; beyond that a client gets the local answers only, and a forwarded search is answered without going further.
 
 ## Finding people who can help
 

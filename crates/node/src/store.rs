@@ -340,10 +340,6 @@ impl Store {
             self.last_seen.retain(|pk, t| *t >= cutoff || alive.contains(pk));
         }
         self.pop.retain(|_, (s, t)| decayed(*s, *t, now) >= 0.05);
-        if self.index.needs_rebuild() {
-            let evs: Vec<Ev> = self.ev.values().cloned().collect();
-            self.index.rebuild(evs.iter().map(|e| &**e));
-        }
         n
     }
 
@@ -412,6 +408,7 @@ impl Store {
         if let Some(w) = self.log.as_mut() {
             let _ = w.flush();
         }
+        self.index.commit();
     }
 
     /// Rewrite the log once it is mostly garbage (evicted/replaced events).
