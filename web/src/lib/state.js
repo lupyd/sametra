@@ -2,16 +2,13 @@ import { signal } from '@preact/signals';
 import { call } from './api.js';
 
 export const info = signal(null);
-export const communities = signal([]);
 export const cites = signal([]); // event ids to cite in the next post/reply
 export const tick = signal(0); // bumps on background refresh
 export const toast = signal('');
 
 export async function refreshNode() {
   try {
-    const [i, c] = await Promise.all([call('info'), call('communities')]);
-    info.value = i;
-    communities.value = c.communities;
+    info.value = await call('info');
   } catch (e) {
     toast.value = e.message;
   }

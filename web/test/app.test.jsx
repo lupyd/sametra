@@ -3,7 +3,7 @@ import { act } from 'preact/test-utils';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import App from '../src/components/App.jsx';
 import { loc, navigate } from '../src/lib/router.js';
-import { cites, communities, info, toast } from '../src/lib/state.js';
+import { cites, info, toast } from '../src/lib/state.js';
 import { fakeNode, item } from './fake-node.js';
 
 const ME = 'e'.repeat(64);
@@ -11,12 +11,12 @@ const ROOT = 'a'.repeat(64);
 let root, calls;
 
 const base = {
-  info: () => ({ pubkey: ME, npub: 'npub1mememememe', name: 'Me', events_cached: 7, pinned: 1, peers: 1, joined: ['math'], relay_all: true }),
-  communities: () => ({ communities: [{ slug: 'math', name: 'Mathematics', about: 'proofs', events: 3, joined: true }, { slug: 'bio', name: 'Biology', events: 1 }] }),
+  info: () => ({ pubkey: ME, npub: 'npub1mememememe', name: 'Me', events_cached: 7, pinned: 1, peers: 1, following: [], relay_all: true }),
   feed: () => ({ items: [item({ reply_count: 2 })] }),
 };
 
-const settle = () => act(async () => { for (let i = 0; i < 8; i++) await new Promise((r) => setTimeout(r, 0)); });
+// two rounds, so loads started by components that a first load rendered also finish
+const settle = async () => { for (let k = 0; k < 2; k++) await act(async () => { for (let i = 0; i < 8; i++) await new Promise((r) => setTimeout(r, 0)); }); };
 
 async function mount(path, handlers = {}) {
   calls = fakeNode({ ...base, ...handlers });
@@ -31,7 +31,6 @@ afterEach(() => {
   render(null, root);
   root.remove();
   info.value = null;
-  communities.value = [];
   cites.value = [];
   toast.value = '';
 });
@@ -45,32 +44,29 @@ const click = async (el) => { await act(() => el.dispatchEvent(new MouseEvent('c
 const sent = (tool) => calls.filter((c) => c.tool === tool).map((c) => c.req);
 
 describe('shell', () => {
-  it('shows identity, communities and node stats', async () => {
-    await mount('/c/math');
+  it('shows identity, followed topics and node stats', async () => {
+    const F = 'f'.repeat(64);
+    await mount('/', { info: () => ({ ...base.info(), following: [F] }), event: () => ({ item: item({ id: F, title: 'A followed topic' }) }) });
     expect($('header .me').textContent).toBe('Me');
     const links = $$('aside nav a');
-    expect(links.map((a) => a.getAttribute('href'))).toEqual(['/all', '/c/math', '/c/bio']);
-    expect(links[1].className).toContain('on');
-    expect(links[2].textContent).toContain('○ Biology'); // not joined
+    expect(links.map((a) => a.getAttribute('href'))).toEqual(['/', '/t/' + F]);
+    expect(links[0].className).toContain('on');
+    expect(links[1].textContent).toBe('A followed topic');
     expect($('aside').textContent).toContain('Connected to 1 peer. 7 events kept on this node.');
     expect($('header button.theme')).not.toBeNull();
     expect($$('header nav.top a').map((a) => a.getAttribute('href'))).toEqual(['/help', '/inbox', '/docs']);
-    expect($('aside a[href="/communities"]')).not.toBeNull();
   });
 
-  it('home redirects to the first joined community', async () => {
+  it('home lists the top-level topics', async () => {
     await mount('/');
-    expect(loc.value).toBe('/c/math');
-    expect(sent('feed')[0]).toMatchObject({ community: 'math' });
+    expect(sent('feed')[0]).toEqual({ parent: '', sort: 'top', limit: 100 });
+    expect($('main h2').textContent).toBe('Topics');
   });
 
   it('home welcomes a fresh node', async () => {
-    await mount('/', { communities: () => ({ communities: [] }), feed: () => ({ items: [] }) });
-    expect(loc.value).toBe('/all');
-    expect(sent('feed').at(-1)).toMatchObject({ community: '' });
-    await settle(); // the all-topics feed loads after the redirect
+    await mount('/', { feed: () => ({ items: [] }) });
     expect(root.textContent).toContain('Welcome to Sametra');
-    expect(root.textContent).toContain('You have not joined any yet.');
+    expect(root.textContent).toContain('Follow a topic to keep it');
     expect($('main a[href="/docs"]').textContent).toBe('Read how it works');
   });
 
@@ -80,7 +76,7 @@ describe('shell', () => {
   });
 
   it('header search navigates', async () => {
-    await mount('/c/math');
+    await mount('/');
     const input = $('header form input');
     input.value = ' gene drive ';
     await act(() => $('header form').dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })));
@@ -90,41 +86,24 @@ describe('shell', () => {
   });
 
   it('node errors show as a dismissable toast', async () => {
-    await mount('/c/math', { info: () => new Error('node down') });
+    await mount('/', { info: () => new Error('node down') });
     const t = $('.toast');
     expect(t.textContent).toBe('node down');
     await click(t);
     expect($('.toast')).toBeNull();
   });
 
-  it('creates and joins communities from the sidebar', async () => {
-    await mount('/c/math', { create_community: (r) => ({ ok: true, community: r.slug }), join: (r) => ({ ok: true, community: r.community }) });
-    expect(button('Start').disabled).toBe(true);
-    await type(byPlaceholder('Short name'), 'oncology');
-    await type(byPlaceholder('Display name'), 'Oncology');
-    await type(byPlaceholder('What it works on'), 'tumours');
-    await click(button('Start'));
-    expect(sent('create_community')).toEqual([{ slug: 'oncology', name: 'Oncology', about: 'tumours' }]);
-    expect(loc.value).toBe('/c/oncology');
-    expect(byPlaceholder('Short name').value).toBe('');
-    await type(byPlaceholder('Short name'), 'chem');
-    await click(button('Join'));
-    expect(sent('join')).toEqual([{ community: 'chem' }]);
-    expect(loc.value).toBe('/c/chem');
-  });
 });
 
 describe('feed', () => {
   it('lists threads with metadata and sorts on request', async () => {
-    await mount('/c/math', {
+    await mount('/', {
       feed: (r) => ({ items: r.sort === 'new' ? [item({ title: 'Newest' })] : [item({ author_is_agent: true, author_rep: 0.45, ratings: 2, score: -0.4, refs: ['c'.repeat(64)], reply_count: 2 })] }),
     });
-    expect(sent('feed')[0]).toEqual({ community: 'math', sort: 'top', limit: 100 });
-    expect($('main h2').textContent).toBe('Mathematics');
-    expect($('main .about').textContent).toBe('proofs');
+    expect(sent('feed')[0]).toEqual({ parent: '', sort: 'top', limit: 100 });
     const card = $('article.card');
     expect(card.querySelector('a.title').getAttribute('href')).toBe('/t/' + ROOT);
-    expect(card.textContent).toContain('2 replies');
+    expect(card.textContent).toContain('2 posts under it');
     const meters = [...card.querySelectorAll('.meter')].map((m) => m.textContent);
     expect(meters).toEqual(['standing+0.5', 'accuracy-0.4']);
     expect(card.querySelector('.meter.neg').textContent).toBe('accuracy-0.4');
@@ -137,22 +116,15 @@ describe('feed', () => {
   });
 
   it('de-emphasises low-trust content without hiding it', async () => {
-    await mount('/c/math', { feed: () => ({ items: [item({ low_trust: true, author_rep: -0.6 })] }) });
+    await mount('/', { feed: () => ({ items: [item({ low_trust: true, author_rep: -0.6 })] }) });
     expect($('article').className).toContain('low');
     expect($('article').textContent).toContain('Body text');
     expect($('article .meta').textContent).toContain('low trust');
     expect($('article .meter.neg').textContent).toBe('standing-0.6');
   });
 
-  it('shows an empty state and a join button for unjoined communities', async () => {
-    await mount('/c/bio', { feed: () => ({ items: [] }), join: () => ({ ok: true, community: 'bio' }) });
-    expect(root.textContent).toContain('Nothing here yet');
-    await click(button('Join', $('main')));
-    expect(sent('join')).toEqual([{ community: 'bio' }]);
-  });
-
   it('composer posts a thread with pending citations and opens it', async () => {
-    await mount('/c/math', { post: () => ({ ok: true, id: 'f'.repeat(64) }), thread: () => ({ root: item({ id: 'f'.repeat(64) }) }) });
+    await mount('/', { post: () => ({ ok: true, id: 'f'.repeat(64) }), thread: () => ({ root: item({ id: 'f'.repeat(64) }) }) });
     cites.value = ['c'.repeat(64)];
     expect(byPlaceholder('Details')).toBeUndefined();
     await type(byPlaceholder('Title'), 'Is P = NP?');
@@ -160,14 +132,14 @@ describe('feed', () => {
     await type(byPlaceholder('Details'), 'Asking for a friend');
     expect(root.textContent).toContain('builds on cccccccc');
     await click(button('Post'));
-    expect(sent('post')).toEqual([{ community: 'math', title: 'Is P = NP?', content: 'Asking for a friend', parent: '', refs: ['c'.repeat(64)], needs: [], format: '', accept: [], topic: '' }]);
+    expect(sent('post')).toEqual([{ title: 'Is P = NP?', content: 'Asking for a friend', parent: '', refs: ['c'.repeat(64)], needs: [], format: '', accept: [] }]);
     expect(loc.value).toBe('/t/' + 'f'.repeat(64));
     expect(cites.value).toEqual([]);
   });
 
   it('attaching a file stores it on IPFS and links it in the post', async () => {
     const CID = 'bafkreia3fjxcmwxpk6mpgisbsdfzsxiynumsnxtzd33jq5f6mxxrqudupe';
-    await mount('/c/math', { ipfs_add: (r) => ({ cid: CID, url: 'ipfs://' + CID, link: `![${r.name}](ipfs://${CID})`, size: r.data.length }) });
+    await mount('/', { ipfs_add: (r) => ({ cid: CID, url: 'ipfs://' + CID, link: `![${r.name}](ipfs://${CID})`, size: r.data.length }) });
     await type(byPlaceholder('Title'), 'Figure');
     await type(byPlaceholder('Details'), 'Here it is');
     const input = $('label.attach input[type=file]');
@@ -182,22 +154,22 @@ describe('feed', () => {
   });
 
   it('composer surfaces node errors', async () => {
-    await mount('/c/math', { post: () => new Error('community slug must be…') });
+    await mount('/', { post: () => new Error('missing \'content\'') });
     await type(byPlaceholder('Title'), 't');
     await type(byPlaceholder('Details'), 'b');
     await click(button('Post'));
-    expect(toast.value).toBe('community slug must be…');
-    expect(loc.value).toBe('/c/math');
+    expect(toast.value).toBe("missing 'content'");
+    expect(loc.value).toBe('/');
   });
 });
 
 describe('thread', () => {
   const R1 = '1'.repeat(64), R2 = '2'.repeat(64);
   const thread = (o = {}) => ({
-    root: item({ mine: true, reply_count: 2, replies: [item({ id: R1, kind: 1111, title: '', content: 'first', parent: ROOT, replies: [item({ id: R2, kind: 1111, title: '', content: 'nested', parent: R1 })] })] }),
-    quoted_by: [item({ id: 'q'.repeat(64), title: 'A citing thread', community: 'bio' })],
+    root: item({ mine: true, reply_count: 2, replies: [item({ id: R1, title: '', content: 'first', parent: ROOT, root: ROOT, depth: 1, replies: [item({ id: R2, title: '', content: 'nested', parent: R1, root: ROOT, depth: 2 })] })] }),
+    quoted_by: [item({ id: 'q'.repeat(64), title: 'A citing thread' })],
     ref_events: [item({ id: 'r'.repeat(64), title: 'A cited source' })],
-    thread_root: '',
+    path: [],
     ...o,
   });
 
@@ -207,18 +179,49 @@ describe('thread', () => {
     expect($('h2.title').textContent).toBe('A title');
     expect($('#e' + R1 + ' > .body').textContent.trim()).toBe('first');
     expect($('#e' + R1 + ' .replies #e' + R2 + ' > .body').textContent.trim()).toBe('nested');
-    expect($('a.back').getAttribute('href')).toBe('/c/math');
+    expect($('a.back').getAttribute('href')).toBe('/');
     const sections = $$('h3.section').map((h) => h.textContent);
-    expect(sections).toEqual(['Subtopics', 'Builds on', 'Built upon by']);
+    expect(sections).toEqual(['Builds on', 'Built upon by']);
     expect($('a[href="/chain/' + ROOT + '"]')).not.toBeNull();
     expect(root.textContent).toContain('A cited source');
     expect(root.textContent).toContain('A citing thread');
-    expect($$('a.btn').find((a) => a.textContent === 'Whole thread')).toBeUndefined();
+    expect($$('a.btn').find((a) => a.textContent === 'Search here').getAttribute('href')).toBe('/search?w=' + ROOT);
+    // every post under it opens as a topic of its own
+    expect($('#e' + R1 + ' > .acts a[href="/t/' + R1 + '"]').textContent).toBe('open');
+    expect($('#e' + ROOT + ' > .acts a[href="/t/' + ROOT + '"]')).toBeNull();
   });
 
-  it('links a reply back to its whole thread', async () => {
-    await mount('/t/' + R1, { thread: () => thread({ thread_root: ROOT }) });
-    expect($$('a.btn').find((a) => a.textContent === 'Whole thread').getAttribute('href')).toBe('/t/' + ROOT);
+  it('shows where a post sits', async () => {
+    const P = 'p'.repeat(64);
+    await mount('/t/' + R1, { thread: () => thread({ path: [item({ id: P, title: 'Classify all X' })] }) });
+    expect($$('.crumbs a').map((a) => a.textContent)).toEqual(['Topics', 'Classify all X']);
+    expect($$('.crumbs a')[1].getAttribute('href')).toBe('/t/' + P);
+  });
+
+  it('follows and unfollows the post it shows', async () => {
+    let following = [];
+    await mount('/t/' + ROOT, {
+      thread: () => thread(),
+      info: () => ({ ...base.info(), following }),
+      follow: (r) => { following = [r.id]; return { ok: true }; },
+      unfollow: () => { following = []; return { ok: true }; },
+      event: () => ({ item: item({}) }),
+    });
+    await click(button('Follow'));
+    expect(sent('follow')).toEqual([{ id: ROOT }]);
+    expect(toast.value).toContain('keeps it and everything under it');
+    expect(button('Following')).toBeDefined();
+    await click(button('Following'));
+    expect(sent('unfollow')).toEqual([{ id: ROOT }]);
+  });
+
+  it('shows who stands highest near it', async () => {
+    await mount('/t/' + ROOT, { thread: () => thread(), reputation: () => ({ entries: [{ pubkey: 'p1', name: 'Good', rep: 0.75, raters: 4 }, { pubkey: 'p2', name: 'Troll', rep: -0.8, raters: 1 }] }) });
+    expect(sent('reputation')[0]).toEqual({ near: ROOT, pubkey: '' });
+    expect($$('h3.section').map((h) => h.textContent)).toContain('Standing here');
+    const rows = $$('table.rep tbody tr').map((r) => [...r.children].map((c) => c.textContent));
+    expect(rows).toEqual([['Good', '+0.8', '4 raters'], ['Troll', '-0.8', '1 rater']]);
+    expect($('main a[href="/docs/reputation"]')).not.toBeNull();
   });
 
   it('shows lookup errors', async () => {
@@ -232,7 +235,7 @@ describe('thread', () => {
     await click(button('reply', top.querySelector('.acts')));
     await type(byPlaceholder('Reply'), 'my answer');
     await click(button('Reply'));
-    expect(sent('post')).toEqual([{ community: '', title: '', content: 'my answer', parent: ROOT, refs: [], needs: [], format: '', accept: [], topic: '' }]);
+    expect(sent('post')).toEqual([{ title: '', content: 'my answer', parent: ROOT, refs: [], needs: [], format: '', accept: [] }]);
     expect(toast.value).toBe('Replied');
     expect(byPlaceholder('Reply')).toBeUndefined();
   });
@@ -246,7 +249,7 @@ describe('thread', () => {
     expect($('.box b').textContent).toBe('-0.4');
     await type(byPlaceholder('Why'), 'not replicated');
     await click(button('Rate'));
-    expect(sent('rate')).toEqual([{ score: -0.4, event: R1, target: '', community: '', reason: 'not replicated', aspect: 'trust', capability: '' }]);
+    expect(sent('rate')).toEqual([{ score: -0.4, event: R1, target: '', reason: 'not replicated', aspect: 'trust', capability: '' }]);
     expect(toast.value).toBe("Rated. The author's standing is now -0.1");
   });
 
@@ -274,29 +277,15 @@ describe('thread', () => {
 });
 
 describe('other views', () => {
-  it('reputation table', async () => {
-    await mount('/c/math/reputation', { reputation: () => ({ entries: [{ pubkey: 'p1', name: 'Good', rep: 0.75, raters: 4 }, { pubkey: 'p2', name: 'Troll', rep: -0.8, raters: 6 }] }) });
-    expect(sent('reputation')[0]).toEqual({ community: 'math', pubkey: '' });
-    const rows = $$('table.rep tbody tr').map((r) => [...r.children].map((c) => c.textContent));
-    expect(rows).toEqual([['Good', '+0.8', '4'], ['Troll', '-0.8', '6']]);
-    expect($$('td.neg').length).toBe(1);
-    expect($('main a[href="/docs/reputation"]')).not.toBeNull();
-  });
-
-  it('reputation empty state', async () => {
-    await mount('/c/math/reputation', { reputation: () => ({ entries: [] }) });
-    expect(root.textContent).toContain('Nobody here has been rated yet.');
-  });
-
   it('search results', async () => {
-    await mount('/search?q=crispr', { search: () => ({ items: [item({ community: 'bio', title: 'CRISPR' })] }) });
+    await mount('/search?q=crispr', { search: () => ({ items: [item({ title: 'CRISPR' })] }) });
     expect($('main h2').textContent).toBe('“crispr”');
-    expect($('article a[href="/c/bio"]')).not.toBeNull();
+    expect($('article .meta a[href="/t/' + ROOT + '"]').textContent).toBe('open');
   });
 
   it('own profile can be edited and shows the node', async () => {
     await mount('/me', {
-      profile: () => ({ pubkey: ME, npub: 'npub1me', profile: { name: 'Me', about: 'bio', agent: false }, reputation: [{ community: 'math', rep: 2 }], last_seen: Math.floor(Date.now() / 1e3) }),
+      profile: () => ({ pubkey: ME, npub: 'npub1me', profile: { name: 'Me', about: 'bio', agent: false }, rep: 0.4, best: [item({ id: '5'.repeat(64), title: 'My best post', score: 0.7 })], last_seen: Math.floor(Date.now() / 1e3) }),
       peers: () => ({ peers: [{ addr: 'ws://peer:42424', outbound: true, since: 1 }] }),
       set_profile: () => ({ ok: true }),
     });
@@ -304,7 +293,8 @@ describe('other views', () => {
     await settle(); // NodePanel loads peers after the profile arrives
     expect(root.textContent).toContain('Last seen just now');
     expect(root.textContent).toContain('npub1me');
-    expect($('table.rep a[href="/c/math"]')).not.toBeNull();
+    expect($$('h3.section').map((h) => h.textContent)).toContain('Where they stand highest');
+    expect($('a[href="/t/' + '5'.repeat(64) + '"]').textContent).toBe('My best post');
     expect(root.textContent).toContain('ws://peer:42424');
     expect(root.textContent).toContain('Relaying everything');
     await type(byPlaceholder('display name'), 'New name');
@@ -318,7 +308,7 @@ describe('other views', () => {
   });
 
   it("someone else's profile is read-only", async () => {
-    await mount('/u/' + 'b'.repeat(64), { profile: () => ({ pubkey: 'b'.repeat(64), npub: 'npub1them', profile: { name: 'Bot', agent: true }, reputation: [], last_seen: 0 }) });
+    await mount('/u/' + 'b'.repeat(64), { profile: () => ({ pubkey: 'b'.repeat(64), npub: 'npub1them', profile: { name: 'Bot', agent: true }, last_seen: 0 }) });
     expect(sent('profile')[0]).toEqual({ pubkey: 'b'.repeat(64) });
     expect(root.textContent).toContain('agent');
     expect(root.textContent).toContain('Not seen recently');
@@ -329,7 +319,7 @@ describe('other views', () => {
 
 describe('relevance, needs and search scopes', () => {
   it('rates relevance separately from accuracy', async () => {
-    await mount('/t/' + ROOT, { thread: () => ({ root: item({ relevance: 0.25, relevance_ratings: 3, cited_by: 4 }), quoted_by: [], ref_events: [], thread_root: '' }), rate: () => ({ ok: true, rep: 0.31 }) });
+    await mount('/t/' + ROOT, { thread: () => ({ root: item({ relevance: 0.25, relevance_ratings: 3, cited_by: 4 }), quoted_by: [], ref_events: [], path: [] }), rate: () => ({ ok: true, rep: 0.31 }) });
     const meta = $('.meta').textContent;
     expect(meta).toContain('relevance+0.3');
     expect(meta).toContain('built on 4×');
@@ -343,10 +333,10 @@ describe('relevance, needs and search scopes', () => {
   });
 
   it('posts needs and suggests who can help', async () => {
-    const helper = { provider: 'h'.repeat(64), provider_name: 'Lab agent', provider_is_agent: true, rep: 0.62, ratings: 3, requests: 4, completed: 3, declined: 0, spec: { id: 'assay', name: 'Plasma assay', kind: 'tool', about: '', input_proto: 'syntax = "proto3"; message Sample { string sample = 1; }', input_message: 'Sample', topics: [], communities: [] } };
-    await mount('/c/math', {
+    const helper = { provider: 'h'.repeat(64), provider_name: 'Lab agent', provider_is_agent: true, rep: 0.62, ratings: 3, requests: 4, completed: 3, declined: 0, spec: { id: 'assay', name: 'Plasma assay', kind: 'tool', about: '', input_proto: 'syntax = "proto3"; message Sample { string sample = 1; }', input_message: 'Sample', topics: [] } };
+    await mount('/', {
       post: () => ({ ok: true, id: 'f'.repeat(64) }),
-      thread: () => ({ root: item({ id: 'f'.repeat(64), needs: ['plasma assay'] }), quoted_by: [], ref_events: [], thread_root: '' }),
+      thread: () => ({ root: item({ id: 'f'.repeat(64), needs: ['plasma assay'] }), quoted_by: [], ref_events: [], path: [] }),
       capabilities: () => ({ capabilities: [helper] }),
       request: () => ({ ok: true, id: 'r'.repeat(64) }),
     });
@@ -368,41 +358,27 @@ describe('relevance, needs and search scopes', () => {
     expect($('pre.schema').textContent).toBe('syntax = "proto3"; message Sample { string sample = 1; }');
     await type(byPlaceholder('Sample as JSON'), '{"sample":"S1"}');
     await click(button('Send request', card));
-    expect(sent('request')).toMatchObject([{ provider: 'h'.repeat(64), capability: 'assay', input_json: '{"sample":"S1"}', input_text: '', post: 'f'.repeat(64), community: '' }]);
+    expect(sent('request')).toMatchObject([{ provider: 'h'.repeat(64), capability: 'assay', input_json: '{"sample":"S1"}', input_text: '', post: 'f'.repeat(64) }]);
   });
 
-  it('search scopes and community filter', async () => {
+  it('search scopes, and search within a post', async () => {
     await mount('/search?q=marker', { search: () => ({ items: [item({ needs: ['assay'] })] }) });
-    expect(sent('search').at(-1)).toMatchObject({ query: 'marker', scope: 'node', community: '' });
-    expect(button('community').disabled).toBe(true);
+    expect(sent('search').at(-1)).toMatchObject({ query: 'marker', scope: 'node', within: '' });
     await click(button('network'));
     expect(loc.value).toBe('/search?q=marker&scope=network');
     expect(sent('search').at(-1).scope).toBe('network');
     expect(root.textContent).toContain('best effort');
-    const sel = $('select[aria-label=Community]');
-    sel.value = 'math';
-    await act(() => sel.dispatchEvent(new Event('change', { bubbles: true })));
-    await settle();
-    expect(sent('search').at(-1)).toMatchObject({ scope: 'network', community: 'math' });
-    await click(button('community'));
-    expect(sent('search').at(-1)).toMatchObject({ scope: 'community', community: 'math' });
-  });
-
-  it('finds and joins communities', async () => {
-    await mount('/communities?q=cancer', {
-      find_communities: (r) => ({ communities: r.query === 'cancer' ? [{ slug: 'onco', name: 'Oncology', about: 'tumours', members: 12, events: 40, joined: false }] : [] }),
-      join: () => ({ ok: true, community: 'onco' }),
-    });
-    expect(sent('find_communities')[0]).toMatchObject({ query: 'cancer', network: false });
-    expect(root.textContent).toContain('12 members');
-    await click(button('join'));
-    expect(sent('join')).toEqual([{ community: 'onco' }]);
-    expect(loc.value).toBe('/c/onco');
+    render(null, root);
+    await mount('/search?q=marker&w=' + ROOT, { search: () => ({ items: [] }), event: () => ({ item: item({ title: 'The topic' }) }) });
+    expect(sent('search').at(-1)).toMatchObject({ query: 'marker', within: ROOT });
+    expect($('.within').textContent).toContain('Only under The topic');
+    await click(button('search everywhere'));
+    expect(loc.value).toBe('/search?q=marker&scope=node');
   });
 });
 
 describe('capabilities', () => {
-  const job = (o) => ({ id: 'j'.repeat(64), requester: 'r'.repeat(64), requester_name: 'Asker', provider: ME, provider_name: 'Me', capability: 'assay', input: '{"sample":"S1"}', post: '', community: 'onco', created_at: 1, status: 'pending', status_text: '', result: '', result_id: '', updated_at: Math.floor(Date.now() / 1e3), mine: false, rated: false, ...o });
+  const job = (o) => ({ id: 'j'.repeat(64), requester: 'r'.repeat(64), requester_name: 'Asker', provider: ME, provider_name: 'Me', capability: 'assay', input: '{"sample":"S1"}', post: '', created_at: 1, status: 'pending', status_text: '', result: '', result_id: '', updated_at: Math.floor(Date.now() / 1e3), mine: false, rated: false, ...o });
 
   it('find help searches capabilities', async () => {
     await mount('/help?q=histology', { capabilities: () => ({ capabilities: [] }) });
@@ -446,9 +422,9 @@ describe('capabilities', () => {
   });
 
   it('offers and withdraws capabilities from your profile', async () => {
-    const mineCap = { provider: ME, provider_name: 'Me', provider_is_agent: false, rep: 0, ratings: 0, requests: 0, completed: 0, declined: 0, spec: { id: 'stats', name: 'Survival analysis', kind: 'skill', about: '', topics: [], communities: [] } };
+    const mineCap = { provider: ME, provider_name: 'Me', provider_is_agent: false, rep: 0, ratings: 0, requests: 0, completed: 0, declined: 0, spec: { id: 'stats', name: 'Survival analysis', kind: 'skill', about: '', topics: [] } };
     await mount('/me', {
-      profile: () => ({ pubkey: ME, npub: 'npub1me', profile: { name: 'Me' }, reputation: [], last_seen: 0 }),
+      profile: () => ({ pubkey: ME, npub: 'npub1me', profile: { name: 'Me' }, last_seen: 0 }),
       capabilities: (r) => ({ capabilities: r.provider === ME ? [mineCap] : [] }),
       set_capability: () => ({ ok: true }),
     });
@@ -467,18 +443,18 @@ describe('capabilities', () => {
     await type(byPlaceholder('input as .proto'), 'syntax = "proto3"; message Sample { string sample = 1; }');
     await type(byPlaceholder('input message'), 'Sample');
     await click(button('Offer capability'));
-    expect(sent('set_capability')[1]).toMatchObject({ id: 'assay', name: 'Plasma assay', kind: 'tool', topics: ['proteomics', 'plasma'], communities: [], input_proto: 'syntax = "proto3"; message Sample { string sample = 1; }', input_message: 'Sample' });
+    expect(sent('set_capability')[1]).toMatchObject({ id: 'assay', name: 'Plasma assay', kind: 'tool', topics: ['proteomics', 'plasma'], input_proto: 'syntax = "proto3"; message Sample { string sample = 1; }', input_message: 'Sample' });
   });
 });
 
 describe('humanity', () => {
-  const prof = (o) => ({ pubkey: 'b'.repeat(64), npub: 'npub1them', profile: { name: 'Sam', about: '', agent: false, model: '' }, reputation: [], last_seen: 0, humanity: 0, humanity_raters: 0, human_status: 'unverified', ...o });
+  const prof = (o) => ({ pubkey: 'b'.repeat(64), npub: 'npub1them', profile: { name: 'Sam', about: '', agent: false, model: '' }, last_seen: 0, humanity: 0, humanity_raters: 0, human_status: 'unverified', ...o });
 
   it('shows the claim and lets you vouch', async () => {
     await mount('/u/' + 'b'.repeat(64), { profile: () => prof({}), rate: () => ({ ok: true, rep: 0.12 }) });
     expect($('.human').textContent).toContain('nobody has vouched for it yet');
     await click(button('yes'));
-    expect(sent('rate')).toEqual([{ score: 1, event: '', target: 'b'.repeat(64), community: '', reason: '', aspect: 'human', capability: '' }]);
+    expect(sent('rate')).toEqual([{ score: 1, event: '', target: 'b'.repeat(64), reason: '', aspect: 'human', capability: '' }]);
     expect(toast.value).toContain('Humanity now +0.1');
     await click(button('no'));
     expect(sent('rate')[1].score).toBe(-1);
@@ -498,7 +474,7 @@ describe('humanity', () => {
   });
 
   it('posts carry the author kind', async () => {
-    await mount('/c/math', { feed: () => ({ items: [item({ id: '1'.repeat(64), author_is_agent: true, author_model: 'claude-opus-5-5' }), item({ id: '2'.repeat(64), author_human: 'verified' })] }) });
+    await mount('/', { feed: () => ({ items: [item({ id: '1'.repeat(64), author_is_agent: true, author_model: 'claude-opus-5-5' }), item({ id: '2'.repeat(64), author_human: 'verified' })] }) });
     const kinds = $$('article .kind').map((t) => t.textContent);
     expect(kinds).toEqual(['claude-opus-5-5', 'verified human']);
     const strands = $$('article').map((a) => a.style.getPropertyValue('--strand'));
@@ -509,7 +485,7 @@ describe('humanity', () => {
 
 describe('theme and chains', () => {
   it('one button switches light and dark, and remembers it', async () => {
-    await mount('/c/math');
+    await mount('/');
     const before = document.documentElement.dataset.theme || 'light';
     await click($('header button.theme'));
     const after = document.documentElement.dataset.theme;
@@ -547,7 +523,7 @@ describe('theme and chains', () => {
     expect(steps.map((li) => li.id)).toEqual(['s' + Q, 's' + S1, 's' + S2]);
     expect(steps[1].className).toBe('focus');
     expect(steps[1].querySelector('a.title')).toBeNull();
-    expect(steps[1].querySelector('.joins').textContent).toBe('replies to Why does X happen?');
+    expect(steps[1].querySelector('.joins').textContent).toBe('answers Why does X happen?');
     expect(steps[2].querySelector('.joins a').getAttribute('href')).toBe('#s' + S1);
     expect(steps[2].querySelector('.joins').textContent).toContain('builds on');
     const strands = steps.map((li) => li.style.getPropertyValue('--strand'));
@@ -565,8 +541,8 @@ describe('theme and chains', () => {
 describe('formats', () => {
   it('replies can use the format a post asks for; other formats show as source', async () => {
     const asked = item({ accept: ['text/x-lean'], content: 'Prove **this**' });
-    const json = item({ id: '3'.repeat(64), kind: 1111, title: '', format: 'application/json', content: '{"a":1}' });
-    await mount('/t/' + ROOT, { thread: () => ({ root: { ...asked, replies: [json] }, quoted_by: [], ref_events: [], thread_root: '' }), post: () => ({ ok: true, id: 'n'.repeat(64) }) });
+    const json = item({ id: '3'.repeat(64), title: '', format: 'application/json', content: '{"a":1}', parent: ROOT, depth: 1 });
+    await mount('/t/' + ROOT, { thread: () => ({ root: { ...asked, replies: [json] }, quoted_by: [], ref_events: [], path: [] }), post: () => ({ ok: true, id: 'n'.repeat(64) }) });
     expect($('#e' + ROOT + ' > .body strong').textContent).toBe('this');
     expect($('#e' + ROOT).textContent).toContain('replies in text/x-lean');
     expect($('#e' + '3'.repeat(64) + ' pre.source').dataset.format).toBe('application/json');
@@ -578,46 +554,20 @@ describe('formats', () => {
   });
 });
 
-describe('topics', () => {
-  const P = 'p'.repeat(64), S = 's'.repeat(64), R = 'r'.repeat(64);
-  const sub = item({ id: S, title: 'Case: X finite', topic: ROOT, subtopics: 2 });
+describe('posts are topics', () => {
+  const R = 'r'.repeat(64);
 
-  it('shows where a topic sits and opens subtopics under it', async () => {
+  it('a reply can carry a title and opens as a topic of its own', async () => {
     await mount('/t/' + ROOT, {
-      thread: () => ({ root: item({ subtopics: 1, replies: [item({ id: R, kind: 1111, title: '', content: 'needs a lemma', root: ROOT, parent: ROOT })] }), topic_path: [item({ id: P, title: 'Classify all X' })], subtopics: [sub], quoted_by: [], ref_events: [], thread_root: '' }),
+      thread: () => ({ root: item({ replies: [item({ id: R, title: 'Case: X finite', content: 'needs a lemma', root: ROOT, parent: ROOT, depth: 1 })] }), quoted_by: [], ref_events: [], path: [] }),
       post: () => ({ ok: true, id: 'n'.repeat(64) }),
     });
-    expect($$('.crumbs a').map((a) => a.textContent)).toEqual(['math', 'Classify all X']);
-    expect($('#subtopics').textContent).toContain('Case: X finite');
-    expect($('#subtopics').textContent).toContain('2 subtopics');
-    await type(byPlaceholder('Open a subtopic'), 'Case: X empty');
-    await type(byPlaceholder('What it is about'), 'trivial?');
-    await click(button('Open subtopic', $('#subtopics')));
-    expect(sent('post')[0]).toMatchObject({ topic: ROOT, title: 'Case: X empty', content: 'trivial?' });
-    expect(loc.value).toBe('/t/' + 'n'.repeat(64));
-  });
-
-  it('a reply can branch into a subtopic that builds on it', async () => {
-    await mount('/t/' + ROOT, {
-      thread: () => ({ root: item({ replies: [item({ id: R, kind: 1111, title: '', content: 'needs a lemma', root: ROOT, parent: ROOT })] }), topic_path: [], subtopics: [], quoted_by: [], ref_events: [], thread_root: '' }),
-      post: () => ({ ok: true, id: 'b'.repeat(64) }),
-    });
-    expect(button('branch', $('#e' + ROOT + ' > .acts'))).toBeUndefined();
-    await click(button('branch', $('#e' + R + ' > .acts')));
-    await type(byPlaceholder('Subtopic title'), 'The lemma');
-    await type(byPlaceholder('What the subtopic'), 'prove it');
-    await click(button('Open subtopic', $('#e' + R)));
-    expect(sent('post')[0]).toMatchObject({ topic: ROOT, title: 'The lemma', refs: [R] });
-    expect(loc.value).toBe('/t/' + 'b'.repeat(64));
-  });
-
-  it('all topics lists everything, with each topic\'s community', async () => {
-    await mount('/all', { feed: () => ({ items: [item({ community: 'bio', subtopics: 3 }), item({ id: '9'.repeat(64), community: '' })] }) });
-    expect(sent('feed').at(-1)).toMatchObject({ community: '' });
-    expect($('main h2').textContent).toBe('All topics');
-    expect($('article .meta a[href="/c/bio"]')).not.toBeNull();
-    expect($('article').textContent).toContain('3 subtopics');
-    expect(button('Standings')).toBeUndefined();
+    expect($('#e' + R + ' > a.title').getAttribute('href')).toBe('/t/' + R);
+    await click(button('reply', $('#e' + R + ' > .acts')));
+    await type(byPlaceholder('Title, if this opens'), 'The lemma');
+    await type(byPlaceholder('Reply'), 'prove it');
+    await click(button('Reply'));
+    expect(sent('post')[0]).toMatchObject({ parent: R, title: 'The lemma', content: 'prove it' });
   });
 });
 
@@ -625,7 +575,7 @@ describe('people and mentions', () => {
   const argon = { pubkey: 'a'.repeat(64), npub: 'npub1argon', name: 'Doctor Argon', about: 'noble gases', agent: true, model: 'claude-opus-5-5', human_status: 'agent', humanity: 0, last_seen: 1, capabilities: 2, handle: 'DoctorArgon', text_match: 1 };
 
   it('the inbox opens on what concerns you, and marks it read', async () => {
-    const reply = item({ id: '7'.repeat(64), kind: 1111, title: '', content: 'an answer', root: ROOT, author_name: 'Doctor Argon' });
+    const reply = item({ id: '7'.repeat(64), title: '', content: 'an answer', parent: ROOT, root: ROOT, depth: 1, author_name: 'Doctor Argon' });
     await mount('/inbox', {
       info: () => ({ pubkey: ME, npub: 'npub1me', name: 'Me', unread: 2 }),
       notifications: () => ({ notifications: [{ reason: 'mention', item: item({ id: '8'.repeat(64) }), unread: true }, { reason: 'reply', item: reply, unread: false }], unread: 1 }),
@@ -635,7 +585,7 @@ describe('people and mentions', () => {
     const cards = $$('article.card');
     expect(cards[0].textContent).toContain('mentioned you');
     expect(cards[0].querySelector('.who.unread')).not.toBeNull();
-    expect(cards[1].textContent).toContain('replied to you');
+    expect(cards[1].textContent).toContain('answered your post');
     expect(cards[1].querySelector('a.title').getAttribute('href')).toBe('/t/' + ROOT + '#e' + '7'.repeat(64));
     expect(sent('info').length).toBeGreaterThan(1);
   });
@@ -649,7 +599,7 @@ describe('people and mentions', () => {
   });
 
   it('typing @ suggests people and completes the handle', async () => {
-    await mount('/c/math', { find_people: () => ({ people: [argon] }), post: () => ({ ok: true, id: 'f'.repeat(64), mentioned: ['npub1argon'] }), thread: () => ({ root: item({ id: 'f'.repeat(64) }), topic_path: [], subtopics: [], quoted_by: [], ref_events: [], thread_root: '' }) });
+    await mount('/', { find_people: () => ({ people: [argon] }), post: () => ({ ok: true, id: 'f'.repeat(64), mentioned: ['npub1argon'] }), thread: () => ({ root: item({ id: 'f'.repeat(64) }), quoted_by: [], ref_events: [], path: [] }) });
     await type(byPlaceholder('Title'), 'Odd line');
     await type(byPlaceholder('Details'), 'Could @doc');
     await new Promise((r) => setTimeout(r, 200));

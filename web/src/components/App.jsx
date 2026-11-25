@@ -1,23 +1,20 @@
 import { useEffect, useState } from 'preact/hooks';
 import { call } from '../lib/api.js';
 import { loc, match, navigate } from '../lib/router.js';
-import { communities, flash, info, refreshNode, toast } from '../lib/state.js';
+import { info, refreshNode, tick, toast } from '../lib/state.js';
 import { FindHelp, Inbox } from './Capabilities.jsx';
 import { Chain } from './Chain.jsx';
 import { Mark, ThemeToggle } from './Mark.jsx';
-import { Feed, FindCommunities, Home, Profile, Reputation, Search, Thread } from './Views.jsx';
+import { Feed, Profile, Search, Thread } from './Views.jsx';
+import { useLoad } from './hooks.js';
 
 const ROUTES = [
-  ['/', Home],
-  ['/all', Feed],
-  ['/c/:slug', Feed],
-  ['/c/:slug/reputation', Reputation],
+  ['/', Feed],
   ['/t/:id', Thread],
   ['/chain/:id', Chain],
   ['/u/:pk', Profile],
   ['/me', Profile],
   ['/search', Search],
-  ['/communities', FindCommunities],
   ['/help', FindHelp],
   ['/inbox', Inbox],
 ];
@@ -27,7 +24,7 @@ function route(path) {
     const m = match(pat, path);
     if (m) return <C {...m} />;
   }
-  return <p class="empty">There is nothing at this address. Pick a community on the left, or search.</p>;
+  return <p class="empty">There is nothing at this address. Go to the topics, or search.</p>;
 }
 
 const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
@@ -41,7 +38,7 @@ export default function App() {
   return (
     <>
       <header>
-        <button class="link burger" aria-label="Show communities" onClick={() => setMenu(!menu)}>☰</button>
+        <button class="link burger" aria-label="Show topics you follow" onClick={() => setMenu(!menu)}>☰</button>
         <a class="brand" href="/"><Mark />Sametra</a>
         <form class="search" role="search" onSubmit={(e) => { e.preventDefault(); const q = e.currentTarget.q.value.trim(); q && navigate('/search?q=' + encodeURIComponent(q)); }}>
           <input name="q" placeholder="Search posts" aria-label="Search posts" />
@@ -55,7 +52,7 @@ export default function App() {
         <ThemeToggle />
       </header>
       <div class="wrap">
-        <aside class={menu ? 'open' : ''}><Sidebar path={path} plural={plural} /></aside>
+        <aside class={menu ? 'open' : ''}><Sidebar path={path} /></aside>
         <main>{route(path)}</main>
       </div>
       {toast.value && <div class="toast" role="status" onClick={() => (toast.value = '')}>{toast.value}</div>}
@@ -63,43 +60,34 @@ export default function App() {
   );
 }
 
-function Sidebar({ path, plural }) {
-  const [slug, setSlug] = useState('');
-  const [name, setName] = useState('');
-  const [about, setAbout] = useState('');
-  const go = async (tool, args) => {
-    try {
-      const a = await call(tool, args);
-      await refreshNode();
-      setSlug(''); setName(''); setAbout('');
-      navigate('/c/' + a.community);
-    } catch (e) { flash(e.message); }
-  };
+/** The topics, and the posts this node follows. */
+function Sidebar({ path }) {
   const i = info.value;
+  const following = i?.following || [];
   return (
     <>
-      <h3>Communities</h3>
       <nav>
-        <a href="/all" class={'c' + (path === '/all' ? ' on' : '')}><span>All topics</span></a>
-        {communities.value.length === 0 && <p class="muted small">You have not joined any yet.</p>}
-        {communities.value.map((c) => (
-          <a key={c.slug} href={'/c/' + c.slug} class={'c' + (path.startsWith('/c/' + c.slug) ? ' on' : '')} title={c.joined ? c.about : 'Not joined: ' + (c.about || c.slug)}>
-            <span>{c.joined ? '' : '○ '}{c.name}</span><small>{c.events}</small>
-          </a>
-        ))}
+        <a href="/" class={'c' + (path === '/' ? ' on' : '')}><span>All topics</span></a>
       </nav>
-      <a class="c find" href="/communities">Find communities</a>
-      <h3>Start or join one</h3>
-      <div class="pad">
-        <input value={slug} onInput={(e) => setSlug(e.currentTarget.value)} placeholder="Short name, e.g. cancer-research" aria-label="Community short name" />
-        {slug && <input value={name} onInput={(e) => setName(e.currentTarget.value)} placeholder="Display name (when starting one)" />}
-        {slug && <input value={about} onInput={(e) => setAbout(e.currentTarget.value)} placeholder="What it works on" />}
-        <div class="row">
-          <button disabled={!slug} onClick={() => go('create_community', { slug, name, about })}>Start</button>
-          <button class="ghost" disabled={!slug} onClick={() => go('join', { community: slug })}>Join</button>
-        </div>
-      </div>
+      <h3>Following</h3>
+      <nav>
+        {following.length === 0 && <p class="muted small">Follow a topic to keep it, and everything under it, on this node.</p>}
+        {following.map((id) => <FollowedTopic key={id} id={id} on={path === '/t/' + id} />)}
+      </nav>
       {i && <p class="stats">Connected to {plural(i.peers, 'peer', 'peers')}. {plural(i.events_cached, 'event', 'events')} kept on this node.</p>}
     </>
   );
 }
+
+function FollowedTopic({ id, on }) {
+  const { data } = useLoad(() => call('event', { id }), [id]);
+  const it = data?.item;
+  return (
+    <a href={'/t/' + id} class={'c' + (on ? ' on' : '')} title={it?.content.slice(0, 200)}>
+      <span>{it ? it.title || it.content.split('\n')[0].slice(0, 60) : id.slice(0, 8)}</span>
+    </a>
+  );
+}
+
+// keep `tick` imported so the sidebar refreshes with the views
+void tick;

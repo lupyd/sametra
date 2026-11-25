@@ -5,7 +5,7 @@
 //! hosting their own posts for as long as they run a node.
 //!
 //! Never forgotten here: this node's own events, events pinned here, and small
-//! metadata (profiles, community definitions, ratings, capabilities, file
+//! metadata (profiles, ratings, capabilities, file
 //! metadata). Everything else is kept until the node needs room (`max_events`)
 //! or it passes the node's own age limit (`max_age`, off by default); then the
 //! node's ranking (`rank`, see `node::Keep`) decides what goes first.
@@ -21,7 +21,7 @@ use std::sync::Arc;
 pub type Ev = Arc<Event>;
 
 /// How long a participant counts as present after their last event or heartbeat
-/// (community member counts); it has no effect on what is kept.
+/// (who is around); it has no effect on what is kept.
 pub const PRESENCE_TTL: u64 = 7 * 86400;
 
 /// When a node forgets: over `max_events`, or older than `max_age` (seconds).
@@ -40,7 +40,8 @@ pub enum Insert {
 pub struct Store {
     ev: HashMap<H32, Ev>,
     by_time: BTreeSet<(u64, H32)>,
-    by_comm: HashMap<String, BTreeSet<(u64, H32)>>,
+    /// top-level topics (posts without a parent), by time
+    tops: BTreeSet<(u64, H32)>,
     refs: HashMap<H32, Vec<H32>>, // referenced id -> events with e/q tag to it
     repl: HashMap<(H32, u32, String), H32>,
     pub pinned: HashSet<H32>,
@@ -54,7 +55,7 @@ pub struct Store {
 }
 
 fn is_metadata(kind: u32) -> bool {
-    matches!(kind, K_PROFILE | K_COMMUNITY | K_RATING | K_CAPABILITY | K_FILE | 3)
+    matches!(kind, K_PROFILE | K_RATING | K_CAPABILITY | K_FILE | 3)
 }
 
 /// Popularity halves every week without new use.
@@ -70,7 +71,7 @@ impl Store {
         let mut s = Store {
             ev: HashMap::new(),
             by_time: BTreeSet::new(),
-            by_comm: HashMap::new(),
+            tops: BTreeSet::new(),
             refs: HashMap::new(),
             repl: HashMap::new(),
             pinned: pins,
@@ -121,8 +122,9 @@ impl Store {
     pub fn contains(&self, id: &H32) -> bool {
         self.ev.contains_key(id)
     }
-    pub fn communities(&self) -> impl Iterator<Item = (&String, usize)> {
-        self.by_comm.iter().map(|(k, v)| (k, v.len()))
+    /// Top-level topics, newest first.
+    pub fn top_level(&self, limit: usize) -> Vec<Ev> {
+        self.tops.iter().rev().take(limit).filter_map(|(_, id)| self.ev.get(id).cloned()).collect()
     }
     pub fn replaceable(&self, pk: &H32, kind: u32, d: &str) -> Option<&Ev> {
         self.repl.get(&(*pk, kind, d.to_string())).and_then(|id| self.ev.get(id))
@@ -130,18 +132,23 @@ impl Store {
     pub fn referencing(&self, id: &H32) -> Vec<Ev> {
         self.refs.get(id).map(|v| v.iter().filter_map(|i| self.ev.get(i).cloned()).collect()).unwrap_or_default()
     }
-    /// Direct replies of `id` (events whose parent is `id`).
-    /// Direct replies only: ratings, deletions and job results also carry `e`
-    /// tags pointing here, but they are not part of the conversation.
+    /// Posts directly under `id` (whose parent is `id`). Ratings, deletions, deeper
+    /// descendants and job results also carry `e` tags pointing here; they are not
+    /// its children.
     pub fn children(&self, id: &H32) -> Vec<Ev> {
-        let mut v: Vec<Ev> = self.referencing(id).into_iter().filter(|e| e.kind == K_REPLY && e.parent() == Some(*id)).collect();
+        let mut v: Vec<Ev> = self.referencing(id).into_iter().filter(|e| e.kind == K_POST && e.parent() == Some(*id)).collect();
         v.dedup_by_key(|e| e.id);
         v
     }
+    /// Everything under `id`, at any depth (posts name all their ancestors, up to
+    /// MAX_PATH: deeper ones are found by walking down).
     pub fn descendant_count(&self, id: &H32, cap: usize) -> usize {
-        let (mut n, mut stack) = (0, vec![*id]);
+        let (mut n, mut stack, mut seen) = (0, vec![*id], HashSet::new());
         while let Some(x) = stack.pop() {
             for c in self.children(&x) {
+                if !seen.insert(c.id) {
+                    continue;
+                }
                 n += 1;
                 if n >= cap {
                     return n;
@@ -191,8 +198,8 @@ impl Store {
         let ls = self.last_seen.entry(e.pubkey).or_insert(0);
         *ls = (*ls).max(e.created_at);
         self.by_time.insert((e.created_at, e.id));
-        if let Some(c) = e.community() {
-            self.by_comm.entry(c.to_string()).or_default().insert((e.created_at, e.id));
+        if e.kind == K_POST && e.parent().is_none() {
+            self.tops.insert((e.created_at, e.id));
         }
         for t in &e.tags {
             if t.len() >= 2 && (t[0] == "e" || t[0] == "q")
@@ -217,13 +224,7 @@ impl Store {
         self.index.remove(id);
         self.pop.remove(id);
         self.by_time.remove(&(e.created_at, e.id));
-        if let Some(c) = e.community()
-            && let Some(s) = self.by_comm.get_mut(c) {
-                s.remove(&(e.created_at, e.id));
-                if s.is_empty() {
-                    self.by_comm.remove(c);
-                }
-            }
+        self.tops.remove(&(e.created_at, e.id));
         for t in &e.tags {
             if t.len() >= 2 && (t[0] == "e" || t[0] == "q")
                 && let Some(r) = H32::from_hex(&t[1])
@@ -276,24 +277,6 @@ impl Store {
                 for e in self.referencing(&r) {
                     if seen.insert(e.id) && f.matches(&e) {
                         out.push(e);
-                    }
-                }
-            }
-            out.sort_by_key(|e| std::cmp::Reverse(e.created_at));
-            out.truncate(limit);
-            return out;
-        }
-        if let Some(cs) = tag("c") {
-            for c in cs {
-                if let Some(set) = self.by_comm.get(c) {
-                    for (_, id) in set.range(lo..=hi).rev() {
-                        let e = &self.ev[id];
-                        if f.matches(e) {
-                            out.push(e.clone());
-                            if out.len() >= limit * cs.len() {
-                                break;
-                            }
-                        }
                     }
                 }
             }
@@ -473,7 +456,7 @@ mod tests {
         let c = vec!["c".to_string(), "math".to_string()];
         let root = me.sign(K_POST, vec![c.clone()], "root".into());
         let reply = other.sign_at(
-            K_REPLY,
+            K_POST,
             vec![c.clone(), vec!["e".into(), root.id.hex(), "".into(), "root".into()], vec!["e".into(), root.id.hex(), "".into(), "reply".into()]],
             "reply".into(),
             now() - 7200,
@@ -524,7 +507,7 @@ mod tests {
         e
     }
     fn reply_to(k: &Keys, root: &Event, parent: &Event, t: u64) -> Event {
-        at(k, K_REPLY, tg(&[&["c", "m"], &["e", &root.id.hex(), "", "root"], &["e", &parent.id.hex(), "", "reply"]]), "r", t)
+        at(k, K_POST, tg(&[&["e", &root.id.hex(), "", "root"], &["e", &parent.id.hex(), "", "reply"]]), "r", t)
     }
     fn open(name: &str) -> (Store, PathBuf) {
         let d = tmpdir(name);
@@ -629,8 +612,8 @@ mod tests {
         assert_eq!(refs.len(), 5);
         assert_eq!(refs[0].id, replies[4].id);
         assert_eq!(q(&s, serde_json::json!({"#q": [root.id.hex()]})).len(), 1);
-        // #c with time window and kind
-        assert_eq!(q(&s, serde_json::json!({"#c": ["m"], "since": 111, "until": 113})).len(), 3);
+        // a tag with a time window, and with a kind
+        assert_eq!(q(&s, serde_json::json!({"#e": [root.id.hex()], "since": 111, "until": 113})).len(), 3);
         assert_eq!(q(&s, serde_json::json!({"#c": ["m"], "kinds": [11]}))[0].id, root.id);
         assert_eq!(q(&s, serde_json::json!({"#c": ["m", "bio"], "limit": 2})).len(), 2);
         // time index
@@ -715,19 +698,19 @@ mod tests {
     }
 
     #[test]
-    fn community_index_counts() {
-        let (mut s, dir) = open("comms");
+    fn top_level_index() {
+        let (mut s, dir) = open("tops");
         let k = Keys::generate();
-        let a = at(&k, K_POST, tg(&[&["c", "m"]]), "a", 1);
+        let a = at(&k, K_POST, vec![], "a", 1);
+        let b = at(&k, K_POST, vec![], "b", 2);
         s.insert(a.clone());
-        s.insert(at(&k, K_POST, tg(&[&["c", "m"]]), "b", 2));
-        s.insert(at(&k, K_POST, tg(&[&["c", "bio"]]), "c", 3));
-        let mut c: Vec<(String, usize)> = s.communities().map(|(k, n)| (k.clone(), n)).collect();
-        c.sort();
-        assert_eq!(c, [("bio".to_string(), 1), ("m".to_string(), 2)]);
-        let bio = s.query(&filter(serde_json::json!({"#c": ["bio"]})), 10)[0].id;
-        s.remove(&bio);
-        assert_eq!(s.communities().count(), 1, "empty community index is dropped");
+        s.insert(b.clone());
+        s.insert(reply_to(&k, &a, &a, 3));
+        let tops: Vec<H32> = s.top_level(10).iter().map(|e| e.id).collect();
+        assert_eq!(tops, [b.id, a.id], "top-level topics only, newest first");
+        assert_eq!(s.children(&a.id).len(), 1);
+        s.remove(&b.id);
+        assert_eq!(s.top_level(10).len(), 1);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -840,7 +823,7 @@ mod tests {
         let (mut s, dir) = open("nip50");
         let k = Keys::generate();
         let a = at(&k, K_POST, tg(&[&["c", "bio"], &["title", "CRISPR screen"]]), "off-target effects", 10);
-        let b = at(&k, K_REPLY, tg(&[&["c", "bio"]]), "crispr reply", 20);
+        let b = at(&k, K_POST, tg(&[&["c", "bio2"]]), "crispr reply", 20);
         let c = at(&k, K_POST, tg(&[&["c", "chem"]]), "crispr reagents", 30);
         for e in [&a, &b, &c] {
             s.insert(e.clone());

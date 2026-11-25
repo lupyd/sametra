@@ -6,7 +6,7 @@
 //! id, so the mesh converges without any coordinator.
 
 use crate::event::*;
-use crate::rep::{self, RepTable};
+use crate::rep::{self, Model, RepTable};
 use crate::store::{Ev, Insert, Store};
 use futures_util::{SinkExt, StreamExt};
 use sametra_transport::codec::{Msg, Wire, parse_frame};
@@ -25,7 +25,8 @@ pub struct Config {
     pub data: PathBuf,
     pub peers: Vec<String>,
     pub public_addr: Option<String>,
-    pub join: Vec<String>,
+    /// Posts whose subtrees a scoped node keeps (`--follow`).
+    pub follow: Vec<H32>,
     pub relay_all: bool,
     pub max_events: usize,
     pub max_peers: usize,
@@ -77,7 +78,7 @@ impl Default for Config {
             data: PathBuf::from("."),
             peers: vec![],
             public_addr: None,
-            join: vec![],
+            follow: vec![],
             relay_all: true,
             max_events: 200_000,
             max_peers: 8,
@@ -154,17 +155,17 @@ pub struct Node {
     pub cfg: Config,
     pub keys: Keys,
     pub store: Mutex<Store>,
-    pub joined: Mutex<BTreeSet<String>>,
+    /// Posts whose subtrees this node keeps when it does not relay everything.
+    pub following: Mutex<BTreeSet<H32>>,
     pub peers: Mutex<HashMap<u64, PeerHandle>>,
     book: Mutex<HashMap<String, AddrInfo>>,
     pub pending: Mutex<HashMap<String, mpsc::Sender<Option<Ev>>>>,
     seen: Mutex<HashMap<H32, u64>>, // recent ephemeral ids
-    rep_cache: Mutex<HashMap<String, Arc<RepTable>>>,
+    /// message scores and contextual standing, rebuilt when ratings change
+    model_cache: Mutex<Option<(Arc<Model>, u64)>>,
     pub memory: Mutex<BTreeMap<String, String>>,
     /// notifications up to this time have been seen
     pub notifications_read: AtomicU64,
-    /// community -> participants announcing it in heartbeats -> last seen
-    members: Mutex<HashMap<String, HashMap<H32, u64>>>,
     /// recently seen search subscription ids (loop guard for forwarded searches)
     searches: Mutex<HashMap<String, u64>>,
     /// concurrent outgoing forwarded searches
@@ -188,9 +189,23 @@ pub struct Node {
 pub type CapScores = HashMap<(H32, String), (f64, usize)>;
 
 pub const ORIGIN_LOCAL: u64 = 0;
-/// Relayed by every node, whatever it joined: small metadata, and capability
+/// Relayed by every node, whatever it follows: small metadata, and capability
 /// jobs (so requests and results find their way through scoped nodes).
-const GLOBAL_KINDS: [u32; 9] = [K_PROFILE, K_COMMUNITY, K_RATING, K_DELETE, K_CAPABILITY, K_JOB, K_JOB_RESULT, K_JOB_FEEDBACK, K_FILE];
+const GLOBAL_KINDS: [u32; 8] = [K_PROFILE, K_RATING, K_DELETE, K_CAPABILITY, K_JOB, K_JOB_RESULT, K_JOB_FEEDBACK, K_FILE];
+
+/// Closeness from the post tree: posts in the same tree are close, the rest far.
+/// (The fallback when no embeddings are available.)
+pub struct TreeCloseness {
+    root_of: HashMap<H32, H32>,
+}
+/// How much standing in one tree counts in another.
+pub const FAR: f64 = 0.1;
+impl rep::Closeness for TreeCloseness {
+    fn closeness(&self, a: &H32, b: &H32) -> f64 {
+        let r = |x: &H32| self.root_of.get(x).copied().unwrap_or(*x);
+        if a == b || r(a) == r(b) { 1.0 } else { FAR }
+    }
+}
 
 impl Node {
     pub fn new(cfg: Config, keys: Keys) -> std::io::Result<Arc<Node>> {
@@ -210,8 +225,8 @@ impl Node {
         let pins: HashSet<H32> = state.pins.iter().filter_map(|p| Some(H32(p.as_slice().try_into().ok()?))).collect();
         let mut store = Store::open(cfg.data.join("store"), pins)?;
         store.load_popularity(&state.popularity);
-        let mut joined: BTreeSet<String> = state.joined.into_iter().collect();
-        joined.extend(cfg.join.iter().cloned());
+        let mut following: BTreeSet<H32> = state.following.iter().filter_map(|b| Some(H32(b.as_slice().try_into().ok()?))).collect();
+        following.extend(cfg.follow.iter().copied());
         let mut book: HashMap<String, AddrInfo> = state.peers.into_iter().map(|p| (p, AddrInfo::default())).collect();
         for p in &cfg.peers {
             book.entry(p.clone()).or_default();
@@ -226,15 +241,14 @@ impl Node {
             cfg,
             keys,
             store: Mutex::new(store),
-            joined: Mutex::new(joined),
+            following: Mutex::new(following),
             peers: Mutex::new(HashMap::new()),
             book: Mutex::new(book),
             pending: Mutex::new(HashMap::new()),
             seen: Mutex::new(HashMap::new()),
-            rep_cache: Mutex::new(HashMap::new()),
+            model_cache: Mutex::new(None),
             memory: Mutex::new(memory),
             notifications_read: AtomicU64::new(state.notifications_read),
-            members: Mutex::new(HashMap::new()),
             searches: Mutex::new(HashMap::new()),
             search_slots: Arc::new(tokio::sync::Semaphore::new(8)),
             cap_cache: Mutex::new(None),
@@ -251,14 +265,14 @@ impl Node {
         Ok(node)
     }
 
-    /// Persist joined communities, address book and pins (NodeState protobuf, atomic replace).
+    /// Persist followed posts, address book and pins (NodeState protobuf, atomic replace).
     pub fn save_state(&self) {
         let (pins, popularity) = {
             let store = self.store.lock().unwrap();
             (store.pinned.iter().map(|p| p.0.to_vec()).collect(), store.export_popularity(5000))
         };
         let st = pb::NodeState {
-            joined: self.joined.lock().unwrap().iter().cloned().collect(),
+            following: self.following.lock().unwrap().iter().map(|h| h.0.to_vec()).collect(),
             peers: self.book.lock().unwrap().iter().filter(|(_, i)| i.fails < 8).map(|(a, _)| a.clone()).collect(),
             pins,
             popularity,
@@ -277,11 +291,17 @@ impl Node {
         self.cfg.relay_all
             || e.pubkey == self.keys.pubkey
             || GLOBAL_KINDS.contains(&e.kind)
-            || e.community().is_some_and(|c| self.joined.lock().unwrap().contains(c))
+            || self.follows(e)
             // capability requests, results and feedback addressed to us
             || e.tags_named("p").any(|p| H32::from_hex(p) == Some(self.keys.pubkey))
             // mentions travel through every node so they reach the people named
             || is_mention(e)
+    }
+
+    /// Is the event a followed post, or under one?
+    pub fn follows(&self, e: &Event) -> bool {
+        let f = self.following.lock().unwrap();
+        !f.is_empty() && (f.contains(&e.id) || e.ancestors().iter().any(|a| f.contains(a)))
     }
 
     /// Validate, store and fan out an event. `force` stores even if outside our interests
@@ -304,17 +324,6 @@ impl Node {
                     return Err("invalid: stale heartbeat".into());
                 }
                 self.store.lock().unwrap().touch(e.pubkey, e.created_at);
-                {
-                    let mut m = self.members.lock().unwrap();
-                    for c in e.tags_named("c").take(50) {
-                        if m.len() < 10_000 || m.contains_key(c) {
-                            let who = m.entry(c.to_string()).or_default();
-                            if who.len() < 100_000 {
-                                who.insert(e.pubkey, e.created_at);
-                            }
-                        }
-                    }
-                }
                 #[cfg(feature = "ipfs")]
                 if e.pubkey != self.keys.pubkey
                     && let Some(ipfs) = self.ipfs.get()
@@ -341,10 +350,10 @@ impl Node {
             return Ok((x.clone(), false));
         }
         if !force && !self.interested(&e) {
-            return Err("blocked: not relaying this community".into());
+            return Err("blocked: not following this topic".into());
         }
         e.validate()?;
-        let comm = (e.kind == K_RATING).then(|| e.community().map(String::from)).flatten();
+        let rating = e.kind == K_RATING;
         if matches!(e.kind, K_RATING | K_JOB_RESULT) {
             *self.cap_cache.lock().unwrap() = None;
         }
@@ -354,12 +363,12 @@ impl Node {
         let r = self.store.lock().unwrap().insert(e);
         match r {
             Insert::Stored(e) => {
-                if let Some(c) = comm {
-                    self.rep_cache.lock().unwrap().remove(&c);
+                if rating {
+                    *self.model_cache.lock().unwrap() = None;
                 }
                 // keep the files posts link to, and help serve them
                 #[cfg(feature = "ipfs")]
-                if matches!(e.kind, K_POST | K_REPLY)
+                if e.kind == K_POST
                     && let Some(ipfs) = self.ipfs.get()
                     && let Ok(rt) = tokio::runtime::Handle::try_current()
                 {
@@ -397,22 +406,15 @@ impl Node {
         self.ingest(e, ORIGIN_LOCAL, true).map(|(e, _)| e)
     }
 
-    /// This node's ranking of what to keep (see [`Keep`]). Reputation tables are
-    /// gathered first, so ranking needs no further locks; only when the cache is
-    /// full or an age limit is set does it cost anything.
+    /// This node's ranking of what to keep (see [`Keep`]). The model is built
+    /// first, so ranking needs no further locks; only when the cache is full or an
+    /// age limit is set does it cost anything.
     pub fn ranking(&self) -> impl Fn(&Store, &Event) -> f64 + use<> {
         let (full, keep) = (self.store.lock().unwrap().len() > self.cfg.max_events, self.cfg.keep);
-        let mut reps: HashMap<String, Arc<RepTable>> = HashMap::new();
-        if full && matches!(keep, Keep::Balanced | Keep::Reputation) {
-            let comms: Vec<String> = self.store.lock().unwrap().communities().map(|(c, _)| c.clone()).collect();
-            for c in comms {
-                let t = self.reputation(&c);
-                reps.insert(c, t);
-            }
-        }
+        let model = (full && matches!(keep, Keep::Balanced | Keep::Reputation)).then(|| self.model());
         move |s: &Store, e: &Event| {
-            // standing: the author's reputation where the post lives, plus the post's own score
-            let standing = || e.community().and_then(|c| reps.get(c)).map(|t| t.user(&e.pubkey) + t.event(&e.id)).unwrap_or(0.0);
+            // standing: the post's own score, plus its author's standing near it
+            let standing = || model.as_ref().map(|m| m.event(&e.id) + m.near(&e.pubkey, &e.id)).unwrap_or(0.0);
             match keep {
                 Keep::Balanced => 2.0 * standing() + s.usage_rank(e),
                 Keep::Reputation => 100.0 * standing() + 0.01 * s.usage_rank(e),
@@ -422,17 +424,34 @@ impl Node {
         }
     }
 
-    pub fn reputation(&self, community: &str) -> Arc<RepTable> {
-        if let Some(t) = self.rep_cache.lock().unwrap().get(community) {
-            return t.clone();
+    /// Message scores and contextual standing (see rep::Model), rebuilt when a
+    /// rating arrives, and at most once a minute as posts arrive.
+    pub fn model(&self) -> Arc<Model> {
+        if let Some((m, at)) = self.model_cache.lock().unwrap().clone()
+            && at + 60 > now()
+        {
+            return m;
         }
-        let ratings = {
-            let f = Filter { kinds: Some(vec![K_RATING]), tags: vec![("c".into(), vec![community.into()])], ..Default::default() };
-            self.store.lock().unwrap().query(&f, usize::MAX)
+        let (ratings, authors, roots) = {
+            let st = self.store.lock().unwrap();
+            let ratings = st.query(&Filter { kinds: Some(vec![K_RATING]), ..Default::default() }, usize::MAX);
+            let mut authors: HashMap<H32, H32> = HashMap::new();
+            let mut roots: HashMap<H32, H32> = HashMap::new();
+            for e in st.query(&Filter { kinds: Some(vec![K_POST]), ..Default::default() }, usize::MAX) {
+                authors.insert(e.id, e.pubkey);
+                roots.insert(e.id, e.root().unwrap_or(e.id));
+            }
+            (ratings, authors, roots)
         };
-        let t = Arc::new(rep::compute(&ratings));
-        self.rep_cache.lock().unwrap().insert(community.to_string(), t.clone());
-        t
+        let close: Arc<dyn rep::Closeness> = self.closeness(roots);
+        let m = Arc::new(rep::compute(&ratings, |id| authors.get(id).copied(), close, now()));
+        *self.model_cache.lock().unwrap() = Some((m.clone(), now()));
+        m
+    }
+
+    /// How close two posts are: the post tree (embeddings come next).
+    fn closeness(&self, roots: HashMap<H32, H32>) -> Arc<dyn rep::Closeness> {
+        Arc::new(TreeCloseness { root_of: roots })
     }
 
     /// Who the network vouches is human (see rep::humanity), cached until a new
@@ -455,10 +474,6 @@ impl Node {
         if let Some(a) = &self.cfg.public_addr {
             tags.push(vec!["r".to_string(), a.clone()]);
         }
-        // the communities we carry: lets others count members and route searches
-        for c in self.joined.lock().unwrap().iter().take(50) {
-            tags.push(vec!["c".to_string(), c.clone()]);
-        }
         // our IPFS daemon, so Sametra nodes connect theirs and swap files directly
         #[cfg(feature = "ipfs")]
         tags.extend(self.ipfs.get().and_then(|i| i.heartbeat_tag()));
@@ -474,13 +489,15 @@ impl Node {
         if self.cfg.relay_all {
             return vec![Filter { since: Some(since), limit: Some(20000), ..Default::default() }, hb];
         }
-        let joined: Vec<String> = self.joined.lock().unwrap().iter().cloned().collect();
+        let following: Vec<String> = self.following.lock().unwrap().iter().map(H32::hex).collect();
         let mut f = vec![Filter { kinds: Some(GLOBAL_KINDS.to_vec()), since: Some(since), ..Default::default() }, hb];
         f.push(Filter { tags: vec![("p".into(), vec![self.keys.pubkey.hex()])], since: Some(since), ..Default::default() });
         // mentions of anyone: relayed by every node so they reach the people named
         f.push(Filter { tags: vec![("l".into(), vec!["mention".into(), "addressed".into()])], since: Some(since), ..Default::default() });
-        if !joined.is_empty() {
-            f.push(Filter { tags: vec![("c".into(), joined)], since: Some(since), limit: Some(20000), ..Default::default() });
+        // followed posts and everything under them (every post names its ancestors)
+        if !following.is_empty() {
+            f.push(Filter { ids: Some(following.clone()), ..Default::default() });
+            f.push(Filter { tags: vec![("e".into(), following)], since: Some(since), limit: Some(20000), ..Default::default() });
         }
         f
     }
@@ -542,21 +559,15 @@ impl Node {
         out
     }
 
-    /// Participants seen recently (within `PRESENCE_TTL`) who carry `community`.
-    pub fn members(&self, community: &str) -> usize {
-        let cut = now().saturating_sub(crate::store::PRESENCE_TTL);
-        self.members.lock().unwrap().get(community).map(|m| m.values().filter(|t| **t >= cut).count()).unwrap_or(0)
-    }
-
     pub fn peer_list(&self) -> Vec<pb::Peer> {
         self.peers.lock().unwrap().values().map(|p| pb::Peer { addr: p.addr.clone(), outbound: p.outbound, since: p.since }).collect()
     }
 }
 
-/// Is the event addressed to people beyond its community: it @mentions someone
-/// (`["p", pubkey, relay, "mention"]`), or is labelled `addressed` (written from
-/// outside the community to the people it replies to)? Such events travel through
-/// every node, labelled (`["l", ...]`) so scoped nodes can subscribe to them.
+/// Is the event addressed to people wherever they are: it @mentions someone
+/// (`["p", pubkey, relay, "mention"]`), or is labelled `addressed` (a reply written
+/// outside the topics its author's node follows)? Such events travel through every
+/// node, labelled (`["l", ...]`) so scoped nodes can subscribe to them.
 pub fn is_mention(e: &Event) -> bool {
     e.tags.iter().any(|t| t.len() >= 4 && t[0] == "p" && t[3] == "mention")
         || (e.tags.iter().any(|t| t.len() >= 2 && t[0] == "l" && t[1] == "addressed") && e.tags_named("p").next().is_some())
@@ -816,17 +827,12 @@ pub fn spawn_background(node: Arc<Node>) {
                     k
                 };
                 if evicted > 0 {
-                    n.rep_cache.lock().unwrap().clear();
+                    *n.model_cache.lock().unwrap() = None;
                     tracing::info!(evicted, cached = n.store.lock().unwrap().len(), "evicted events");
                 }
                 let cut = now().saturating_sub(1200);
                 n.seen.lock().unwrap().retain(|_, t| *t > cut);
                 n.searches.lock().unwrap().retain(|_, t| *t + 120 > now());
-                let gone = now().saturating_sub(crate::store::PRESENCE_TTL);
-                n.members.lock().unwrap().retain(|_, m| {
-                    m.retain(|_, t| *t >= gone);
-                    !m.is_empty()
-                });
                 n.save_state();
             }
         }
@@ -910,21 +916,25 @@ mod tests {
 
     #[test]
     fn interest_scoping_without_relay_all() {
+        let k = Keys::generate();
+        let topic = k.sign(K_POST, vec![], "a topic".into());
         let n = node_with("interest", |c| {
             c.relay_all = false;
-            c.join = vec!["m".into()];
+            c.follow = vec![topic.id];
         });
-        let k = Keys::generate();
-        assert!(n.ingest(k.sign(K_POST, c("m"), "in".into()), 1, false).is_ok());
-        assert!(n.ingest(k.sign(K_POST, c("bio"), "out".into()), 1, false).unwrap_err().contains("not relaying"));
-        assert!(n.ingest(k.sign(K_POST, c("bio"), "fetched".into()), 1, true).is_ok(), "explicit fetches are kept");
+        assert!(n.ingest(topic.clone(), 1, false).is_ok(), "the followed post");
+        let child = k.sign(K_POST, ancestry_tags(&topic.id, &[]), "under it".into());
+        let grandchild = k.sign(K_POST, ancestry_tags(&child.id, &[topic.id]), "deeper".into());
+        assert!(n.ingest(child, 1, false).is_ok());
+        assert!(n.ingest(grandchild, 1, false).is_ok(), "everything under it, at any depth");
+        assert!(n.ingest(k.sign(K_POST, vec![], "elsewhere".into()), 1, false).unwrap_err().contains("not following"));
+        assert!(n.ingest(k.sign(K_POST, vec![], "fetched".into()), 1, true).is_ok(), "explicit fetches are kept");
         assert!(n.ingest(k.sign(K_PROFILE, vec![], "{}".into()), 1, false).is_ok(), "global metadata");
-        assert!(n.ingest(k.sign(K_COMMUNITY, vec![vec!["d".into(), "bio".into()]], String::new()), 1, false).is_ok());
-        assert!(n.publish(K_POST, c("bio"), "mine".into()).is_ok(), "own events");
-        assert!(n.keys.sign(K_POST, c("zzz"), "own via gossip".into()).validate().is_ok());
-        assert!(n.ingest(n.keys.sign(K_POST, c("zzz"), "own".into()), 1, false).is_ok());
+        assert!(n.publish(K_POST, vec![], "mine".into()).is_ok(), "own events");
+        assert!(n.ingest(n.keys.sign(K_POST, vec![], "own".into()), 1, false).is_ok());
         let sf = n.sync_filters(5);
-        assert!(sf.iter().any(|f| f.tags == vec![("c".to_string(), vec!["m".to_string()])] && f.since == Some(5)));
+        assert!(sf.iter().any(|f| f.tags == vec![("e".to_string(), vec![topic.id.hex()])] && f.since == Some(5)), "everything under it names it");
+        assert!(sf.iter().any(|f| f.ids == Some(vec![topic.id.hex()])), "and the post itself");
         assert!(sf.iter().any(|f| f.kinds.as_ref().is_some_and(|k| k.contains(&K_RATING))));
         assert!(sf.iter().any(|f| f.kinds == Some(vec![K_HEARTBEAT])));
     }
@@ -964,7 +974,7 @@ mod tests {
         let n = node_with("edits", |_| {});
         for i in 0..5 {
             n.publish(K_PROFILE, vec![], format!("v{i}")).unwrap();
-            let d = vec![vec!["d".into(), "x".into()], vec!["c".into(), "m".into()]];
+            let d = vec![vec!["d".into(), "x".into()]];
             n.publish(K_RATING, d, format!("r{i}")).unwrap();
         }
         let st = n.store.lock().unwrap();
@@ -974,16 +984,8 @@ mod tests {
     }
 
     #[test]
-    fn heartbeats_count_members_and_popularity_persists() {
-        let n = node_with("members", |c| c.join = vec!["bio".into(), "math".into()]);
-        n.heartbeat();
-        let hb = n.heartbeat_event();
-        assert_eq!(hb.tags_named("c").collect::<Vec<_>>(), ["bio", "math"], "heartbeats carry joined communities");
-        let k = Keys::generate();
-        n.ingest(k.sign(K_HEARTBEAT, vec![vec!["c".into(), "bio".into()]], String::new()), 1, false).unwrap();
-        assert_eq!(n.members("bio"), 2);
-        assert_eq!(n.members("math"), 1);
-        assert_eq!(n.members("chem"), 0);
+    fn popularity_persists() {
+        let n = node_with("popular", |_| {});
         // popularity survives a restart through state.pb
         let e = n.publish(K_POST, c("bio"), "x".into()).unwrap();
         n.store.lock().unwrap().bump(&e.id, 5.0);
@@ -1005,16 +1007,21 @@ mod tests {
     }
 
     #[test]
-    fn reputation_cache_is_invalidated_by_new_ratings() {
+    fn model_is_rebuilt_on_new_ratings() {
         let n = node_with("repcache", |_| {});
         let (a, b) = (Keys::generate(), Keys::generate());
-        assert_eq!(n.reputation("m").user(&b.pubkey), 0.0);
+        let post = b.sign(K_POST, vec![], "claim".into());
+        let elsewhere = b.sign(K_POST, vec![], "other topic".into());
+        n.ingest(post.clone(), 1, false).unwrap();
+        n.ingest(elsewhere.clone(), 1, false).unwrap();
+        assert_eq!(n.model().near(&b.pubkey, &post.id), 0.0);
         let t = |k: &str, v: String| vec![k.to_string(), v];
-        let r = a.sign(K_RATING, vec![t("d", "x".into()), t("c", "m".into()), t("p", b.pubkey.hex()), t("score", "8".into())], String::new());
+        let r = a.sign(K_RATING, vec![t("d", "x".into()), t("p", b.pubkey.hex()), t("e", post.id.hex()), t("score", "1".into())], String::new());
         n.ingest(r, 1, false).unwrap();
-        assert!(n.reputation("m").user(&b.pubkey) > 0.0);
-        assert!(Arc::ptr_eq(&n.reputation("m"), &n.reputation("m")), "cached");
-        assert_eq!(n.reputation("other").user(&b.pubkey), 0.0, "per community");
+        let m = n.model();
+        assert!(m.near(&b.pubkey, &post.id) > 0.0);
+        assert!(m.near(&b.pubkey, &elsewhere.id) < m.near(&b.pubkey, &post.id), "standing is strongest where it was earned");
+        assert!(Arc::ptr_eq(&m, &n.model()), "cached");
     }
 
     #[test]
@@ -1025,7 +1032,7 @@ mod tests {
         let cfg = || Config { data: dir.clone(), peers: vec!["ws://boot:1".into()], ..Default::default() };
         let n = Node::new(cfg(), keys).unwrap();
         let e = n.publish(K_POST, c("m"), "x".into()).unwrap();
-        n.joined.lock().unwrap().insert("m".into());
+        n.following.lock().unwrap().insert(e.id);
         n.store.lock().unwrap().pin([e.id], true);
         n.book.lock().unwrap().insert("ws://learned:2".into(), AddrInfo::default());
         n.book.lock().unwrap().insert("ws://dead:3".into(), AddrInfo { fails: 9, next_try: 0 });
@@ -1035,7 +1042,7 @@ mod tests {
         n.store.lock().unwrap().flush();
         drop(n);
         let n = Node::new(Config { peers: vec![], ..cfg() }, Keys::parse(&secret).unwrap()).unwrap();
-        assert!(n.joined.lock().unwrap().contains("m"));
+        assert!(n.following.lock().unwrap().contains(&e.id));
         assert!(n.store.lock().unwrap().pinned.contains(&e.id));
         assert!(n.store.lock().unwrap().get(&e.id).is_some());
         let book = n.book.lock().unwrap();
@@ -1053,8 +1060,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("state.pb"), [0xff, 0xff, 0xff]).unwrap();
         std::fs::write(dir.join("memory.pb"), [0x0a, 0x50]).unwrap();
-        let n = Node::new(Config { data: dir.clone(), join: vec!["x".into()], ..Default::default() }, Keys::generate()).unwrap();
-        assert!(n.joined.lock().unwrap().contains("x"));
+        let n = Node::new(Config { data: dir.clone(), follow: vec![H32([7; 32])], ..Default::default() }, Keys::generate()).unwrap();
+        assert!(n.following.lock().unwrap().contains(&H32([7; 32])));
         assert!(n.memory.lock().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }

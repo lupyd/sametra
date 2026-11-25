@@ -11,11 +11,10 @@ use std::fmt;
 pub const K_PROFILE: u32 = 0;
 pub const K_DELETE: u32 = 5;
 pub const K_FILE: u32 = 1063; // file metadata (NIP-94): an IPFS file and who added it
-pub const K_POST: u32 = 11; // thread root (NIP-7D style)
-pub const K_REPLY: u32 = 1111; // reply / comment
+/// A post. Every post may have a parent; a reply is a subtopic like any other.
+pub const K_POST: u32 = 11;
 pub const K_HEARTBEAT: u32 = 20100; // ephemeral presence + peer address
 pub const K_RATING: u32 = 31985; // parameterized replaceable rating
-pub const K_COMMUNITY: u32 = 34550; // community definition (NIP-72)
 pub const K_CAPABILITY: u32 = 31990; // capability announcement (NIP-89 handler information)
 pub const K_JOB: u32 = 5910; // capability request (NIP-90 job request)
 pub const K_JOB_RESULT: u32 = 6910; // job result (NIP-90: request kind + 1000)
@@ -29,6 +28,9 @@ pub const TYPE_CAPABILITY: &str = "application/x-protobuf; message=sametra.Capab
 /// Domain separation for event ids.
 const ID_DOMAIN: &[u8] = b"sametra/event/1\0";
 pub const MAX_TAGS: usize = 256;
+/// A post carries at most this many ancestors besides its root (`path` markers):
+/// enough that subtree queries are one tag filter for any realistic depth.
+pub const MAX_PATH: usize = 30;
 
 pub fn now() -> u64 {
     std::time::SystemTime::now()
@@ -187,9 +189,6 @@ impl Event {
             .filter(move |t| t.len() >= 2 && t[0] == name)
             .map(|t| t[1].as_str())
     }
-    pub fn community(&self) -> Option<&str> {
-        self.tag("c")
-    }
     pub fn d_tag(&self) -> &str {
         self.tag("d").unwrap_or("")
     }
@@ -202,27 +201,38 @@ impl Event {
     pub fn is_param_replaceable(&self) -> bool {
         (30000..40000).contains(&self.kind)
     }
-    /// Direct parent of a reply: `e` tag marked "reply", else "root", else last `e`.
+    /// The parent post (`e` tag marked "reply"), if this is not a top-level topic.
     pub fn parent(&self) -> Option<H32> {
-        let es: Vec<&Vec<String>> = self.tags.iter().filter(|t| t.len() >= 2 && t[0] == "e").collect();
-        let pick = es
-            .iter()
-            .find(|t| t.get(3).map(|m| m == "reply").unwrap_or(false))
-            .or_else(|| es.iter().find(|t| t.get(3).map(|m| m == "root").unwrap_or(false)))
-            .or(es.last())?;
-        H32::from_hex(&pick[1])
+        self.marked("reply").next()
     }
-    /// Subtopics: the topic this one was opened under (`e` tag marked "topic").
-    pub fn topic_parent(&self) -> Option<H32> {
-        self.tags.iter().find(|t| t.len() >= 4 && t[0] == "e" && t[3] == "topic").and_then(|t| H32::from_hex(&t[1]))
-    }
+    /// The top-level topic of this post's tree (`e` tag marked "root").
     pub fn root(&self) -> Option<H32> {
-        self.tags
-            .iter()
-            .find(|t| t.len() >= 4 && t[0] == "e" && t[3] == "root")
-            .and_then(|t| H32::from_hex(&t[1]))
-            .or_else(|| self.parent())
+        self.marked("root").next().or_else(|| self.parent())
     }
+    /// Every ancestor this post names: root first, then the path, then the parent.
+    pub fn ancestors(&self) -> Vec<H32> {
+        let mut v: Vec<H32> = self.marked("root").chain(self.marked("path")).chain(self.marked("reply")).collect();
+        let mut seen = std::collections::HashSet::new();
+        v.retain(|x| seen.insert(*x));
+        v
+    }
+    fn marked<'a>(&'a self, marker: &'a str) -> impl Iterator<Item = H32> + 'a {
+        self.tags.iter().filter(move |t| t.len() >= 4 && t[0] == "e" && t[3] == marker).filter_map(|t| H32::from_hex(&t[1]))
+    }
+}
+
+/// Tags that place a post under `parent`, whose own ancestors are `parent_ancestors`
+/// (root first): the root, up to `MAX_PATH` nearest other ancestors, and the parent.
+pub fn ancestry_tags(parent: &H32, parent_ancestors: &[H32]) -> Vec<Vec<String>> {
+    let e = |id: &H32, m: &str| vec!["e".to_string(), id.hex(), String::new(), m.to_string()];
+    let root = parent_ancestors.first().unwrap_or(parent);
+    let mut tags = vec![e(root, "root")];
+    let inner: Vec<&H32> = parent_ancestors.iter().skip(1).collect();
+    for a in inner.iter().skip(inner.len().saturating_sub(MAX_PATH)) {
+        tags.push(e(a, "path"));
+    }
+    tags.push(e(parent, "reply"));
+    tags
 }
 
 // ---- keys ----------------------------------------------------------------
@@ -570,7 +580,7 @@ mod tests {
     #[test]
     fn protobuf_roundtrip() {
         let k = Keys::generate();
-        let e = k.sign(K_REPLY, vec![vec!["c".into(), "x".into()], vec!["e".into(), "ab".repeat(32), "".into(), "root".into()]], "héllo".into());
+        let e = k.sign(K_POST, vec![vec!["t".into(), "x".into()], vec!["e".into(), "ab".repeat(32), "".into(), "root".into()]], "héllo".into());
         let pb = e.to_pb();
         // ids and pubkeys in tags travel as 32 raw bytes, other values as text
         assert_eq!(pb.tags[1].v[1].raw.len(), 32);
@@ -583,7 +593,7 @@ mod tests {
         let mut odd = e.to_pb();
         odd.tags[1].v[1].raw.pop();
         assert!(Event::from_pb(odd).is_none());
-        let f = Filter { kinds: Some(vec![1111]), tags: vec![("c".into(), vec!["x".into()])], since: Some(5), ..Default::default() };
+        let f = Filter { kinds: Some(vec![11]), tags: vec![("t".into(), vec!["x".into()])], since: Some(5), ..Default::default() };
         let f2 = Filter::from_pb(&crate::pb::decode(&crate::pb::encode(&f.to_pb())).unwrap());
         assert!(f2.matches(&e) && f2.since == Some(5) && f2.limit.is_none());
     }
@@ -664,8 +674,8 @@ mod tests {
     #[test]
     fn tag_helpers() {
         let k = Keys::generate();
-        let e = k.sign(K_REPLY, tags(&[&["c", "bio"], &["d", "x"], &["q", "a"], &["q", "b"], &["lonely"]]), String::new());
-        assert_eq!(e.community(), Some("bio"));
+        let e = k.sign(K_POST, tags(&[&["t", "bio"], &["d", "x"], &["q", "a"], &["q", "b"], &["lonely"]]), String::new());
+        assert_eq!(e.tag("t"), Some("bio"));
         assert_eq!(e.d_tag(), "x");
         assert_eq!(e.tags_named("q").collect::<Vec<_>>(), ["a", "b"]);
         assert_eq!(e.tag("lonely"), None, "one-element tags have no value");
@@ -673,19 +683,27 @@ mod tests {
     }
 
     #[test]
-    fn parent_and_root_markers() {
+    fn ancestry() {
         let k = Keys::generate();
         let (a, b, c) = ("a".repeat(64), "b".repeat(64), "c".repeat(64));
-        let h = |s: &str| H32::from_hex(s);
-        let marked = k.sign(K_REPLY, tags(&[&["e", &a, "", "root"], &["e", &b, "", "reply"]]), String::new());
-        assert_eq!((marked.parent(), marked.root()), (h(&b), h(&a)));
-        let root_only = k.sign(K_REPLY, tags(&[&["e", &a, "", "root"]]), String::new());
-        assert_eq!((root_only.parent(), root_only.root()), (h(&a), h(&a)));
-        let unmarked = k.sign(K_REPLY, tags(&[&["e", &a], &["e", &c]]), String::new());
-        assert_eq!((unmarked.parent(), unmarked.root()), (h(&c), h(&c)));
-        let none = k.sign(K_POST, tags(&[&["q", &a]]), String::new());
-        assert_eq!((none.parent(), none.root()), (None, None));
-        let junk = k.sign(K_REPLY, tags(&[&["e", "nothex"]]), String::new());
+        let h = |s: &str| H32::from_hex(s).unwrap();
+        let top = k.sign(K_POST, vec![], String::new());
+        assert_eq!((top.parent(), top.root(), top.ancestors()), (None, None, vec![]));
+        // a child of a top-level topic: the topic is root and parent
+        let child = k.sign(K_POST, ancestry_tags(&h(&a), &[]), String::new());
+        assert_eq!((child.parent(), child.root(), child.ancestors()), (Some(h(&a)), Some(h(&a)), vec![h(&a)]));
+        // deeper: root, path, parent
+        let deep = k.sign(K_POST, ancestry_tags(&h(&c), &[h(&a), h(&b)]), String::new());
+        assert_eq!((deep.parent(), deep.root()), (Some(h(&c)), Some(h(&a))));
+        assert_eq!(deep.ancestors(), [h(&a), h(&b), h(&c)]);
+        // very deep: the root and the nearest MAX_PATH ancestors
+        let chain: Vec<H32> = (0..100u8).map(|i| H32([i; 32])).collect();
+        let t = ancestry_tags(&H32([200; 32]), &chain);
+        let e = k.sign(K_POST, t, String::new());
+        let anc = e.ancestors();
+        assert_eq!(anc.len(), 1 + MAX_PATH + 1);
+        assert_eq!((anc[0], anc[1], *anc.last().unwrap()), (chain[0], chain[100 - MAX_PATH], H32([200; 32])));
+        let junk = k.sign(K_POST, tags(&[&["e", "nothex", "", "reply"]]), String::new());
         assert_eq!(junk.parent(), None);
     }
 
@@ -695,8 +713,8 @@ mod tests {
         let ev = |kind| k.sign(kind, vec![], String::new());
         assert!(ev(K_HEARTBEAT).is_ephemeral() && !ev(K_POST).is_ephemeral());
         assert!(ev(K_PROFILE).is_replaceable() && ev(3).is_replaceable() && ev(10002).is_replaceable());
-        assert!(!ev(K_REPLY).is_replaceable());
-        assert!(ev(K_RATING).is_param_replaceable() && ev(K_COMMUNITY).is_param_replaceable());
+        assert!(!ev(K_POST).is_replaceable());
+        assert!(ev(K_RATING).is_param_replaceable() && ev(K_CAPABILITY).is_param_replaceable());
         assert!(!ev(K_PROFILE).is_param_replaceable() && !ev(K_HEARTBEAT).is_replaceable());
     }
 

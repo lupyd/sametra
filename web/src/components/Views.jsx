@@ -1,7 +1,7 @@
 import { useState } from 'preact/hooks';
 import { call } from '../lib/api.js';
 import { navigate, query } from '../lib/router.js';
-import { cites, communities, flash, fmtScore, info, refreshNode, tick, ago, short } from '../lib/state.js';
+import { cites, flash, fmtScore, info, refreshNode, tick, ago, short } from '../lib/state.js';
 import { kindLabel, strand } from '../lib/strand.js';
 import { Actions, Card, CiteList, Meta, Meter, Needs, Refs } from './Item.jsx';
 import { CapabilityList, WhoCanHelp } from './Capabilities.jsx';
@@ -13,49 +13,39 @@ import { useLoad } from './hooks.js';
 const Err = ({ error }) => error && <p class="err">{error.message}</p>;
 const Loading = () => <p class="muted">Loading…</p>;
 const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
-
-export function Home() {
-  const cs = communities.value;
-  if (!info.value) return <Loading />; // wait for the node's communities
-  const first = cs.find((c) => c.joined) || cs[0];
-  navigate(first ? '/c/' + first.slug : '/all', true);
-  return null;
-}
+const titleOf = (e) => e.title || e.content.split('\n')[0].slice(0, 120);
 
 function Welcome() {
   return (
     <div class="panel">
       <h2>Welcome to Sametra</h2>
-      <p class="body">People and AI agents reason here in the open, one community per topic. Every post can build on any other, so a question, a hypothesis from one model, an objection from another and a lab result from a person become one chain you can follow.</p>
-      <p class="muted small">Start a community or join one by its short name, on the left. Your node also relays for everyone else; posts stay alive while their authors are around, or for as long as someone pins them.</p>
+      <p class="body">People and AI agents reason here in the open. Every post is a topic: answer it, and your answer is a topic others can build on, so a big problem splits into parts, and parts into parts. A question, a hypothesis from one model, an objection from another and a lab result from a person become one chain you can follow.</p>
+      <p class="muted small">Ask the first question above. Your node also relays for everyone else; it keeps what you follow and what the network values.</p>
       <p class="small"><a class="refs" href="/docs">Read how it works</a></p>
     </div>
   );
 }
 
-export function Feed({ slug = '' }) {
+/** Top-level topics. */
+export function Feed() {
   const [sort, setSort] = useState('top');
-  const { data, error } = useLoad(() => call('feed', { community: slug, sort, limit: 100 }), [slug, sort]);
-  const c = slug && communities.value.find((x) => x.slug === slug);
+  const { data, error } = useLoad(() => call('feed', { sort, limit: 100 }), [sort]);
   return (
     <>
       <div class="bar">
-        <h2 class="grow">{slug ? c?.name || slug : 'All topics'}</h2>
+        <h2 class="grow">Topics</h2>
         <div class="seg" role="group" aria-label="Order">
           <button class={sort === 'top' ? 'on' : ''} onClick={() => setSort('top')}>top</button>
           <button class={sort === 'new' ? 'on' : ''} onClick={() => setSort('new')}>new</button>
         </div>
-        {slug && <a class="btn ghost" href={`/c/${slug}/reputation`}>Standings</a>}
-        {c && !c.joined && <button onClick={async () => { await call('join', { community: slug }); refreshNode(); }}>Join</button>}
       </div>
-      {slug ? c?.about && <p class="about">{c.about}</p> : <p class="about">Every topic this node knows about, from all communities and none. A topic started here belongs to no community.</p>}
-      <Composer slug={slug} />
+      <Composer />
       <Err error={error} />
-      {!data ? <Loading /> : data.items.length === 0 ? (slug ? <p class="empty">Nothing here yet. Ask the first question; there are no stupid ones.</p> : <Welcome />) :
+      {!data ? <Loading /> : data.items.length === 0 ? <Welcome /> :
         data.items.map((e) => (
           <Card key={e.id} e={e}>
-            <Meta e={e} extra={<><a href={'/t/' + e.id}>{plural(e.reply_count, 'reply', 'replies')}</a>{e.subtopics > 0 && <a href={'/t/' + e.id + '#subtopics'}>{plural(e.subtopics, 'subtopic', 'subtopics')}</a>}{!slug && e.community && <a href={'/c/' + e.community}>{e.community}</a>}</>} />
-            <a class="title" href={'/t/' + e.id}>{e.title || e.content.split('\n')[0].slice(0, 120)}</a>
+            <Meta e={e} extra={<a href={'/t/' + e.id}>{plural(e.reply_count, 'post', 'posts')} under it</a>} />
+            <a class="title" href={'/t/' + e.id}>{titleOf(e)}</a>
             <Body e={e} />
             <Needs e={e} />
             <Refs e={e} />
@@ -66,7 +56,8 @@ export function Feed({ slug = '' }) {
   );
 }
 
-function Composer({ slug }) {
+/** A new top-level topic. */
+function Composer() {
   const [title, setTitle] = useState('');
   const [body, setBody] = useState('');
   const [needs, setNeeds] = useState('');
@@ -76,7 +67,7 @@ function Composer({ slug }) {
   const submit = async () => {
     setBusy(true);
     try {
-      const a = await call('post', { community: slug, title, content: body, refs: cites.value, needs: needs.split(',').map((x) => x.trim()).filter(Boolean), accept: accept.split(',').map((x) => x.trim()).filter(Boolean) });
+      const a = await call('post', { title, content: body, refs: cites.value, needs: needs.split(',').map((x) => x.trim()).filter(Boolean), accept: accept.split(',').map((x) => x.trim()).filter(Boolean) });
       cites.value = []; setTitle(''); setBody(''); setNeeds(''); setAccept('');
       navigate('/t/' + a.id);
     } catch (e) { flash(e.message); } finally { setBusy(false); }
@@ -99,7 +90,7 @@ function Node({ e, top }) {
   return (
     <div class={top ? 'card thread-root' + (e.low_trust ? ' low' : '') : 'reply'} id={'e' + e.id} style={{ '--strand': strand(e) }}>
       <Meta e={e} />
-      {e.title && <h2 class="title big">{e.title}</h2>}
+      {e.title && (top ? <h2 class="title big">{e.title}</h2> : <a class="title" href={'/t/' + e.id}>{e.title}</a>)}
       <Body e={e} cls={e.low_trust ? 'muted' : ''} />
       <Accepts e={e} />
       <Needs e={e} />
@@ -110,60 +101,54 @@ function Node({ e, top }) {
   );
 }
 
+/** A post, with its ancestors above and everything under it. */
 export function Thread({ id }) {
   const { data, error } = useLoad(() => call('thread', { id }), [id]);
   if (error && !data) return <Err error={error} />;
   if (!data) return <Loading />;
   const r = data.root;
+  const following = info.value?.following?.includes(r.id);
+  const follow = async () => {
+    try {
+      await call(following ? 'unfollow' : 'follow', { id: r.id });
+      await refreshNode();
+      flash(following ? 'No longer following' : 'Following: this node keeps it and everything under it');
+    } catch (e) { flash(e.message); }
+  };
   return (
     <>
       <div class="bar">
-        <nav class="grow crumbs" aria-label="Enclosing topics">
-          <a class="back" href={r.community ? '/c/' + r.community : '/all'}>{r.community || 'All topics'}</a>
-          {data.topic_path.map((t) => <a key={t.id} href={'/t/' + t.id}>{t.title || short(t.id)}</a>)}
+        <nav class="grow crumbs" aria-label="Where this sits">
+          <a class="back" href="/">Topics</a>
+          {data.path.map((t) => <a key={t.id} href={'/t/' + t.id}>{t.title || short(t.id)}</a>)}
         </nav>
-        {data.thread_root && <a class="btn ghost" href={'/t/' + data.thread_root}>Whole thread</a>}
+        <button class="ghost" onClick={follow}>{following ? 'Following' : 'Follow'}</button>
+        <a class="btn ghost" href={'/search?w=' + r.id}>Search here</a>
         <a class="btn ghost" href={'/chain/' + r.id}>Follow the chain</a>
       </div>
       <Node e={r} top />
-      {r.kind === 11 && <Subtopics topic={r} items={data.subtopics} />}
       {r.needs.length > 0 && <WhoCanHelp e={r} />}
+      <Standing id={r.id} />
       {data.ref_events.length > 0 && <Related title="Builds on" items={data.ref_events} />}
       {data.quoted_by.length > 0 && <Related title="Built upon by" items={data.quoted_by} />}
     </>
   );
 }
 
-/** Topics opened under this one, and a form to open another. */
-function Subtopics({ topic, items }) {
-  const [title, setTitle] = useState('');
-  const [body, setBody] = useState('');
-  const [busy, setBusy] = useState(false);
+/** Who stands highest near this post, among those who wrote under it. */
+function Standing({ id }) {
+  const { data } = useLoad(() => call('reputation', { near: id }), [id]);
+  if (!data || data.entries.length === 0) return null;
   return (
-    <section id="subtopics">
-      <h3 class="section">Subtopics</h3>
-      {items.length === 0 && <p class="muted small">Split a part of this problem into its own topic. It stays linked here, and can grow subtopics of its own.</p>}
-      {items.map((e) => (
-        <div class="card slim" key={e.id} style={{ '--strand': strand(e) }}>
-          <div class="meta"><span class="who">{e.author_name}</span><span class="kind">{kindLabel(e)}</span>{e.subtopics > 0 && <span>{plural(e.subtopics, 'subtopic', 'subtopics')}</span>}<span>{ago(e.created_at)}</span></div>
-          <a class="title" href={'/t/' + e.id}>{e.title}</a>
-        </div>
-      ))}
-      <div class="panel compose">
-        <input value={title} onInput={(e) => setTitle(e.currentTarget.value)} placeholder="Open a subtopic: name the part you want to work on" aria-label="Subtopic title" />
-        {title && <textarea value={body} onInput={(e) => setBody(e.currentTarget.value)} placeholder="What it is about, in markdown" />}
-        {title && (
-          <div class="row"><CiteList /><button disabled={busy || !body.trim()} onClick={async () => {
-            setBusy(true);
-            try {
-              const a = await call('post', { topic: topic.id, title, content: body, refs: cites.value });
-              cites.value = []; setTitle(''); setBody('');
-              navigate('/t/' + a.id);
-            } catch (e) { flash(e.message); } finally { setBusy(false); }
-          }}>Open subtopic</button></div>
-        )}
-      </div>
-    </section>
+    <>
+      <h3 class="section">Standing here</h3>
+      <table class="rep">
+        <tbody>{data.entries.slice(0, 8).map((x) => (
+          <tr key={x.pubkey}><td><a href={'/u/' + x.pubkey}>{x.name}</a></td><td class={x.rep < 0 ? 'neg' : ''}><Meter v={x.rep} /></td><td class="muted small">{plural(x.raters, 'rater', 'raters')}</td></tr>
+        ))}</tbody>
+      </table>
+      <p class="muted small">Standing is contextual: it comes from each person's rated posts on close subjects, so an expert here may be a novice elsewhere. <a class="refs" href="/docs/reputation">How standing works</a></p>
+    </>
   );
 }
 
@@ -173,7 +158,7 @@ function Related({ title, items }) {
       <h3 class="section">{title}</h3>
       {items.map((e) => (
         <div class="card slim" key={e.id} style={{ '--strand': strand(e) }}>
-          <div class="meta"><span class="who">{e.author_name}</span><span class="kind">{kindLabel(e)}</span><span>in {e.community}</span><span>{ago(e.created_at)}</span></div>
+          <div class="meta"><span class="who">{e.author_name}</span><span class="kind">{kindLabel(e)}</span><span>{ago(e.created_at)}</span></div>
           <a class="title" href={'/t/' + e.id}>{e.title || e.content.slice(0, 140)}</a>
         </div>
       ))}
@@ -181,50 +166,38 @@ function Related({ title, items }) {
   );
 }
 
-export function Reputation({ slug }) {
-  const { data, error } = useLoad(() => call('reputation', { community: slug }), [slug]);
-  return (
-    <>
-      <div class="bar"><h2 class="grow">Standings in {slug}</h2><a class="btn ghost" href={'/c/' + slug}>Back to posts</a></div>
-      <Err error={error} />
-      {!data ? <Loading /> : data.entries.length === 0 ? <p class="empty">Nobody here has been rated yet.</p> : (
-        <table class="rep">
-          <thead><tr><th>Participant</th><th>Standing</th><th>Rated by</th></tr></thead>
-          <tbody>{data.entries.map((x) => (
-            <tr key={x.pubkey}><td><a href={'/u/' + x.pubkey}>{x.name}</a></td><td class={x.rep < 0 ? 'neg' : ''}><Meter v={x.rep} /></td><td>{x.raters}</td></tr>
-          ))}</tbody>
-        </table>
-      )}
-      <p class="muted small">Everyone starts at 0, on a scale from −1 to 1. A rating counts for as much as the rater is trusted here: trusted members' judgement carries further, and the reports of members the community distrusts barely count. <a class="refs" href="/docs/reputation">How standings work</a></p>
-    </>
-  );
-}
-
-const SCOPES = { node: 'this node', community: 'community', network: 'network' };
+const SCOPES = { node: 'this node', network: 'network' };
 
 export function Search() {
   const q = query('q');
   const scope = query('scope') || 'node';
-  const c = query('c');
+  const w = query('w');
+  const [text, setText] = useState(q);
   const go = (o) => {
-    const p = new URLSearchParams({ q, scope, c, ...o });
-    if (!p.get('c')) p.delete('c');
+    const p = new URLSearchParams({ q, scope, w, ...o });
+    if (!p.get('w')) p.delete('w');
     navigate('/search?' + p.toString());
   };
-  const { data, error } = useLoad(() => call('search', { query: q, scope, community: c, limit: 50 }), [q, scope, c]);
-  const people = useLoad(() => call('find_people', { query: q, limit: 5 }), [q]).data;
+  const within = useLoad(() => (w ? call('event', { id: w }) : Promise.resolve(null)), [w]).data;
+  const { data, error } = useLoad(() => (q ? call('search', { query: q, scope, within: w, limit: 50 }) : Promise.resolve({ items: [] })), [q, scope, w]);
+  const people = useLoad(() => (q ? call('find_people', { query: q, limit: 5 }) : Promise.resolve({ people: [] })), [q]).data;
   return (
     <>
       <div class="bar">
-        <h2 class="grow">“{q}”</h2>
+        <h2 class="grow">{q ? `“${q}”` : 'Search'}</h2>
         <div class="seg" role="group" aria-label="Where to search">
-          {Object.entries(SCOPES).map(([k, label]) => <button key={k} class={scope === k ? 'on' : ''} onClick={() => go({ scope: k })} disabled={k === 'community' && !c}>{label}</button>)}
+          {Object.entries(SCOPES).map(([k, label]) => <button key={k} class={scope === k ? 'on' : ''} onClick={() => go({ scope: k })}>{label}</button>)}
         </div>
-        <select value={c} onChange={(e) => go({ c: e.currentTarget.value, scope: e.currentTarget.value ? scope : scope === 'community' ? 'node' : scope })} aria-label="Community">
-          <option value="">all communities</option>
-          {communities.value.map((x) => <option key={x.slug} value={x.slug}>{x.name}</option>)}
-        </select>
       </div>
+      {w && (
+        <p class="small within">Only under <a href={'/t/' + w}>{within?.item ? titleOf(within.item) : short(w)}</a> <button class="link" onClick={() => go({ w: '' })}>search everywhere</button></p>
+      )}
+      {!q && (
+        <form class="panel row" onSubmit={(e) => { e.preventDefault(); go({ q: text.trim() }); }}>
+          <input value={text} onInput={(e) => setText(e.currentTarget.value)} placeholder="Words to look for" aria-label="Words to look for" />
+          <button>Search</button>
+        </form>
+      )}
       {people?.people.length > 0 && (
         <div class="people">
           {people.people.map((p) => (
@@ -235,46 +208,16 @@ export function Search() {
           ))}
         </div>
       )}
-      {scope !== 'node' && <p class="muted small">{scope === 'network' ? 'Asked peers up to three levels deep. Network search is best effort: whatever arrives in time is shown and kept on this node.' : 'Asked your peers and their peers for posts in this community.'}</p>}
+      {scope === 'network' && <p class="muted small">Asked peers up to three levels deep. Network search is best effort: whatever arrives in time is shown and kept on this node.</p>}
       <Err error={error} />
-      {!data ? <Loading /> : data.items.length === 0 ? <p class="empty">No matches{scope === 'node' ? " on this node. Try searching the community or the network." : '.'}</p> :
+      {!q ? null : !data ? <Loading /> : data.items.length === 0 ? <p class="empty">No matches{scope === 'node' ? ' on this node. Try the network.' : '.'}</p> :
         data.items.map((e) => (
           <Card key={e.id} e={e}>
-            <Meta e={e} extra={<><a href={'/c/' + e.community}>{e.community}</a>{!e.title && <a href={'/t/' + e.id}>open</a>}</>} />
+            <Meta e={e} extra={<a href={'/t/' + e.id}>open</a>} />
             {e.title && <a class="title" href={'/t/' + e.id}>{e.title}</a>}
             <Body e={e} />
             <Needs e={e} />
           </Card>
-        ))}
-    </>
-  );
-}
-
-export function FindCommunities() {
-  const q = query('q');
-  const [text, setText] = useState(q);
-  const [network, setNetwork] = useState(false);
-  const { data, error } = useLoad(() => call('find_communities', { query: q, network, limit: 50 }), [q, network]);
-  return (
-    <>
-      <div class="bar"><h2 class="grow">Find communities</h2></div>
-      <form class="panel row" onSubmit={(e) => { e.preventDefault(); navigate('/communities?q=' + encodeURIComponent(text.trim())); }}>
-        <input value={text} onInput={(e) => setText(e.currentTarget.value)} placeholder="A topic: cancer, number theory, batteries" aria-label="Topic" />
-        <label class="small nowrap"><input type="checkbox" checked={network} onChange={(e) => setNetwork(e.currentTarget.checked)} /> ask peers</label>
-        <button>Search</button>
-      </form>
-      <Err error={error} />
-      {!data ? <Loading /> : data.communities.length === 0 ? <p class="empty">No community works on that yet. Start one from the sidebar.</p> :
-        data.communities.map((x) => (
-          <div class="card slim" key={x.slug}>
-            <div class="meta">
-              <a class="who" href={'/c/' + x.slug}>{x.name}</a><code>{x.slug}</code>
-              <span>{plural(x.members, 'member', 'members')}</span><span>{plural(x.events, 'event', 'events')} kept here</span>
-              {x.joined && <span class="tag">joined</span>}
-            </div>
-            {x.about && <div class="body">{x.about}</div>}
-            {!x.joined && <div class="acts"><button class="link" onClick={async () => { try { await call('join', { community: x.slug }); refreshNode(); navigate('/c/' + x.slug); } catch (e) { flash(e.message); } }}>join</button></div>}
-          </div>
         ))}
     </>
   );
@@ -299,10 +242,19 @@ export function Profile({ pk }) {
         {p.name && <p class="small">Mention them as <code>@{p.name.replace(/[^\p{L}\p{N}_]/gu, '')}</code></p>}
         <p class="small mono muted">{data.npub}</p>
         <p class="muted small">{data.last_seen ? 'Last seen ' + (ago(data.last_seen) === 'now' ? 'just now' : ago(data.last_seen) + ' ago') : 'Not seen recently'}</p>
-        {data.reputation.length > 0 && (
-          <table class="rep"><tbody>{data.reputation.map((r) => <tr key={r.community}><td><a href={'/c/' + r.community}>{r.community}</a></td><td class={r.rep < 0 ? 'neg' : ''}><Meter v={r.rep} /></td></tr>)}</tbody></table>
-        )}
+        <p class="small">Overall standing <Meter v={data.rep} /> <span class="muted">: their standing depends on the subject; see where they stand highest below.</span></p>
       </div>
+      {data.best.length > 0 && (
+        <>
+          <h3 class="section">Where they stand highest</h3>
+          {data.best.map((e) => (
+            <div class="card slim" key={e.id} style={{ '--strand': strand(e) }}>
+              <div class="meta"><Meter v={e.score} label="accuracy" /><span>{ago(e.created_at)}</span></div>
+              <a class="title" href={'/t/' + e.id}>{titleOf(e)}</a>
+            </div>
+          ))}
+        </>
+      )}
       <CapabilityList provider={data.pubkey} self={self} />
       {self && <EditProfile p={p} />}
       {self && <NodePanel />}
@@ -365,7 +317,7 @@ function NodePanel() {
   return (
     <div class="panel">
       <h3>This node</h3>
-      <p class="small">Keeps {plural(i.events_cached, 'event', 'events')}, {i.pinned} pinned. Relaying {i.relay_all ? 'everything' : 'only joined communities'}.{i.public_addr && <> Reachable at <code>{i.public_addr}</code>.</>}</p>
+      <p class="small">Keeps {plural(i.events_cached, 'event', 'events')}, {i.pinned} pinned. Relaying {i.relay_all ? 'everything' : 'only what it follows'}.{i.public_addr && <> Reachable at <code>{i.public_addr}</code>.</>}</p>
       {data && (data.peers.length === 0 ? <p class="muted small">No peers connected. Start the node with <code>--peer ws://host:42424</code>.</p> :
         <table class="rep"><tbody>{data.peers.map((p, k) => <tr key={k}><td class="mono small">{p.addr}</td><td class="muted small">{p.outbound ? 'outbound' : 'inbound'}</td><td class="muted small">{ago(p.since)}</td></tr>)}</tbody></table>)}
     </div>

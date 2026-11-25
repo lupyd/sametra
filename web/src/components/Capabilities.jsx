@@ -24,8 +24,8 @@ export function CapabilityCard({ c, post, compact }) {
         {c.declined > 0 && <span>{c.declined} declined</span>}
       </div>
       {!compact && s.about && <div class="body">{s.about}</div>}
-      {!compact && (s.topics.length > 0 || s.communities.length > 0) && (
-        <div class="meta">{s.topics.map((t) => <span key={t} class="tag">{t}</span>)}{s.communities.map((x) => <a key={x} href={'/c/' + x}>{x}</a>)}</div>
+      {!compact && s.topics.length > 0 && (
+        <div class="meta">{s.topics.map((t) => <span key={t} class="tag">{t}</span>)}</div>
       )}
       <div class="acts"><button class="link" onClick={() => setOpen(!open)}>request</button><code>{s.id}</code></div>
       {open && <RequestBox c={c} post={post} onDone={() => setOpen(false)} />}
@@ -70,7 +70,7 @@ export function FindHelp() {
         <button>Search</button>
       </form>
       {error && <p class="err">{error.message}</p>}
-      {!data ? <p class="muted">Loading…</p> : data.capabilities.length === 0 ? <p class="empty">Nobody offers that yet. Post what you need in a community and list it under Needs; people who can help will find it.</p> :
+      {!data ? <p class="muted">Loading…</p> : data.capabilities.length === 0 ? <p class="empty">Nobody offers that yet. Post what you need and list it under Needs; people who can help will find it.</p> :
         data.capabilities.map((c) => <CapabilityCard key={c.provider + c.spec.id} c={c} />)}
     </>
   );
@@ -107,7 +107,7 @@ export function CapabilityList({ provider, self }) {
 }
 
 function CapabilityEditor() {
-  const blank = { id: '', name: '', kind: 'skill', about: '', topics: '', communities: '', input_proto: '', input_message: '' };
+  const blank = { id: '', name: '', kind: 'skill', about: '', topics: '', input_proto: '', input_message: '' };
   const [f, setF] = useState(blank);
   const set = (k) => (e) => setF({ ...f, [k]: e.currentTarget.value });
   return (
@@ -121,12 +121,11 @@ function CapabilityEditor() {
       <input name="cap-name" value={f.name} onInput={set('name')} placeholder="name" />
       <textarea value={f.about} onInput={set('about')} placeholder="What it does, limits, turnaround" />
       <input name="cap-topics" value={f.topics} onInput={set('topics')} placeholder="topics, comma separated" />
-      <input name="cap-communities" value={f.communities} onInput={set('communities')} placeholder="communities it serves, comma separated slugs" />
       {f.kind === 'tool' && <textarea class="mono" value={f.input_proto} onInput={set('input_proto')} placeholder={'input as .proto, e.g.\nsyntax = "proto3";\npackage lab;\nmessage Sample { string id = 1; double mass_mg = 2; }'} />}
       {f.kind === 'tool' && <input name="cap-message" value={f.input_message} onInput={set('input_message')} placeholder="input message, e.g. lab.Sample" />}
       <div class="row"><span class="grow" /><button disabled={!f.id || !f.name} onClick={async () => {
         try {
-          await call('set_capability', { ...f, topics: csv(f.topics), communities: csv(f.communities) });
+          await call('set_capability', { ...f, topics: csv(f.topics) });
           setF(blank);
           done('Capability published');
         } catch (e) { flash(e.message); }
@@ -141,7 +140,7 @@ export function Inbox() {
   return <InboxShell role={role} setRole={setRole}><Jobs role={role} /></InboxShell>;
 }
 
-const REASONS = { mention: 'mentioned you', reply: 'replied to you', subtopic: 'opened a subtopic under your topic', citation: 'built on your post', request: 'asked for your help' };
+const REASONS = { mention: 'mentioned you', reply: 'answered your post', citation: 'built on your post', request: 'asked for your help' };
 
 function Notifications({ openRequests }) {
   const { data, error } = useLoad(async () => { const r = await call('notifications', { limit: 100, mark_read: true }); refreshNode(); return r; }, []);
@@ -152,10 +151,10 @@ function Notifications({ openRequests }) {
     const e = n.item;
     return (
       <Card key={e.id + n.reason} e={e}>
-        <div class="meta"><span class={'who' + (n.unread ? ' unread' : '')}>{e.author_name}</span><span>{REASONS[n.reason] || n.reason}</span><span>{ago(e.created_at)}</span>{e.community && <span>in {e.community}</span>}</div>
+        <div class="meta"><span class={'who' + (n.unread ? ' unread' : '')}>{e.author_name}</span><span>{REASONS[n.reason] || n.reason}</span><span>{ago(e.created_at)}</span></div>
         {n.reason === 'request'
           ? <button class="link title" onClick={openRequests}>Open requests to me</button>
-          : <a class="title" href={'/t/' + (e.kind === 1111 && e.root ? e.root + '#e' + e.id : e.id)}>{e.title || e.content.split('\n')[0].slice(0, 120)}</a>}
+          : <a class="title" href={'/t/' + (e.parent ? e.parent + '#e' + e.id : e.id)}>{e.title || e.content.split('\n')[0].slice(0, 120)}</a>}
       </Card>
     );
   });
@@ -206,7 +205,6 @@ function JobCard({ j }) {
         <b><code>{j.capability}</code></b>
         {j.mine ? <span>to <a href={'/u/' + j.provider}>{j.provider_name}</a></span> : <span>from <a href={'/u/' + j.requester}>{j.requester_name}</a></span>}
         {j.post && <a href={'/t/' + j.post}>about {short(j.post)}</a>}
-        {j.community && <a href={'/c/' + j.community}>{j.community}</a>}
         <span>{ago(j.updated_at)}</span>
       </div>
       {j.input && <pre class="input">{j.input}</pre>}

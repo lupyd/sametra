@@ -17,7 +17,6 @@ fn tool(id: &str) -> pb::CapabilitySpec {
         input_proto: "syntax = \"proto3\"; package lab; message Sample { string sample = 1; double volume_ml = 2; }".into(),
         input_message: "lab.Sample".into(),
         topics: vec!["Proteomics".into(), "mass spectrometry".into()],
-        communities: vec!["onco".into()],
         ..Default::default()
     }
 }
@@ -42,7 +41,6 @@ async fn publish_search_and_withdraw() {
     assert!(n.err("set_capability", &bad(&|s| s.input_proto = "message {".into())).await.1.contains("input_proto:"));
     assert!(n.err("set_capability", &bad(&|s| s.input_message = "lab.Nope".into())).await.1.contains("no message 'lab.Nope'"));
     assert!(n.err("set_capability", &bad(&|s| s.input_proto = String::new())).await.1.contains("declares its input"));
-    assert!(n.err("set_capability", &bad(&|s| s.communities = vec!["Bad Slug".into()])).await.1.contains("slug"));
     n.ok::<_, pb::Ack>("set_capability", &tool("assay")).await;
     n.ok::<_, pb::Ack>("set_capability", &skill("pathology")).await;
 
@@ -60,8 +58,6 @@ async fn publish_search_and_withdraw() {
     assert_eq!((c.provider.as_str(), c.requests, c.rep), (n.node.keys.pubkey.hex().as_str(), 0, 0.0));
     let by_kind: pb::CapabilitiesResponse = n.ok("capabilities", &pb::CapabilitiesRequest { kind: "skill".into(), ..Default::default() }).await;
     assert_eq!(by_kind.capabilities[0].spec.as_ref().unwrap().id, "pathology");
-    let by_comm: pb::CapabilitiesResponse = n.ok("capabilities", &pb::CapabilitiesRequest { community: "onco".into(), ..Default::default() }).await;
-    assert_eq!(by_comm.capabilities.len(), 1);
     let by_provider: pb::CapabilitiesResponse = n.ok("capabilities", &pb::CapabilitiesRequest { provider: n.node.keys.npub(), ..Default::default() }).await;
     assert_eq!(by_provider.capabilities.len(), 2);
     let none: pb::CapabilitiesResponse = n.ok("capabilities", &find("zebrafish")).await;
@@ -102,13 +98,13 @@ async fn request_accept_deliver_and_rate() {
     assert!(cap.provider_is_agent && cap.provider_name == "Hospital lab agent");
 
     // the input is a lab.Sample: given as JSON at the edge, checked and sent as protobuf
-    let req = |input: &str| pb::JobRequest { provider: cap.provider.clone(), capability: "assay".into(), input_json: input.into(), community: "onco".into(), ..Default::default() };
+    let req = |input: &str| pb::JobRequest { provider: cap.provider.clone(), capability: "assay".into(), input_json: input.into(), ..Default::default() };
     assert!(asker.err("request", &req(r#"{"colour":2}"#)).await.1.contains("not a valid lab.Sample"));
     assert!(asker.err("request", &req("plain text")).await.1.contains("not a valid lab.Sample"));
     let raw = pb::JobRequest { input_json: String::new(), input: vec![0x0a, 0x09], ..req("") };
     assert!(asker.err("request", &raw).await.1.contains("not a valid lab.Sample"), "truncated bytes are refused too");
     assert!(asker.err("request", &pb::JobRequest { capability: "nope".into(), ..req("{}") }).await.1.contains("no capability 'nope'"));
-    let post: pb::Ack = asker.ok("post", &pb::PostRequest { needs: vec!["plasma assay".into()], ..post("onco", "Need marker X measured", "two samples") }).await;
+    let post: pb::Ack = asker.ok("post", &pb::PostRequest { needs: vec!["plasma assay".into()], ..post("Need marker X measured", "two samples") }).await;
     let job: pb::Ack = asker.ok("request", &pb::JobRequest { post: post.id.clone(), ..req(r#"{"sample":"S-17"}"#) }).await;
 
     // the lab sees it and accepts
@@ -123,7 +119,7 @@ async fn request_accept_deliver_and_rate() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let j = pending.expect("request reached the provider");
-    assert_eq!((j.status.as_str(), j.capability.as_str(), j.input.as_str(), j.post.as_str(), j.community.as_str()), ("pending", "assay", r#"{"sample":"S-17"}"#, post.id.as_str(), "onco"));
+    assert_eq!((j.status.as_str(), j.capability.as_str(), j.input.as_str(), j.post.as_str()), ("pending", "assay", r#"{"sample":"S-17"}"#, post.id.as_str()));
     // on the wire it was the encoded message: field 1, "S-17"
     assert_eq!((j.input_data.as_slice(), j.input_type.as_str()), (&b"\x0a\x04S-17"[..], "application/x-protobuf; message=lab.Sample"));
     assert!(!j.mine && j.requester == asker.node.keys.pubkey.hex());
@@ -184,8 +180,8 @@ async fn request_accept_deliver_and_rate() {
         }
         assert!(ok, "capability reputation agrees on both nodes and ignores the forgery");
     }
-    // capability reputation is not community reputation
-    let lb: pb::ReputationResponse = lab.ok("reputation", &pb::ReputationRequest { community: "onco".into(), pubkey: cap.provider.clone() }).await;
+    // capability reputation is not standing
+    let lb: pb::ReputationResponse = lab.ok("reputation", &pb::ReputationRequest { near: String::new(), pubkey: cap.provider.clone() }).await;
     assert_eq!(lb.entries[0].rep, 0.0);
 }
 

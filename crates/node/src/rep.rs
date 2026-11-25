@@ -1,59 +1,64 @@
-//! Reputation, on a scale of -1..1.
+//! Reputation, on a scale of -1..1, contextual and message first.
 //!
-//! Every participant starts at 0. A rating is a replaceable event (kind 31985)
-//! from a rater to a target participant, optionally about one specific event,
-//! with a score in -1..1. Ratings are weighted by the rater's own standing, so
-//! a 0.2 from a well-reputed member can outweigh a 1 from a distrusted one:
+//! Ratings rate messages, not people. A message's score is the weighted sum of
+//! the ratings it received (each faded by its age):
 //!
-//!   weight(r) = (rep(r) + 1)^2                 rep 1 -> 4, 0 -> 1, -1 -> 0
-//!   rep(t)    = tanh( Σ_r weight(r)·score(r,t) / SCALE )
+//!   T(m)        = Σ_r  weight(r near m) · score · decay
+//!   score(m)    = tanh(T(m) / 4)
 //!
-//! iterated to a fixed point (a small EigenTrust-like computation). When r's
-//! weight is used to rate t, t's own vote for r is excluded, so two accounts
-//! praising each other cannot bootstrap each other. A rater contributes one
-//! vote per target (the mean of all their ratings of it); self-ratings are
-//! ignored.
+//! A person has no single reputation. Their standing *near a message* comes from
+//! their own rated messages, each counted by how close it is to that message:
 //!
-//! Ratings have an aspect (`aspect` tag):
-//!  * trust (default): is it accurate? Feeds the target's community reputation
-//!    and the event's trust score.
-//!  * relevance: how useful/on-topic is this message here? Scores only the
-//!    message, never the author's reputation.
-//!  * human: is this participant really a human? Network-wide (no community);
-//!    the same fixed point, so people verified as human vouch with more weight
-//!    (see `humanity`).
-//!  * capability: did the provider deliver what their capability claims? Kept
-//!    out of community reputation entirely (see `capability_scores`).
+//!   rep(p near x) = tanh( Σ_{m by p} closeness(x, m) · T(m) / 8 )
 //!
-//! Event scores of both kinds use the same rater weighting.
+//! so someone strong in one area and weak in another is judged by the area at
+//! hand, and fields need no names: closeness decides (see [`Closeness`]; the node
+//! supplies it from embeddings, or from the post tree). A rater counts for as much
+//! as their own standing near what they rate:
+//!
+//!   weight(r near m) = (rep(r near m) + 1)²       1 -> 4, 0 -> 1, -1 -> 0
+//!
+//! computed in two passes: first every vote at weight 1, then weighted by the
+//! raters' standing from the first pass. When a rater's standing is taken from
+//! the first pass, votes the rated author gave the rater are left out, so two
+//! accounts praising each other gain nothing from it. Ratings fade with a
+//! half-life of `HALF_LIFE`, so standing reflects recent work, not old history.
+//! Cost: one pass over the ratings, plus per vote a look at the rater's own rated
+//! messages (capped at `MAX_PER_AUTHOR`).
+//!
+//! Aspects (`aspect` tag): trust (default: accurate?), relevance (useful here?
+//! scores only the message), human (is this a human? network-wide, see
+//! [`humanity`]), capability (delivered what was claimed? see [`capability_scores`]).
 
 use crate::event::*;
 use crate::store::Ev;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
-/// Weighted sum that maps to tanh(1) ≈ 0.76: eight average votes.
+/// A message's weighted sum that maps to tanh(1) ≈ 0.76: four average votes.
+const MSG_SCALE: f64 = 4.0;
+/// A person near a message: eight average votes on close messages.
+const PERSON_SCALE: f64 = 8.0;
+/// Humanity: eight average vouches.
 const SCALE: f64 = 8.0;
 /// Capability reputation saturates faster: a few satisfied requesters count.
 const CAP_SCALE: f64 = 4.0;
+/// Ratings lose half their weight in this many seconds (about six months).
+pub const HALF_LIFE: f64 = 182.0 * 86400.0;
+/// A person's most recent rated messages that count.
+pub const MAX_PER_AUTHOR: usize = 512;
 const ITERS: usize = 30;
 
-#[derive(Default, Debug)]
-pub struct RepTable {
-    pub user: HashMap<H32, f64>,
-    pub raters: HashMap<H32, usize>,
-    pub event: HashMap<H32, (f64, usize)>,
-    pub relevance: HashMap<H32, (f64, usize)>,
+/// How close two messages are, 0..1 (1: the same subject). The node supplies it.
+pub trait Closeness: Send + Sync {
+    fn closeness(&self, a: &H32, b: &H32) -> f64;
 }
 
-impl RepTable {
-    pub fn user(&self, pk: &H32) -> f64 {
-        self.user.get(pk).copied().unwrap_or(0.0)
-    }
-    pub fn event(&self, id: &H32) -> f64 {
-        self.event.get(id).map(|x| x.0).unwrap_or(0.0)
-    }
-    pub fn relevance(&self, id: &H32) -> f64 {
-        self.relevance.get(id).map(|x| x.0).unwrap_or(0.0)
+/// Everything is close: reputation without context (overall).
+pub struct Everywhere;
+impl Closeness for Everywhere {
+    fn closeness(&self, _: &H32, _: &H32) -> f64 {
+        1.0
     }
 }
 
@@ -62,8 +67,8 @@ pub fn weight(rep: f64) -> f64 {
     x * x
 }
 
-fn squash(sum: f64) -> f64 {
-    (sum / SCALE).tanh()
+pub fn decay(at: u64, now: u64) -> f64 {
+    0.5f64.powf(now.saturating_sub(at) as f64 / HALF_LIFE)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,6 +85,7 @@ pub struct Rating {
     pub event: Option<H32>,
     pub score: f64,
     pub aspect: Aspect,
+    pub at: u64,
 }
 
 pub fn parse_rating(e: &Event) -> Option<Rating> {
@@ -100,36 +106,195 @@ pub fn parse_rating(e: &Event) -> Option<Rating> {
     };
     let event = e.tag("e").and_then(H32::from_hex);
     match aspect {
-        // relevance rates a message; capability ratings cite a delivered result
-        Aspect::Relevance | Aspect::Capability(_) if event.is_none() => return None,
+        // trust and relevance rate a message; capability ratings cite a delivered result
+        Aspect::Trust | Aspect::Relevance | Aspect::Capability(_) if event.is_none() => return None,
         // humanity is about the person, never a message
         Aspect::Human if event.is_some() => return None,
         _ => {}
     }
-    Some(Rating { rater: e.pubkey, target, event, score: score.clamp(-1.0, 1.0), aspect })
+    Some(Rating { rater: e.pubkey, target, event, score: score.clamp(-1.0, 1.0), aspect, at: e.created_at })
 }
 
-/// One averaged vote per (rater, target).
-fn votes(rs: &[&Rating]) -> Vec<(H32, H32, f64)> {
-    let mut v: HashMap<(H32, H32), (f64, usize)> = HashMap::new();
-    for r in rs {
-        let e = v.entry((r.rater, r.target)).or_insert((0.0, 0));
-        e.0 += r.score;
-        e.1 += 1;
+/// One vote on a message: (rater, score · decay).
+type Vote = (H32, f64);
+
+/// Message scores and contextual standing of people.
+pub struct Model {
+    /// message -> (weighted trust sum T, raters)
+    pub(crate) event: HashMap<H32, (f64, usize)>,
+    pub(crate) relevance: HashMap<H32, (f64, usize)>,
+    /// author -> their rated messages (message, T), most recent last
+    pub(crate) by_author: HashMap<H32, Vec<(H32, f64)>>,
+    /// author -> distinct people who rated their messages
+    raters: HashMap<H32, usize>,
+    close: Arc<dyn Closeness>,
+}
+
+impl Default for Model {
+    fn default() -> Model {
+        Model { event: HashMap::new(), relevance: HashMap::new(), by_author: HashMap::new(), raters: HashMap::new(), close: Arc::new(Everywhere) }
     }
-    v.into_iter().map(|((a, b), (s, n))| (a, b, s / n as f64)).collect()
 }
 
-/// The weighted fixed point shared by community reputation and humanity.
+impl std::fmt::Debug for Model {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.debug_struct("Model").field("messages", &self.event.len()).field("people", &self.by_author.len()).finish()
+    }
+}
+
+impl Model {
+    /// The message's trust score.
+    pub fn event(&self, id: &H32) -> f64 {
+        self.event.get(id).map(|x| (x.0 / MSG_SCALE).tanh()).unwrap_or(0.0)
+    }
+    pub fn event_raters(&self, id: &H32) -> usize {
+        self.event.get(id).map(|x| x.1).unwrap_or(0)
+    }
+    pub fn relevance(&self, id: &H32) -> f64 {
+        self.relevance.get(id).map(|x| (x.0 / MSG_SCALE).tanh()).unwrap_or(0.0)
+    }
+    pub fn relevance_raters(&self, id: &H32) -> usize {
+        self.relevance.get(id).map(|x| x.1).unwrap_or(0)
+    }
+    /// A person's standing near message `at`.
+    pub fn near(&self, pk: &H32, at: &H32) -> f64 {
+        let Some(ms) = self.by_author.get(pk) else { return 0.0 };
+        let sum: f64 = ms.iter().map(|(m, t)| self.close.closeness(at, m) * t).sum();
+        (sum / PERSON_SCALE).tanh()
+    }
+    /// A person's standing over all their rated messages alike.
+    pub fn overall(&self, pk: &H32) -> f64 {
+        let sum: f64 = self.by_author.get(pk).map(|ms| ms.iter().map(|x| x.1).sum()).unwrap_or(0.0);
+        (sum / PERSON_SCALE).tanh()
+    }
+    /// How many people rated this person's messages.
+    pub fn raters(&self, pk: &H32) -> usize {
+        self.raters.get(pk).copied().unwrap_or(0)
+    }
+    /// Their best-rated messages, best first.
+    pub fn best(&self, pk: &H32, n: usize) -> Vec<H32> {
+        let mut ms = self.by_author.get(pk).cloned().unwrap_or_default();
+        ms.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        ms.into_iter().filter(|x| x.1 > 0.0).take(n).map(|x| x.0).collect()
+    }
+    /// Everyone with rated messages.
+    pub fn people(&self) -> impl Iterator<Item = &H32> {
+        self.by_author.keys()
+    }
+}
+
+/// Message scores and standing from `ratings`. `author_of` gives a message's
+/// author (ratings of messages this node does not hold, or naming the wrong
+/// author, are left out); `close` measures how close two messages are.
+pub fn compute(ratings: &[Ev], author_of: impl Fn(&H32) -> Option<H32>, close: Arc<dyn Closeness>, now: u64) -> Model {
+    // one vote per (rater, message, aspect): the mean of their ratings, faded by age
+    let mut trust: HashMap<H32, HashMap<H32, (f64, usize)>> = HashMap::new();
+    let mut rel: HashMap<H32, HashMap<H32, (f64, usize)>> = HashMap::new();
+    let mut author: HashMap<H32, H32> = HashMap::new();
+    for r in ratings.iter().filter_map(|e| parse_rating(e)) {
+        let into = match r.aspect {
+            Aspect::Trust => &mut trust,
+            Aspect::Relevance => &mut rel,
+            _ => continue,
+        };
+        let m = r.event.unwrap();
+        let Some(a) = author_of(&m).filter(|a| *a == r.target) else { continue };
+        author.insert(m, a);
+        let v = into.entry(m).or_default().entry(r.rater).or_insert((0.0, 0));
+        v.0 += r.score * decay(r.at, now);
+        v.1 += 1;
+    }
+    let mean = |m: HashMap<H32, HashMap<H32, (f64, usize)>>| -> HashMap<H32, Vec<Vote>> {
+        m.into_iter()
+            .map(|(id, votes)| {
+                let mut v: Vec<Vote> = votes.into_iter().map(|(r, (s, n))| (r, s / n as f64)).collect();
+                v.sort_by_key(|x| x.0);
+                (id, v)
+            })
+            .collect()
+    };
+    let (trust, rel) = (mean(trust), mean(rel));
+
+    // pass 1: every vote at weight 1
+    let mut by_author0: HashMap<H32, Vec<(H32, &Vec<Vote>)>> = HashMap::new();
+    for (m, votes) in &trust {
+        by_author0.entry(author[m]).or_default().push((*m, votes));
+    }
+    for ms in by_author0.values_mut() {
+        ms.sort_by_key(|x| x.0);
+        let n = ms.len();
+        ms.drain(..n.saturating_sub(MAX_PER_AUTHOR));
+    }
+    // a rater's standing near `m`, leaving out what `exclude` gave them
+    let standing0 = |rater: &H32, m: &H32, exclude: &H32| -> f64 {
+        let Some(ms) = by_author0.get(rater) else { return 0.0 };
+        let sum: f64 = ms
+            .iter()
+            .map(|(m2, votes)| {
+                let t: f64 = votes.iter().filter(|(r, _)| r != exclude).map(|x| x.1).sum();
+                close.closeness(m, m2) * t
+            })
+            .sum();
+        (sum / PERSON_SCALE).tanh()
+    };
+    // pass 2: weighted by the raters' standing near what they rate
+    let weighted = |votes: &HashMap<H32, Vec<Vote>>| -> HashMap<H32, (f64, usize)> {
+        votes
+            .iter()
+            .map(|(m, vs)| {
+                let a = author[m];
+                let t: f64 = vs.iter().map(|(r, s)| weight(standing0(r, m, &a)) * s).sum();
+                (*m, (t, vs.len()))
+            })
+            .collect()
+    };
+    let event = weighted(&trust);
+    let relevance = weighted(&rel);
+
+    let mut by_author: HashMap<H32, Vec<(H32, f64)>> = HashMap::new();
+    let mut raters: HashMap<H32, HashSet<H32>> = HashMap::new();
+    for (m, (t, _)) in &event {
+        by_author.entry(author[m]).or_default().push((*m, *t));
+        raters.entry(author[m]).or_default().extend(trust[m].iter().map(|v| v.0));
+    }
+    for ms in by_author.values_mut() {
+        ms.sort_by_key(|x| x.0);
+        let n = ms.len();
+        ms.drain(..n.saturating_sub(MAX_PER_AUTHOR));
+    }
+    Model { event, relevance, by_author, raters: raters.into_iter().map(|(k, v)| (k, v.len())).collect(), close }
+}
+
+// ---- humanity ----------------------------------------------------------------
+
+/// Network-wide per-person scores (humanity).
+#[derive(Default, Debug)]
+pub struct RepTable {
+    pub user: HashMap<H32, f64>,
+    pub raters: HashMap<H32, usize>,
+}
+
+impl RepTable {
+    pub fn user(&self, pk: &H32) -> f64 {
+        self.user.get(pk).copied().unwrap_or(0.0)
+    }
+}
+
+fn squash(sum: f64) -> f64 {
+    (sum / SCALE).tanh()
+}
+
+/// The weighted fixed point for person-level vouching: one averaged vote per
+/// (rater, target), weighted by the rater's own score, without the target's vote
+/// for the rater.
 fn fixed_point(votes: &[(H32, H32, f64)]) -> HashMap<H32, f64> {
     let mut rep: HashMap<H32, f64> = HashMap::new();
-    let mut sum: HashMap<H32, f64> = HashMap::new(); // raw weighted sums received
-    let mut contrib: HashMap<(H32, H32), f64> = HashMap::new(); // w·s each vote added last round
+    let mut sum: HashMap<H32, f64> = HashMap::new();
+    let mut contrib: HashMap<(H32, H32), f64> = HashMap::new();
     for _ in 0..ITERS {
         let mut next_sum: HashMap<H32, f64> = HashMap::new();
         let mut next_contrib = HashMap::with_capacity(votes.len());
         for (rater, target, s) in votes {
-            // rater's standing without the target's own vote for the rater
             let back = contrib.get(&(*target, *rater)).copied().unwrap_or(0.0);
             let c = weight(squash(sum.get(rater).copied().unwrap_or(0.0) - back)) * s;
             *next_sum.entry(*target).or_insert(0.0) += c;
@@ -147,52 +312,27 @@ fn fixed_point(votes: &[(H32, H32, f64)]) -> HashMap<H32, f64> {
     rep
 }
 
-fn table(votes: &[(H32, H32, f64)], rep: HashMap<H32, f64>) -> RepTable {
-    let mut t = RepTable::default();
-    for (_, target, _) in votes {
+/// Humanity: is this participant a human? Network-wide, from `human` ratings:
+/// participants others verified as human vouch with more weight, those judged
+/// to be bots with less.
+pub fn humanity(ratings: &[Ev]) -> RepTable {
+    let mut v: HashMap<(H32, H32), (f64, usize)> = HashMap::new();
+    for r in ratings.iter().filter_map(|e| parse_rating(e)).filter(|r| r.aspect == Aspect::Human) {
+        let e = v.entry((r.rater, r.target)).or_insert((0.0, 0));
+        e.0 += r.score;
+        e.1 += 1;
+    }
+    let votes: Vec<(H32, H32, f64)> = v.into_iter().map(|((a, b), (s, n))| (a, b, s / n as f64)).collect();
+    let mut t = RepTable { user: fixed_point(&votes), ..Default::default() };
+    for (_, target, _) in &votes {
         *t.raters.entry(*target).or_insert(0) += 1;
     }
-    t.user = rep;
     t
-}
-
-/// Community reputation, event trust scores and event relevance.
-pub fn compute(ratings: &[Ev]) -> RepTable {
-    let all: Vec<Rating> = ratings.iter().filter_map(|e| parse_rating(e)).collect();
-    let trust: Vec<&Rating> = all.iter().filter(|r| r.aspect == Aspect::Trust).collect();
-    let rel: Vec<&Rating> = all.iter().filter(|r| r.aspect == Aspect::Relevance).collect();
-    let v = votes(&trust);
-    let rep = fixed_point(&v);
-    let per_event = |rs: &[&Rating]| -> HashMap<H32, (f64, usize)> {
-        let mut m: HashMap<H32, (f64, usize)> = HashMap::new();
-        for r in rs.iter().filter(|r| r.event.is_some()) {
-            let a = m.entry(r.event.unwrap()).or_insert((0.0, 0));
-            a.0 += weight(rep.get(&r.rater).copied().unwrap_or(0.0)) * r.score;
-            a.1 += 1;
-        }
-        m.into_iter().map(|(k, (n, c))| (k, (squash(n), c))).collect()
-    };
-    let event = per_event(&trust);
-    let relevance = per_event(&rel);
-    RepTable { event, relevance, ..table(&v, rep) }
-}
-
-/// Humanity: is this participant a human? Network-wide, from `human` ratings,
-/// with the same weighting: participants others verified as human vouch with
-/// more weight, those judged to be bots with less.
-pub fn humanity(ratings: &[Ev]) -> RepTable {
-    let all: Vec<Rating> = ratings.iter().filter_map(|e| parse_rating(e)).filter(|r| r.aspect == Aspect::Human).collect();
-    let v = votes(&all.iter().collect::<Vec<_>>());
-    let rep = fixed_point(&v);
-    table(&v, rep)
 }
 
 /// Capability reputation: per (provider, capability id), from capability ratings
 /// that `valid` accepts (the caller checks each cites a result the provider
-/// delivered to the rater), each weighted by `weight_of(rating)` (the rater's
-/// standing where the request was made).
-/// Same squashing as community reputation but on a smaller scale, so a handful
-/// of satisfied requesters is already meaningful.
+/// delivered to the rater), each weighted by `weight_of(rating)`.
 pub fn capability_scores(ratings: &[Ev], valid: impl Fn(&Rating) -> bool, weight_of: impl Fn(&Rating) -> f64) -> HashMap<(H32, String), (f64, usize)> {
     let mut votes: HashMap<(H32, String, H32), (f64, usize, f64)> = HashMap::new();
     for r in ratings.iter().filter_map(|e| parse_rating(e)).filter(|r| matches!(r.aspect, Aspect::Capability(_))) {
@@ -218,68 +358,196 @@ pub fn capability_scores(ratings: &[Ev], valid: impl Fn(&Rating) -> bool, weight
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
 
-    fn rate(k: &Keys, target: &H32, score: f64) -> Ev {
-        Arc::new(k.sign(
-            K_RATING,
-            vec![
-                vec!["d".into(), format!("c:{}", target.hex())],
-                vec!["c".into(), "c".into()],
+    const NOW: u64 = 1_800_000_000;
+
+    /// Messages in "areas": closeness 1 within an area, `far` across.
+    struct Areas(HashMap<H32, u8>, f64);
+    impl Closeness for Areas {
+        fn closeness(&self, a: &H32, b: &H32) -> f64 {
+            if self.0.get(a) == self.0.get(b) { 1.0 } else { self.1 }
+        }
+    }
+
+    struct World {
+        authors: HashMap<H32, H32>,
+        areas: HashMap<H32, u8>,
+        ratings: Vec<Ev>,
+        n: u8,
+    }
+    impl World {
+        fn new() -> World {
+            World { authors: HashMap::new(), areas: HashMap::new(), ratings: vec![], n: 0 }
+        }
+        fn msg(&mut self, author: &Keys, area: u8) -> H32 {
+            self.n += 1;
+            let id = H32([self.n; 32]);
+            self.authors.insert(id, author.pubkey);
+            self.areas.insert(id, area);
+            id
+        }
+        fn rate(&mut self, k: &Keys, m: &H32, score: f64) {
+            self.rate_aged(k, m, score, NOW, "trust");
+        }
+        fn rate_aged(&mut self, k: &Keys, m: &H32, score: f64, at: u64, aspect: &str) {
+            let target = self.authors[m];
+            let tags = vec![
+                vec!["d".into(), format!("{}:{aspect}", m.hex())],
                 vec!["p".into(), target.hex()],
+                vec!["e".into(), m.hex()],
                 vec!["score".into(), score.to_string()],
-            ],
-            String::new(),
-        ))
+                vec!["aspect".into(), aspect.into()],
+            ];
+            self.ratings.push(Arc::new(k.sign_at(K_RATING, tags, String::new(), at)));
+        }
+        fn model(&self, far: f64) -> Model {
+            compute(&self.ratings, |m| self.authors.get(m).copied(), Arc::new(Areas(self.areas.clone(), far)), NOW)
+        }
     }
 
     #[test]
-    fn reputable_raters_count_more() {
+    fn standing_depends_on_the_area() {
+        // a physicist who is wrong about maths: strong near physics, weak near maths
+        let mut w = World::new();
+        let (phys, rater) = (Keys::generate(), Keys::generate());
+        let p: Vec<H32> = (0..4).map(|_| w.msg(&phys, 1)).collect();
+        let m: Vec<H32> = (0..4).map(|_| w.msg(&phys, 2)).collect();
+        for x in &p {
+            w.rate(&rater, x, 1.0);
+        }
+        for x in &m {
+            w.rate(&rater, x, -1.0);
+        }
+        let model = w.model(0.0);
+        assert!(model.near(&phys.pubkey, &p[0]) > 0.3, "{}", model.near(&phys.pubkey, &p[0]));
+        assert!(model.near(&phys.pubkey, &m[0]) < -0.3);
+        assert!(model.overall(&phys.pubkey).abs() < 1e-9, "overall they cancel out; in context they do not");
+        assert_eq!(model.raters(&phys.pubkey), 1);
+        assert_eq!(model.best(&phys.pubkey, 2).len(), 2);
+        assert!(model.best(&phys.pubkey, 10).iter().all(|b| p.contains(b)), "only well-rated messages are their best");
+    }
+
+    #[test]
+    fn raters_count_for_their_standing_near_what_they_rate() {
+        let mut w = World::new();
         let elders: Vec<Keys> = (0..6).map(|_| Keys::generate()).collect();
-        let (expert, shady, alice, bob) = (Keys::generate(), Keys::generate(), Keys::generate(), Keys::generate());
-        let mut rs = vec![];
-        for e in &elders {
-            rs.push(rate(e, &expert.pubkey, 1.0)); // community trusts expert
+        let (expert, crank, author) = (Keys::generate(), Keys::generate(), Keys::generate());
+        // the expert is respected in area 1; the crank is not
+        let e1 = w.msg(&expert, 1);
+        let c1 = w.msg(&crank, 1);
+        for el in &elders {
+            w.rate(el, &e1, 1.0);
+            w.rate(el, &c1, -1.0);
         }
-        for e in &elders[..4] {
-            rs.push(rate(e, &shady.pubkey, -1.0)); // and distrusts shady
-        }
-        rs.push(rate(&expert, &alice.pubkey, 0.2)); // modest praise from a trusted member
-        rs.push(rate(&shady, &bob.pubkey, 1.0)); // max praise from a distrusted one
-        let t = compute(&rs);
-        assert!(t.user(&expert.pubkey) > 0.5);
-        assert!(t.user(&alice.pubkey) > t.user(&bob.pubkey), "{} vs {}", t.user(&alice.pubkey), t.user(&bob.pubkey));
-        assert_eq!(t.user(&elders[0].pubkey), 0.0);
-        assert!(t.user.values().all(|v| (-1.0..=1.0).contains(v)));
+        let (good, bad) = (w.msg(&author, 1), w.msg(&author, 1));
+        w.rate(&expert, &good, 0.3);
+        w.rate(&crank, &bad, 1.0);
+        let model = w.model(0.0);
+        assert!(model.event(&good) > model.event(&bad), "{} vs {}", model.event(&good), model.event(&bad));
+        // in another area the expert's word is an ordinary vote
+        let other = w.msg(&author, 2);
+        w.rate(&expert, &other, 0.3);
+        let model = w.model(0.0);
+        assert!(model.event(&other) < model.event(&good));
     }
 
     #[test]
-    fn distrusted_raters_lose_influence() {
-        let honest: Vec<Keys> = (0..6).map(|_| Keys::generate()).collect();
-        let (troll, victim) = (Keys::generate(), Keys::generate());
-        let mut rs = vec![];
-        for h in &honest {
-            rs.push(rate(h, &troll.pubkey, -1.0));
-        }
-        rs.push(rate(&troll, &victim.pubkey, -1.0));
-        let t = compute(&rs);
-        assert!(t.user(&troll.pubkey) < -0.5);
-        assert!(t.user(&victim.pubkey) > -0.05, "troll's report should barely matter: {}", t.user(&victim.pubkey));
+    fn newcomers_rise_on_one_good_message() {
+        let mut w = World::new();
+        let (new, a, b) = (Keys::generate(), Keys::generate(), Keys::generate());
+        let idea = w.msg(&new, 1);
+        w.rate(&a, &idea, 1.0);
+        w.rate(&b, &idea, 1.0);
+        let model = w.model(0.1);
+        assert!(model.event(&idea) > 0.4, "a good message stands on its own: {}", model.event(&idea));
+        assert!(model.near(&new.pubkey, &idea) > 0.0);
     }
 
     #[test]
     fn mutual_admiration_does_not_snowball() {
+        let mut w = World::new();
         let (a, b) = (Keys::generate(), Keys::generate());
-        let t = compute(&[rate(&a, &b.pubkey, 1.0), rate(&b, &a.pubkey, 1.0)]);
-        let single = compute(&[rate(&a, &b.pubkey, 1.0)]);
-        assert!((t.user(&b.pubkey) - single.user(&b.pubkey)).abs() < 1e-6, "{}", t.user(&b.pubkey));
+        let (ma, mb) = (w.msg(&a, 1), w.msg(&b, 1));
+        w.rate(&a, &mb, 1.0);
+        let single = w.model(1.0).event(&mb);
+        w.rate(&b, &ma, 1.0);
+        let both = w.model(1.0).event(&mb);
+        assert!((both - single).abs() < 1e-9, "{both} vs {single}");
     }
 
-    fn raw(k: &Keys, tags: &[(&str, String)]) -> Ev {
-        Arc::new(k.sign(K_RATING, tags.iter().map(|(a, b)| vec![a.to_string(), b.clone()]).collect(), String::new()))
+    #[test]
+    fn old_ratings_fade() {
+        let mut w = World::new();
+        let (a, r) = (Keys::generate(), Keys::generate());
+        let (fresh, old) = (w.msg(&a, 1), w.msg(&a, 1));
+        w.rate_aged(&r, &fresh, 1.0, NOW, "trust");
+        w.rate_aged(&r, &old, 1.0, NOW - HALF_LIFE as u64, "trust");
+        let m = w.model(1.0);
+        let (f, o) = (m.event.get(&fresh).unwrap().0, m.event.get(&old).unwrap().0);
+        assert!((o / f - 0.5).abs() < 1e-6, "a half-life halves it: {o} vs {f}");
     }
-    fn rate_event(k: &Keys, target: &H32, ev: &H32, score: f64) -> Ev {
-        raw(k, &[("d", format!("c:{}:{}", target.hex(), ev.hex())), ("p", target.hex()), ("e", ev.hex()), ("score", score.to_string())])
+
+    #[test]
+    fn relevance_scores_messages_not_people() {
+        let mut w = World::new();
+        let (a, r) = (Keys::generate(), Keys::generate());
+        let m = w.msg(&a, 1);
+        w.rate_aged(&r, &m, 0.8, NOW, "relevance");
+        let model = w.model(1.0);
+        assert!(model.relevance(&m) > 0.0);
+        assert_eq!(model.relevance_raters(&m), 1);
+        assert_eq!(model.event(&m), 0.0);
+        assert_eq!(model.overall(&a.pubkey), 0.0, "relevance never moves standing");
+    }
+
+    #[test]
+    fn misattributed_and_unknown_messages_are_ignored() {
+        let mut w = World::new();
+        let (a, b, r) = (Keys::generate(), Keys::generate(), Keys::generate());
+        let m = w.msg(&a, 1);
+        // a rating that names the wrong author
+        let tags = vec![vec!["p".into(), b.pubkey.hex()], vec!["e".into(), m.hex()], vec!["score".into(), "1".into()]];
+        w.ratings.push(Arc::new(r.sign_at(K_RATING, tags, String::new(), NOW)));
+        // one of a message this node does not hold
+        let tags = vec![vec!["p".into(), a.pubkey.hex()], vec!["e".into(), H32([99; 32]).hex()], vec!["score".into(), "1".into()]];
+        w.ratings.push(Arc::new(r.sign_at(K_RATING, tags, String::new(), NOW)));
+        let model = w.model(1.0);
+        assert_eq!((model.overall(&a.pubkey), model.overall(&b.pubkey)), (0.0, 0.0));
+    }
+
+    #[test]
+    fn one_vote_per_rater_and_message() {
+        let mut w = World::new();
+        let (a, r) = (Keys::generate(), Keys::generate());
+        let m = w.msg(&a, 1);
+        w.rate(&r, &m, 1.0);
+        w.rate(&r, &m, 0.0);
+        let model = w.model(1.0);
+        assert_eq!(model.event_raters(&m), 1);
+        assert!((model.event.get(&m).unwrap().0 - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn bounded_and_deterministic() {
+        let mut w = World::new();
+        let ks: Vec<Keys> = (0..6).map(|_| Keys::generate()).collect();
+        let ms: Vec<H32> = ks.iter().map(|k| w.msg(k, 1)).collect();
+        for (i, k) in ks.iter().enumerate() {
+            for (j, m) in ms.iter().enumerate() {
+                if i != j {
+                    w.rate(k, m, ((i as i32 * 3 - j as i32 * 2) % 11) as f64 / 10.0);
+                }
+            }
+        }
+        let m1 = w.model(0.5);
+        w.ratings.reverse();
+        let m2 = w.model(0.5);
+        for (k, m) in ks.iter().zip(&ms) {
+            assert!((m1.near(&k.pubkey, m) - m2.near(&k.pubkey, m)).abs() < 1e-12);
+            assert!((-1.0..=1.0).contains(&m1.near(&k.pubkey, m)) && (-1.0..=1.0).contains(&m1.event(m)));
+        }
+        let empty = compute(&[], |_| None, Arc::new(Everywhere), NOW);
+        assert_eq!((empty.event(&H32([1; 32])), empty.near(&H32([1; 32]), &H32([2; 32]))), (0.0, 0.0));
     }
 
     #[test]
@@ -287,166 +555,56 @@ mod tests {
         assert_eq!(weight(1.0), 4.0);
         assert_eq!(weight(0.0), 1.0);
         assert_eq!(weight(-1.0), 0.0);
-        assert!(weight(0.5) > weight(0.4));
+    }
+
+    fn raw(k: &Keys, tags: &[(&str, String)]) -> Ev {
+        Arc::new(k.sign(K_RATING, tags.iter().map(|(a, b)| vec![a.to_string(), b.clone()]).collect(), String::new()))
     }
 
     #[test]
-    fn worked_examples_from_the_docs() {
-        // docs/reputation: one vote at each weight
-        let one = |w: f64, s: f64| squash(w * s);
-        assert!((one(1.0, 1.0) - 0.124).abs() < 1e-3, "newcomer gives 1");
-        assert!((one(4.0, 0.2) - 0.0997).abs() < 1e-3, "trusted member gives 0.2");
-        assert!((one(0.25, 1.0) - 0.0312).abs() < 1e-3, "distrusted member gives 1");
-        assert!((squash(20.0) - 0.987).abs() < 1e-3, "20 newcomers give 1");
-    }
-
-    #[test]
-    fn parse_rating_validation() {
-        let (a, b) = (Keys::generate(), Keys::generate());
-        let bp = b.pubkey.hex();
-        assert!(parse_rating(&raw(&a, &[("p", bp.clone()), ("score", "0.3".into())])).is_some());
-        assert!(parse_rating(&raw(&a, &[("p", a.pubkey.hex()), ("score", "0.3".into())])).is_none(), "self-rating");
-        assert!(parse_rating(&raw(&a, &[("p", bp.clone())])).is_none(), "no score");
-        assert!(parse_rating(&raw(&a, &[("p", bp.clone()), ("score", "NaN".into())])).is_none());
-        assert!(parse_rating(&raw(&a, &[("p", bp.clone()), ("score", "inf".into())])).is_none());
-        assert!(parse_rating(&raw(&a, &[("p", "zz".into()), ("score", "1".into())])).is_none());
-        assert!(parse_rating(&Arc::new(a.sign(K_POST, vec![vec!["p".into(), bp.clone()], vec!["score".into(), "1".into()]], String::new()))).is_none());
-        let r = parse_rating(&raw(&a, &[("p", bp.clone()), ("score", "9".into())])).unwrap();
-        assert_eq!(r.score, 1.0, "clamped");
-        assert_eq!(parse_rating(&raw(&a, &[("p", bp), ("score", "-0.25".into())])).unwrap().score, -0.25);
-    }
-
-    #[test]
-    fn empty_and_unrated() {
-        let t = compute(&[]);
-        assert!(t.user.is_empty() && t.event.is_empty());
-        assert_eq!(t.user(&H32([1; 32])), 0.0);
-        assert_eq!(t.event(&H32([1; 32])), 0.0);
-    }
-
-    #[test]
-    fn one_vote_per_rater_and_target() {
-        let (a, b) = (Keys::generate(), Keys::generate());
-        let (e1, e2) = (H32([1; 32]), H32([2; 32]));
-        // rating two of b's posts counts as one averaged vote on b
-        let twice = compute(&[rate_event(&a, &b.pubkey, &e1, 1.0), rate_event(&a, &b.pubkey, &e2, 0.0)]);
-        let once = compute(&[rate(&a, &b.pubkey, 0.5)]);
-        assert!((twice.user(&b.pubkey) - once.user(&b.pubkey)).abs() < 1e-9);
-        assert_eq!(twice.raters[&b.pubkey], 1);
-        // but each post keeps its own score
-        assert!(twice.event(&e1) > 0.0);
-        assert_eq!(twice.event(&e2), 0.0);
-        assert_eq!(twice.event[&e1].1, 1);
-    }
-
-    #[test]
-    fn more_raters_more_rep_but_bounded() {
-        let target = Keys::generate();
-        let mut prev = 0.0;
-        for n in [1, 5, 20, 200] {
-            let rs: Vec<Ev> = (0..n).map(|_| rate(&Keys::generate(), &target.pubkey, 1.0)).collect();
-            let t = compute(&rs);
-            let r = t.user(&target.pubkey);
-            assert!(r > prev && r <= 1.0, "{n} raters -> {r}");
-            assert_eq!(t.raters[&target.pubkey], n);
-            prev = r;
-        }
-        assert!(prev > 0.99);
-        let rs: Vec<Ev> = (0..200).map(|_| rate(&Keys::generate(), &target.pubkey, -1.0)).collect();
-        assert!(compute(&rs).user(&target.pubkey) >= -1.0);
-    }
-
-    #[test]
-    fn event_score_weighted_by_rater_rep() {
-        let elders: Vec<Keys> = (0..6).map(|_| Keys::generate()).collect();
-        let (trusted, distrusted, author) = (Keys::generate(), Keys::generate(), Keys::generate());
-        let mut rs = vec![];
-        for e in &elders {
-            rs.push(rate(e, &trusted.pubkey, 1.0));
-            rs.push(rate(e, &distrusted.pubkey, -1.0));
-        }
-        let (good, bad) = (H32([7; 32]), H32([8; 32]));
-        rs.push(rate_event(&trusted, &author.pubkey, &good, 0.3));
-        rs.push(rate_event(&distrusted, &author.pubkey, &bad, 1.0));
-        let t = compute(&rs);
-        assert!(t.event(&good) > t.event(&bad), "{} vs {}", t.event(&good), t.event(&bad));
-    }
-
-    fn aspect(k: &Keys, target: &H32, ev: Option<&H32>, score: f64, a: &str, cap: Option<&str>) -> Ev {
-        let mut t = vec![("d", format!("{a}:{}", target.hex())), ("p", target.hex()), ("score", score.to_string()), ("aspect", a.to_string())];
-        if let Some(e) = ev {
-            t.push(("e", e.hex()));
-        }
-        if let Some(c) = cap {
-            t.push(("capability", c.to_string()));
-        }
-        raw(k, &t)
-    }
-
-    #[test]
-    fn relevance_scores_messages_not_people() {
-        let (a, b) = (Keys::generate(), Keys::generate());
-        let post = H32([9; 32]);
-        let t = compute(&[aspect(&a, &b.pubkey, Some(&post), 0.8, "relevance", None)]);
-        assert!(t.relevance(&post) > 0.0);
-        assert_eq!(t.relevance[&post].1, 1);
-        assert_eq!(t.user(&b.pubkey), 0.0, "relevance never moves the author's reputation");
-        assert_eq!(t.event(&post), 0.0, "nor the post's trust score");
-        // weighted like trust: a distrusted rater's relevance vote counts less
-        let elders: Vec<Keys> = (0..6).map(|_| Keys::generate()).collect();
-        let (troll, good) = (Keys::generate(), Keys::generate());
-        let (p1, p2) = (H32([1; 32]), H32([2; 32]));
-        let mut rs: Vec<Ev> = elders.iter().map(|e| rate(e, &troll.pubkey, -1.0)).collect();
-        rs.extend(elders.iter().map(|e| rate(e, &good.pubkey, 1.0)));
-        rs.push(aspect(&troll, &b.pubkey, Some(&p1), 1.0, "relevance", None));
-        rs.push(aspect(&good, &b.pubkey, Some(&p2), 0.3, "relevance", None));
-        let t = compute(&rs);
-        assert!(t.relevance(&p2) > t.relevance(&p1));
-    }
-
-    #[test]
-    fn aspects_are_validated() {
+    fn ratings_are_validated() {
         let (a, b) = (Keys::generate(), Keys::generate());
         let bp = b.pubkey.hex();
         let ev = "ab".repeat(32);
-        assert!(parse_rating(&raw(&a, &[("p", bp.clone()), ("score", "1".into()), ("aspect", "vibes".into())])).is_none(), "unknown aspect");
-        assert!(parse_rating(&raw(&a, &[("p", bp.clone()), ("score", "1".into()), ("aspect", "relevance".into())])).is_none(), "relevance needs a message");
-        assert!(parse_rating(&raw(&a, &[("p", bp.clone()), ("score", "1".into()), ("aspect", "capability".into()), ("e", ev.clone())])).is_none(), "capability needs an id");
-        assert!(parse_rating(&raw(&a, &[("p", bp.clone()), ("score", "1".into()), ("aspect", "human".into()), ("e", ev)])).is_none(), "humanity rates a person, not a message");
-        assert_eq!(parse_rating(&raw(&a, &[("p", bp.clone()), ("score", "1".into()), ("aspect", "human".into())])).unwrap().aspect, Aspect::Human);
-        assert_eq!(parse_rating(&raw(&a, &[("p", bp), ("score", "1".into())])).unwrap().aspect, Aspect::Trust);
+        let ok = |t: &[(&str, String)]| parse_rating(&raw(&a, t)).is_some();
+        assert!(ok(&[("p", bp.clone()), ("e", ev.clone()), ("score", "0.3".into())]));
+        assert!(!ok(&[("p", bp.clone()), ("score", "0.3".into())]), "trust rates a message");
+        assert!(!ok(&[("p", a.pubkey.hex()), ("e", ev.clone()), ("score", "0.3".into())]), "self-rating");
+        assert!(!ok(&[("p", bp.clone()), ("e", ev.clone())]), "no score");
+        assert!(!ok(&[("p", bp.clone()), ("e", ev.clone()), ("score", "NaN".into())]));
+        assert!(!ok(&[("p", bp.clone()), ("e", ev.clone()), ("score", "1".into()), ("aspect", "vibes".into())]));
+        assert!(!ok(&[("p", bp.clone()), ("e", ev.clone()), ("score", "1".into()), ("aspect", "capability".into())]), "capability needs an id");
+        assert!(!ok(&[("p", bp.clone()), ("e", ev.clone()), ("score", "1".into()), ("aspect", "human".into())]), "humanity rates a person");
+        assert!(ok(&[("p", bp.clone()), ("score", "1".into()), ("aspect", "human".into())]));
+        let r = parse_rating(&raw(&a, &[("p", bp), ("e", ev), ("score", "9".into())])).unwrap();
+        assert_eq!(r.score, 1.0, "clamped");
+    }
+
+    fn vouch(k: &Keys, t: &Keys, s: f64) -> Ev {
+        raw(k, &[("p", t.pubkey.hex()), ("score", s.to_string()), ("aspect", "human".into())])
     }
 
     #[test]
-    fn humanity_is_vouched_and_kept_apart() {
+    fn humanity_is_vouched() {
         let verified: Vec<Keys> = (0..6).map(|_| Keys::generate()).collect();
         let (anchor, person, bot, bot_friend) = (Keys::generate(), Keys::generate(), Keys::generate(), Keys::generate());
-        let h = |k: &Keys, t: &Keys, s: f64| aspect(k, &t.pubkey, None, s, "human", None);
-        let mut rs: Vec<Ev> = verified.iter().map(|k| h(k, &anchor, 1.0)).collect(); // a well-known human
-        rs.extend(verified.iter().take(4).map(|k| h(k, &bot, -1.0))); // judged a bot
-        rs.push(h(&anchor, &person, 0.6)); // vouched for by a verified human
-        rs.push(h(&bot, &bot_friend, 1.0)); // vouched for by a judged bot
+        let mut rs: Vec<Ev> = verified.iter().map(|k| vouch(k, &anchor, 1.0)).collect();
+        rs.extend(verified.iter().take(4).map(|k| vouch(k, &bot, -1.0)));
+        rs.push(vouch(&anchor, &person, 0.6));
+        rs.push(vouch(&bot, &bot_friend, 1.0));
         let t = humanity(&rs);
         assert!(t.user(&anchor.pubkey) > 0.5);
         assert!(t.user(&bot.pubkey) < -0.3);
         assert!(t.user(&person.pubkey) > t.user(&bot_friend.pubkey), "a bot's vouch is worth little");
         assert_eq!(t.raters[&anchor.pubkey], 6);
-        assert!(compute(&rs).user.is_empty(), "humanity is not community reputation");
-        assert!(humanity(&[rate(&anchor, &person.pubkey, 1.0)]).user.is_empty(), "trust ratings are not humanity");
     }
 
     #[test]
     fn capability_scores_only_count_valid_weighted_votes() {
         let (provider, alice, bob, mallory) = (Keys::generate(), Keys::generate(), Keys::generate(), Keys::generate());
-        let res = H32([5; 32]);
-        let rs = vec![
-            aspect(&alice, &provider.pubkey, Some(&res), 0.9, "capability", Some("ms")),
-            aspect(&alice, &provider.pubkey, Some(&res), 0.7, "capability", Some("ms")), // same rater: averaged
-            aspect(&bob, &provider.pubkey, Some(&res), 0.6, "capability", Some("ms")),
-            aspect(&mallory, &provider.pubkey, Some(&res), -1.0, "capability", Some("ms")), // never got a result
-            aspect(&bob, &provider.pubkey, Some(&res), 0.4, "capability", Some("other")),
-            rate(&alice, &provider.pubkey, 1.0), // trust ratings are not capability ratings
-        ];
+        let res = H32([5; 32]).hex();
+        let cap = |k: &Keys, s: f64, c: &str| raw(k, &[("p", provider.pubkey.hex()), ("e", res.clone()), ("score", s.to_string()), ("aspect", "capability".into()), ("capability", c.into())]);
+        let rs = vec![cap(&alice, 0.9, "ms"), cap(&alice, 0.7, "ms"), cap(&bob, 0.6, "ms"), cap(&mallory, -1.0, "ms"), cap(&bob, 0.4, "other")];
         let t = capability_scores(&rs, |r| r.rater != mallory.pubkey, |_| 1.0);
         let (s, n) = t[&(provider.pubkey, "ms".to_string())];
         assert_eq!(n, 2);
@@ -454,26 +612,5 @@ mod tests {
         assert_eq!(t[&(provider.pubkey, "other".to_string())].1, 1);
         let heavy = capability_scores(&rs, |r| r.rater != mallory.pubkey, |r| if r.rater == bob.pubkey { 4.0 } else { 1.0 });
         assert!(heavy[&(provider.pubkey, "ms".to_string())].0 > s);
-        // capability ratings stay out of community reputation
-        assert!(compute(&rs[..5]).user.is_empty());
-    }
-
-    #[test]
-    fn deterministic_regardless_of_order() {
-        let ks: Vec<Keys> = (0..5).map(|_| Keys::generate()).collect();
-        let mut rs = vec![];
-        for (i, a) in ks.iter().enumerate() {
-            for (j, b) in ks.iter().enumerate() {
-                if i != j {
-                    rs.push(rate(a, &b.pubkey, ((i as i32 * 3 - j as i32 * 2) % 11) as f64 / 10.0));
-                }
-            }
-        }
-        let t1 = compute(&rs);
-        rs.reverse();
-        let t2 = compute(&rs);
-        for k in &ks {
-            assert!((t1.user(&k.pubkey) - t2.user(&k.pubkey)).abs() < 1e-4);
-        }
     }
 }

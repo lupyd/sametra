@@ -157,13 +157,14 @@ fn tools_lists_schemas() {
 #[test]
 fn call_subcommand_against_a_running_node() {
     let d = tempdir("call");
-    let (_node, port) = run_node(&d.0, 0, &["--join", "math"]);
+    let followed = "ab".repeat(32);
+    let (_node, port) = run_node(&d.0, 0, &["--follow", &followed]);
     let info = call(&d.0, port, "info", json!({})).unwrap();
-    assert_eq!(info["joined"], json!(["math"]));
-    let a = call(&d.0, port, "post", json!({"community": "math", "title": "Q", "content": "Why?"})).unwrap();
+    assert_eq!(info["following"], json!([followed]));
+    let a = call(&d.0, port, "post", json!({"title": "Q", "content": "Why?"})).unwrap();
     let id = a["id"].as_str().unwrap().to_string();
     call(&d.0, port, "post", json!({"parent": id, "content": "Because."})).unwrap();
-    let f = call(&d.0, port, "feed", json!({"community": "math"})).unwrap();
+    let f = call(&d.0, port, "feed", json!({})).unwrap();
     assert_eq!(f["items"][0]["title"], "Q");
     assert_eq!(f["items"][0]["reply_count"], 1);
     // default arguments: `call info` with no JSON
@@ -173,7 +174,7 @@ fn call_subcommand_against_a_running_node() {
     let o = cmd(&d.0).args(["call", "info"]).env("SAMETRA_API", format!("http://127.0.0.1:{port}")).output().unwrap();
     assert_eq!(out(o).0, 0);
     // errors: node-side, bad JSON, bad arguments, unknown tool, missing tool
-    assert!(call(&d.0, port, "post", json!({"community": "math", "content": " "})).unwrap_err().contains("content"));
+    assert!(call(&d.0, port, "post", json!({"content": " "})).unwrap_err().contains("content"));
     assert!(call(&d.0, port, "rate", json!({"score": "ten"})).unwrap_err().contains("bad arguments"));
     assert!(call(&d.0, port, "nope", json!({})).unwrap_err().contains("unknown tool"));
     let (code, _, stderr) = out(cmd(&d.0).args(["call", "--api", &format!("http://127.0.0.1:{port}"), "info", "{oops"]).output().unwrap());
@@ -225,9 +226,9 @@ fn mcp_stdio_server() {
     let text = |v: &Value| -> Value { serde_json::from_str(v["result"]["content"][0]["text"].as_str().unwrap()).unwrap_or(Value::Null) };
     send(tool(3, "set_profile", json!({"name": "Agent Smith", "agent": true})));
     assert_eq!(text(&recv())["ok"], true);
-    send(tool(4, "create_community", json!({"slug": "oncology"})));
-    assert_eq!(text(&recv())["community"], "oncology");
-    send(tool(5, "post", json!({"community": "oncology", "title": "Hypothesis", "content": "..."})));
+    send(tool(4, "follow", json!({"id": "ab".repeat(32)})));
+    assert_eq!(text(&recv())["ok"], true);
+    send(tool(5, "post", json!({"title": "Hypothesis", "content": "..."})));
     let id = text(&recv())["id"].as_str().unwrap().to_string();
     send(tool(6, "thread", json!({"id": id})));
     let t = text(&recv());
@@ -256,10 +257,10 @@ fn restart_keeps_events_state_and_identity() {
     let d = tempdir("restart");
     let (node, port) = run_node(&d.0, 0, &[]);
     let info = call(&d.0, port, "info", json!({})).unwrap();
-    let a = call(&d.0, port, "post", json!({"community": "bio", "title": "Persist me", "content": "x"})).unwrap();
+    let a = call(&d.0, port, "post", json!({"title": "Persist me", "content": "x"})).unwrap();
     let id = a["id"].as_str().unwrap().to_string();
     call(&d.0, port, "pin", json!({"id": id})).unwrap();
-    call(&d.0, port, "join", json!({"community": "chem"})).unwrap();
+    call(&d.0, port, "follow", json!({"id": id})).unwrap();
     call(&d.0, port, "memory_set", json!({"key": "k", "value": "v"})).unwrap();
     node.interrupt();
     for f in ["key", "state.pb", "memory.pb", "store/events.pb"] {
@@ -269,7 +270,7 @@ fn restart_keeps_events_state_and_identity() {
     let info2 = call(&d.0, port, "info", json!({})).unwrap();
     assert_eq!(info2["pubkey"], info["pubkey"]);
     assert_eq!(info2["pinned"], 1);
-    assert!(info2["joined"].as_array().unwrap().contains(&json!("chem")));
+    assert_eq!(info2["following"], json!([id]));
     let t = call(&d.0, port, "thread", json!({"id": id})).unwrap();
     assert_eq!(t["root"]["title"], "Persist me");
     assert_eq!(t["root"]["pinned"], true);
@@ -283,7 +284,7 @@ fn bootstrap_peer_and_gossip_between_processes() {
     let (_a, _) = run_node(&da.0, pa, &["--public", &format!("ws://127.0.0.1:{pa}")]);
     let (_b, _) = run_node(&db.0, pb, &["--peer", &format!("ws://127.0.0.1:{pa}"), "--threads", "1"]);
     assert!(wait(Duration::from_secs(20), || call(&db.0, pb, "info", json!({})).unwrap()["peers"] == 1), "b dialed its bootstrap peer");
-    let a = call(&da.0, pa, "post", json!({"community": "m", "title": "hello b", "content": "x"})).unwrap();
+    let a = call(&da.0, pa, "post", json!({"title": "hello b", "content": "x"})).unwrap();
     let id = a["id"].as_str().unwrap().to_string();
     assert!(wait(Duration::from_secs(10), || call(&db.0, pb, "event", json!({"id": id})).is_ok()));
     let r = call(&db.0, pb, "post", json!({"parent": id, "content": "hello a"})).unwrap();
@@ -319,7 +320,7 @@ fn tls_node_and_https_calls() {
         }
         out(c.output().unwrap())
     };
-    let (code, stdout, stderr) = call_tls("post", json!({"community": "m", "title": "t", "content": "over https"}), true);
+    let (code, stdout, stderr) = call_tls("post", json!({"title": "t", "content": "over https"}), true);
     assert_eq!(code, 0, "{stderr}");
     let id = serde_json::from_str::<Value>(&stdout).unwrap()["id"].as_str().unwrap().to_string();
     // the same port still answers plain http
@@ -467,23 +468,23 @@ fn agent_policy_limits_and_focus() {
     let (_node, port) = run_node(&d.0, 0, &[]);
     let api = format!("http://127.0.0.1:{port}");
     let data = d.0.to_str().unwrap();
-    let topic = call(&d.0, port, "post", json!({"community": "math", "title": "Focus", "content": "here"})).unwrap()["id"].as_str().unwrap().to_string();
-    let elsewhere = call(&d.0, port, "post", json!({"community": "bio", "title": "Other", "content": "there"})).unwrap()["id"].as_str().unwrap().to_string();
+    let topic = call(&d.0, port, "post", json!({"title": "Focus", "content": "here"})).unwrap()["id"].as_str().unwrap().to_string();
+    let elsewhere = call(&d.0, port, "post", json!({"title": "Other", "content": "there"})).unwrap()["id"].as_str().unwrap().to_string();
     let policy = format!("[budget]\nposts_per_day = 3\ntool_calls_per_session = 6\n[focus]\nmode = \"only\"\ntopics = [\"{topic}\"]\n");
     std::fs::write(d.0.join("agent.toml"), policy).unwrap();
     // `mcp --node` picks up DATA/agent.toml
     let r = mcp_session(&d.0, &["--node", "--api", &api, "--data", data], &[
         ("post", json!({"parent": topic, "content": "in scope"})),
-        ("post", json!({"topic": topic, "title": "Sub", "content": "a subtopic is in scope"})),
+        ("post", json!({"parent": topic, "title": "Sub", "content": "a post under it is in scope"})),
         ("post", json!({"parent": elsewhere, "content": "out of scope"})),
-        ("post", json!({"community": "bio", "title": "New", "content": "new topic elsewhere"})),
+        ("post", json!({"title": "New", "content": "new topic elsewhere"})),
         ("rate", json!({"event": elsewhere, "score": 0.5})),
         ("policy", json!({})),
         ("info", json!({})),
     ]);
     assert_eq!(r[0]["ok"], true);
     assert_eq!(r[1]["ok"], true);
-    // replies inside the subtopic are in scope too
+    // and so is everything further down
     let sub = r[1]["id"].as_str().unwrap();
     assert!(refusal(&r[2]).contains("out of scope"));
     assert!(refusal(&r[3]).contains("out of scope"));
@@ -521,14 +522,14 @@ fn agent_runs_sessions_within_budget() {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    let policy = format!("[agent]\nharness = \"command\"\ncommand = [\"{}\", \"{{prompt}}\"]\nprompt = \"Be brief.\"\n[budget]\nusd_per_day = 1.0\n[focus]\nmode = \"prefer\"\ncommunities = [\"math\"]\n", fake.display());
+    let policy = format!("[agent]\nharness = \"command\"\ncommand = [\"{}\", \"{{prompt}}\"]\nprompt = \"Be brief.\"\n[budget]\nusd_per_day = 1.0\n[focus]\nmode = \"prefer\"\ntopics = [\"{}\"]\n", fake.display(), "ab".repeat(32));
     std::fs::write(d.0.join("agent.toml"), policy).unwrap();
     let (code, _, stderr) = agent(&["--print"]);
     assert_eq!(code, 0, "{stderr}");
     let (code, _, stderr) = agent(&["--once"]);
     assert_eq!(code, 0, "{stderr}");
     let prompt = std::fs::read_to_string(d.0.join("prompt")).unwrap();
-    assert!(prompt.contains("notifications") && prompt.contains("Your priority is the communities math") && prompt.ends_with("Be brief."));
+    assert!(prompt.contains("notifications") && prompt.contains(&format!("Your priority is the topics {}", "ab".repeat(32))) && prompt.ends_with("Be brief."));
     assert!(stderr.contains("session done") && stderr.contains("input_tokens=1000 output_tokens=200 cost=$0.6000"), "{stderr}");
     assert_eq!(agent(&["--once"]).0, 0, "$0.60 of $1.00: one more session");
     let (code, _, stderr) = agent(&["--once"]);
@@ -615,7 +616,7 @@ fn files_through_kubo_move_between_nodes() {
     assert_eq!(http_get(pb, &format!("/ipfs/{cid}"), "example.org").0, 200);
     // a post linking a file carries its metadata (NIP-92 imeta), and other nodes keep the file
     let data = call(&a.0, pa, "ipfs_add", json!({"text": "x,y\n1,2", "name": "d.csv"})).unwrap()["cid"].as_str().unwrap().to_string();
-    let post = call(&a.0, pa, "post", json!({"community": "math", "title": "Data", "content": format!("see [d.csv](ipfs://{data})")})).unwrap();
+    let post = call(&a.0, pa, "post", json!({"title": "Data", "content": format!("see [d.csv](ipfs://{data})")})).unwrap();
     let raw = raw_event(&call(&a.0, pa, "event", json!({"id": post["id"]})).unwrap());
     let imeta = raw.tags.iter().find(|t| t[0] == "imeta").expect("imeta tag").clone();
     assert_eq!(imeta[1], format!("url ipfs://{data}"));

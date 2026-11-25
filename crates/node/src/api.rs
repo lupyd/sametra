@@ -10,7 +10,7 @@ use crate::event::{Event, Filter};
 use crate::node::Node;
 use crate::pb::{self, *};
 use crate::node::CapScores;
-use crate::rep::{self, Aspect, RepTable};
+use crate::rep::{self, Aspect, Model, RepTable};
 use crate::store::{Ev, Store};
 use std::sync::Arc;
 use std::time::Duration;
@@ -42,7 +42,7 @@ sametra_proto::tools!(gen_server);
 fn slug(s: &str) -> R<String> {
     let s = s.trim().to_lowercase();
     if s.is_empty() || s.len() > 64 || !s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') {
-        return Err("community slug must be 1-64 chars of a-z 0-9 - _ .".into());
+        return Err("must be 1-64 chars of a-z 0-9 - _ .".into());
     }
     Ok(s)
 }
@@ -107,9 +107,9 @@ fn name_of(st: &Store, pk: &H32) -> String {
     if n.is_empty() { npub(pk)[..14].to_string() } else { n }
 }
 
-fn view(st: &Store, rep: &RepTable, e: &Event, full: bool, cx: &Cx) -> Item {
-    let author_rep = rep.user(&e.pubkey);
-    let score = rep.event(&e.id);
+fn view(st: &Store, m: &Model, e: &Event, full: bool, cx: &Cx) -> Item {
+    let author_rep = m.near(&e.pubkey, &e.id);
+    let score = m.event(&e.id);
     let text = e.text();
     let content = if full || text.len() <= 600 {
         text.to_string()
@@ -130,29 +130,28 @@ fn view(st: &Store, rep: &RepTable, e: &Event, full: bool, cx: &Cx) -> Item {
         author_human: human_status(st, &cx.hum, &e.pubkey).into(),
         author_rep: round2(author_rep),
         score: round2(score),
-        ratings: rep.event.get(&e.id).map(|x| x.1 as u32).unwrap_or(0),
+        ratings: m.event_raters(&e.id) as u32,
         low_trust: author_rep < LOW_TRUST || score < LOW_TRUST,
-        community: e.community().unwrap_or("").into(),
         title: e.tag("title").unwrap_or("").into(),
         content,
         created_at: e.created_at,
-        parent: e.parent().filter(|_| e.kind == K_REPLY).map(|p| p.hex()).unwrap_or_default(),
+        parent: e.parent().map(|p| p.hex()).unwrap_or_default(),
         refs: e.tags_named("q").map(String::from).collect(),
         pinned: st.pinned.contains(&e.id),
         mine: e.pubkey == cx.me,
         reply_count: 0,
         replies: vec![],
-        relevance: round2(rep.relevance(&e.id)),
-        relevance_ratings: rep.relevance.get(&e.id).map(|x| x.1 as u32).unwrap_or(0),
+        relevance: round2(m.relevance(&e.id)),
+        relevance_ratings: m.relevance_raters(&e.id) as u32,
         cited_by: st.cited_by(&e.id) as u32,
         popularity: round2(st.popularity(&e.id)),
         needs: e.tags_named("need").map(String::from).collect(),
         format: if e.content_type.is_empty() { crate::body::MARKDOWN.to_string() } else { e.content_type.clone() },
         accept: e.tags_named("accept").map(String::from).collect(),
         blocks: if full && crate::body::is_markdown(&e.content_type) { crate::body::blocks(text) } else { vec![] },
-        topic: e.topic_parent().filter(|_| e.kind == K_POST).map(|p| p.hex()).unwrap_or_default(),
-        subtopics: if e.kind == K_POST { subtopics_of(st, &e.id).len() as u32 } else { 0 },
-        root: e.root().filter(|_| e.kind == K_REPLY).map(|p| p.hex()).unwrap_or_default(),
+        children: if e.kind == K_POST { st.children(&e.id).len() as u32 } else { 0 },
+        root: e.root().map(|p| p.hex()).unwrap_or_default(),
+        depth: e.ancestors().len() as u32,
         mentions: e
             .tags
             .iter()
@@ -167,20 +166,12 @@ fn view(st: &Store, rep: &RepTable, e: &Event, full: bool, cx: &Cx) -> Item {
 /// Below this (author reputation or message score) content is flagged low trust.
 pub const LOW_TRUST: f64 = -0.3;
 
-/// Feed and reply order: trust and relevance of the message, author standing
-/// (each worth up to 10 points at full strength), discussion and citations,
-/// minus a point per day of age.
-/// Topics opened under `id`, oldest first.
-fn subtopics_of(st: &Store, id: &H32) -> Vec<Ev> {
-    let mut v: Vec<Ev> = st.referencing(id).into_iter().filter(|e| e.kind == K_POST && e.topic_parent() == Some(*id)).collect();
-    v.sort_by_key(|e| (e.created_at, e.id));
-    v.dedup_by_key(|e| e.id);
-    v
-}
-
-fn rank(rep: &RepTable, e: &Event, replies: usize, cites: usize) -> f64 {
+/// Feed and reply order: trust and relevance of the message and its author's
+/// standing near it (each worth up to 10 points at full strength), discussion and
+/// citations, minus a point per day of age.
+fn rank(m: &Model, e: &Event, replies: usize, cites: usize) -> f64 {
     let age_h = now().saturating_sub(e.created_at) as f64 / 3600.0;
-    10.0 * (rep.event(&e.id) + rep.relevance(&e.id) + 0.5 * rep.user(&e.pubkey)) + (1.0 + replies as f64).ln() + 0.5 * (1.0 + cites as f64).ln() - age_h / 24.0
+    10.0 * (m.event(&e.id) + m.relevance(&e.id) + 0.5 * m.near(&e.pubkey, &e.id)) + (1.0 + replies as f64).ln() + 0.5 * (1.0 + cites as f64).ln() - age_h / 24.0
 }
 
 /// A score as it goes into a `score` tag: at most three decimals, no trailing zeros.
@@ -193,16 +184,16 @@ fn check_score(s: f64) -> R<()> {
     if s.is_finite() && (-1.0..=1.0).contains(&s) { Ok(()) } else { Err("score must be in -1..1".into()) }
 }
 
-fn tree(st: &Store, rep: &RepTable, e: &Ev, depth: usize, budget: &mut usize, cx: &Cx) -> Item {
-    let mut v = view(st, rep, e, true, cx);
+fn tree(st: &Store, m: &Model, e: &Ev, depth: usize, budget: &mut usize, cx: &Cx) -> Item {
+    let mut v = view(st, m, e, true, cx);
     let mut kids = st.children(&e.id);
-    kids.sort_by(|a, b| rank(rep, b, 0, st.cited_by(&b.id)).total_cmp(&rank(rep, a, 0, st.cited_by(&a.id))));
+    kids.sort_by(|a, b| rank(m, b, 0, st.cited_by(&b.id)).total_cmp(&rank(m, a, 0, st.cited_by(&a.id))));
     for k in kids {
         if *budget == 0 || depth > 64 {
             break;
         }
         *budget -= 1;
-        v.replies.push(tree(st, rep, &k, depth + 1, budget, cx));
+        v.replies.push(tree(st, m, &k, depth + 1, budget, cx));
     }
     v.reply_count = v.replies.iter().map(|r| 1 + r.reply_count).sum();
     v
@@ -216,10 +207,6 @@ async fn get_or_fetch(node: &Arc<Node>, id: &H32) -> Option<Ev> {
     node.remote_fetch(vec![f], Duration::from_secs(3)).await.into_iter().find(|e| e.id == *id)
 }
 
-fn c_filter(kinds: Option<Vec<u32>>, c: &str) -> Filter {
-    Filter { kinds, tags: vec![("c".into(), vec![c.to_string()])], ..Default::default() }
-}
-
 // ---- tools -----------------------------------------------------------------
 
 async fn info(node: &Arc<Node>, _: Empty) -> R<InfoResponse> {
@@ -231,7 +218,7 @@ async fn info(node: &Arc<Node>, _: Empty) -> R<InfoResponse> {
         name: name_of(&st, &node.keys.pubkey),
         events_cached: st.len() as u32,
         pinned: st.pinned.len() as u32,
-        joined: node.joined.lock().unwrap().iter().cloned().collect(),
+        following: node.following.lock().unwrap().iter().map(H32::hex).collect(),
         relay_all: node.cfg.relay_all,
         peers: node.peers.lock().unwrap().len() as u32,
         public_addr: node.cfg.public_addr.clone().unwrap_or_default(),
@@ -377,128 +364,56 @@ async fn peers(node: &Arc<Node>, _: Empty) -> R<PeersResponse> {
     Ok(PeersResponse { peers: node.peer_list() })
 }
 
-async fn communities(node: &Arc<Node>, _: Empty) -> R<CommunitiesResponse> {
-    let joined = node.joined.lock().unwrap().clone();
-    let st = node.store.lock().unwrap();
-    let mut m: std::collections::BTreeMap<String, Community> = Default::default();
-    for e in st.query(&Filter { kinds: Some(vec![K_COMMUNITY]), ..Default::default() }, 10_000) {
-        let d = e.d_tag().to_string();
-        if d.is_empty() || m.contains_key(&d) {
-            continue;
-        }
-        m.insert(
-            d.clone(),
-            Community { name: e.tag("name").unwrap_or(&d).into(), about: e.text().to_string(), creator: e.pubkey.hex(), slug: d, ..Default::default() },
-        );
-    }
-    let blank = |c: &String| Community { slug: c.clone(), name: c.clone(), ..Default::default() };
-    for (c, n) in st.communities() {
-        m.entry(c.clone()).or_insert_with(|| blank(c)).events = n as u32;
-    }
-    for c in &joined {
-        m.entry(c.clone()).or_insert_with(|| blank(c));
-    }
-    drop(st);
-    let mut v: Vec<Community> = m
-        .into_values()
-        .map(|mut x| {
-            x.joined = joined.contains(&x.slug);
-            x.members = node.members(&x.slug) as u32;
-            x
-        })
-        .collect();
-    v.sort_by(|a, b| b.joined.cmp(&a.joined).then(b.events.cmp(&a.events)));
-    Ok(CommunitiesResponse { communities: v })
-}
-
-/// Find communities by name or description, ranked by match, members and activity.
-async fn find_communities(node: &Arc<Node>, r: FindCommunitiesRequest) -> R<CommunitiesResponse> {
-    let q = r.query.trim().to_string();
-    let limit = if r.limit == 0 { 30 } else { r.limit.min(200) } as usize;
-    if r.network && !q.is_empty() {
-        let f = Filter { kinds: Some(vec![K_COMMUNITY]), search: Some(q.clone()), limit: Some(50), ..Default::default() };
-        node.remote_search(vec![f], 1).await;
-    }
-    let all = communities(node, Empty {}).await?.communities;
-    let qt: Vec<String> = tokens(&q).collect();
-    let matches: std::collections::HashMap<String, f64> = {
-        let st = node.store.lock().unwrap();
-        st.search(&q, 1000)
-            .into_iter()
-            .filter_map(|h| st.get(&h.id).filter(|e| e.kind == K_COMMUNITY).map(|e| (e.d_tag().to_string(), h.score * if h.all { 1.0 } else { 0.5 })))
-            .collect()
-    };
-    let activity = |c: &Community| (1.0 + c.members as f64 + c.events as f64 / 10.0).ln();
-    let mut v: Vec<(f64, Community)> = all
-        .into_iter()
-        .filter_map(|c| {
-            if qt.is_empty() {
-                return Some((activity(&c), c));
-            }
-            // slugs of communities nobody defined are matched by name only
-            let slug_hit = qt.iter().any(|t| c.slug.contains(t.as_str())) as u8 as f64;
-            let m = matches.get(&c.slug).copied().unwrap_or(0.0) + slug_hit;
-            (m > 0.0).then(|| (m * (1.0 + 0.3 * activity(&c)), c))
-        })
-        .collect();
-    v.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.slug.cmp(&b.1.slug)));
-    Ok(CommunitiesResponse { communities: v.into_iter().take(limit).map(|x| x.1).collect() })
-}
-
-async fn create_community(node: &Arc<Node>, r: CreateCommunityRequest) -> R<Ack> {
-    let c = slug(&r.slug)?;
-    let name = if r.name.trim().is_empty() { c.clone() } else { r.name.trim().chars().take(100).collect() };
-    let e = node.publish(K_COMMUNITY, vec![t("d", &c), t("name", name)], r.about)?;
-    node.joined.lock().unwrap().insert(c.clone());
+/// Keep a post and everything under it, and sync it from peers (scoped nodes keep
+/// only what they follow; a node that relays everything keeps it anyway).
+async fn follow(node: &Arc<Node>, r: FollowRequest) -> R<Ack> {
+    let id = hex_id(&r.id, "id")?;
+    node.following.lock().unwrap().insert(id);
     node.save_state();
-    Ok(Ack { community: c, ..ack(Some(&e.id)) })
+    let f = vec![Filter { ids: Some(vec![id.hex()]), ..Default::default() }, Filter { tags: vec![("e".into(), vec![id.hex()])], limit: Some(2000), ..Default::default() }];
+    let n = node.remote_fetch(f, Duration::from_secs(3)).await.len();
+    Ok(Ack { count: n as u32, ..ack(Some(&id)) })
 }
 
-async fn join(node: &Arc<Node>, r: CommunityRequest) -> R<Ack> {
-    let c = slug(&r.community)?;
-    node.joined.lock().unwrap().insert(c.clone());
+async fn unfollow(node: &Arc<Node>, r: FollowRequest) -> R<Ack> {
+    let id = hex_id(&r.id, "id")?;
+    node.following.lock().unwrap().remove(&id);
     node.save_state();
-    let mut f = c_filter(None, &c);
-    f.limit = Some(2000);
-    let n = node.remote_fetch(vec![f], Duration::from_secs(3)).await.len();
-    Ok(Ack { count: n as u32, community: c, ..ack(None) })
+    Ok(ack(Some(&id)))
 }
 
-async fn leave(node: &Arc<Node>, r: CommunityRequest) -> R<Ack> {
-    let c = slug(&r.community)?;
-    node.joined.lock().unwrap().remove(&c);
-    node.save_state();
-    Ok(Ack { community: c, ..ack(None) })
-}
-
+/// Top-level topics, or the posts directly under `parent`, ranked or newest first.
 async fn feed(node: &Arc<Node>, r: FeedRequest) -> R<Items> {
-    let c = match opt_slug(&r.community) {
-        Some(c) => Some(slug(c)?),
-        None => None,
-    };
+    let parent = opt_slug(&r.parent).map(|p| hex_id(p, "parent")).transpose()?;
     let limit = if r.limit == 0 { 30 } else { r.limit.min(500) } as usize;
-    let rep = node.reputation(c.as_deref().unwrap_or(""));
+    if let Some(p) = parent
+        && !node.peers.lock().unwrap().is_empty()
+    {
+        let f = Filter { tags: vec![("e".into(), vec![p.hex()])], limit: Some(2000), ..Default::default() };
+        node.remote_fetch(vec![f], Duration::from_millis(1500)).await;
+    }
+    let m = node.model();
     let cx = Cx::of(node);
     let st = node.store.lock().unwrap();
-    let f = match &c {
-        Some(c) => c_filter(Some(vec![K_POST]), c),
-        None => Filter { kinds: Some(vec![K_POST]), ..Default::default() },
+    let posts = match parent {
+        Some(p) => st.children(&p),
+        None => st.top_level(5000),
     };
-    let mut items: Vec<(f64, Item)> = st
-        .query(&f, 5000)
+    let mut items: Vec<(f64, Item)> = posts
         .iter()
-        .filter(|e| e.topic_parent().is_none()) // subtopics are listed under their topic
         .map(|e| {
             let n = st.descendant_count(&e.id, 10_000);
-            let mut v = view(&st, &rep, e, false, &cx);
+            let mut v = view(&st, &m, e, false, &cx);
             v.reply_count = n as u32;
-            (if r.sort == "new" { e.created_at as f64 } else { rank(&rep, e, n + v.subtopics as usize, v.cited_by as usize) }, v)
+            (if r.sort == "new" { e.created_at as f64 } else { rank(&m, e, n, v.cited_by as usize) }, v)
         })
         .collect();
     items.sort_by(|x, y| y.0.total_cmp(&x.0));
     Ok(Items { items: items.into_iter().take(limit).map(|x| x.1).collect() })
 }
 
+/// A post with everything under it (recursively), its ancestors, what it cites and
+/// what cites it.
 async fn thread(node: &Arc<Node>, r: IdRequest) -> R<ThreadResponse> {
     let id = hex_id(&r.id, "id")?;
     let root = get_or_fetch(node, &id).await.ok_or("event not found on this node or its peers")?;
@@ -507,34 +422,23 @@ async fn thread(node: &Arc<Node>, r: IdRequest) -> R<ThreadResponse> {
         let f = Filter { tags: vec![("e".into(), vec![id.hex()])], limit: Some(5000), ..Default::default() };
         node.remote_fetch(vec![f], Duration::from_millis(1500)).await;
     }
-    // enclosing topics: of this topic, or of the topic a reply belongs to
+    // its ancestors: the post names them all, top first
     let mut path: Vec<Ev> = vec![];
-    let mut up = if root.kind == K_REPLY { root.root() } else { root.topic_parent() };
-    if root.kind == K_REPLY && let Some(t) = up.and_then(|t| node.store.lock().unwrap().get(&t).cloned()) {
-        path.push(t.clone());
-        up = t.topic_parent();
-    }
-    while let Some(t) = up {
-        if path.len() >= 12 || path.iter().any(|p| p.id == t) {
-            break;
+    for a in root.ancestors() {
+        if let Some(e) = get_or_fetch(node, &a).await {
+            path.push(e);
         }
-        let Some(e) = get_or_fetch(node, &t).await.filter(|e| e.kind == K_POST) else { break };
-        up = e.topic_parent();
-        path.push(e);
     }
-    path.reverse();
-    let rep = node.reputation(root.community().unwrap_or(""));
+    let m = node.model();
     let cx = Cx::of(node);
     let st = node.store.lock().unwrap();
     let mut budget = 5000;
     let idh = id.hex();
     Ok(ThreadResponse {
-        root: Some(tree(&st, &rep, &root, 0, &mut budget, &cx)),
-        quoted_by: st.referencing(&id).iter().filter(|e| e.tags_named("q").any(|q| q == idh)).map(|e| view(&st, &rep, e, false, &cx)).collect(),
-        ref_events: root.tags_named("q").filter_map(H32::from_hex).filter_map(|r| st.get(&r).map(|e| view(&st, &rep, e, false, &cx))).collect(),
-        thread_root: root.root().filter(|r| *r != root.id && root.kind == K_REPLY).map(|r| r.hex()).unwrap_or_default(),
-        topic_path: path.iter().map(|e| view(&st, &rep, e, false, &cx)).collect(),
-        subtopics: subtopics_of(&st, &root.id).iter().map(|e| view(&st, &rep, e, false, &cx)).collect(),
+        root: Some(tree(&st, &m, &root, 0, &mut budget, &cx)),
+        quoted_by: st.referencing(&id).iter().filter(|e| e.tags_named("q").any(|q| q == idh)).map(|e| view(&st, &m, e, false, &cx)).collect(),
+        ref_events: root.tags_named("q").filter_map(H32::from_hex).filter_map(|r| st.get(&r).map(|e| view(&st, &m, e, false, &cx))).collect(),
+        path: path.iter().map(|e| view(&st, &m, e, false, &cx)).collect(),
     })
 }
 
@@ -542,10 +446,10 @@ async fn event(node: &Arc<Node>, r: IdRequest) -> R<EventResponse> {
     let id = hex_id(&r.id, "id")?;
     let e = get_or_fetch(node, &id).await.ok_or("event not found")?;
     node.store.lock().unwrap().bump(&id, 1.0); // viewed
-    let rep = node.reputation(e.community().unwrap_or(""));
+    let m = node.model();
     let cx = Cx::of(node);
     let st = node.store.lock().unwrap();
-    Ok(EventResponse { item: Some(view(&st, &rep, &e, true, &cx)), raw: pb::encode(&e.to_pb()) })
+    Ok(EventResponse { item: Some(view(&st, &m, &e, true, &cx)), raw: pb::encode(&e.to_pb()) })
 }
 
 /// The chain of reasoning around a post: walk up through reply parents and
@@ -557,15 +461,12 @@ async fn chain(node: &Arc<Node>, r: ChainRequest) -> R<ChainResponse> {
     let depth = if r.depth == 0 { 4 } else { r.depth.min(8) } as i32;
     const MAX_NODES: usize = 300;
     let focus = get_or_fetch(node, &id).await.ok_or("event not found on this node or its peers")?;
-    let is_step = |e: &Event| e.kind == K_POST || e.kind == K_REPLY;
-    // what a post builds on: its parent (replies) and everything it cites
+    let is_step = |e: &Event| e.kind == K_POST;
+    // what a post builds on: its parent and everything it cites
     let upstream = |e: &Event| -> Vec<(H32, &'static str)> {
         let mut v: Vec<(H32, &'static str)> = vec![];
-        if e.kind == K_REPLY && let Some(p) = e.parent() {
+        if let Some(p) = e.parent() {
             v.push((p, "reply"));
-        }
-        if e.kind == K_POST && let Some(p) = e.topic_parent() {
-            v.push((p, "subtopic"));
         }
         v.extend(e.tags_named("q").filter_map(H32::from_hex).map(|q| (q, "cites")));
         v
@@ -616,14 +517,12 @@ async fn chain(node: &Arc<Node>, r: ChainRequest) -> R<ChainResponse> {
                     if nodes.contains_key(&c.id) || nodes.len() >= MAX_NODES || !is_step(&c) {
                         continue;
                     }
-                    let rel = if c.kind == K_REPLY && c.parent() == Some(e.id) {
+                    let rel = if c.parent() == Some(e.id) {
                         "reply"
-                    } else if c.kind == K_POST && c.topic_parent() == Some(e.id) {
-                        "subtopic"
                     } else if c.tags_named("q").any(|q| q == h) {
                         "cites"
                     } else {
-                        continue; // shares the thread root but builds on something else
+                        continue; // deeper in the same tree, but builds on something else
                     };
                     nodes.insert(c.id, (c.clone(), level, rel));
                     next.push(c);
@@ -632,7 +531,7 @@ async fn chain(node: &Arc<Node>, r: ChainRequest) -> R<ChainResponse> {
             frontier = next;
         }
     }
-    let rep = node.reputation(focus.community().unwrap_or(""));
+    let m = node.model();
     let cx = Cx::of(node);
     let st = node.store.lock().unwrap();
     let mut out: Vec<ChainNode> = nodes
@@ -640,7 +539,7 @@ async fn chain(node: &Arc<Node>, r: ChainRequest) -> R<ChainResponse> {
         .map(|(e, level, _)| {
             let up: Vec<(H32, &str)> = upstream(e).into_iter().filter(|(p, _)| nodes.contains_key(p)).collect();
             ChainNode {
-                item: Some(view(&st, &rep, e, true, &cx)),
+                item: Some(view(&st, &m, e, true, &cx)),
                 builds_on: up.iter().map(|(p, _)| p.hex()).collect(),
                 level: *level,
                 // how this step joins the chain: replying to a step in it, or citing one
@@ -662,11 +561,11 @@ async fn chain(node: &Arc<Node>, r: ChainRequest) -> R<ChainResponse> {
     Ok(ChainResponse { focus: id.hex(), nodes: out, contributors })
 }
 
-/// Full-text search. `scope`: "node" (this node's cache, default), "community"
-/// (also ask peers and their peers, filtered to `community`), "network" (lossy
-/// fan-out three levels deep). Found events are cached here, then everything is ranked locally:
-/// text match x (1 + quality), where quality is relevance, trust, author
-/// standing, citations and use.
+/// Full-text search, decentralized. `scope`: "node" (this node's index, default) or
+/// "network" (peers answer from their indexes and forward the query, up to three
+/// levels; lossy). `within`: only posts under that post (or it), here and on peers.
+/// Found events are cached here, then ranked locally: text match x (1 + quality),
+/// where quality is relevance, trust, the author's standing near it, citations and use.
 async fn search(node: &Arc<Node>, r: SearchRequest) -> R<Items> {
     let q = r.query.trim().to_string();
     if q.is_empty() {
@@ -675,52 +574,40 @@ async fn search(node: &Arc<Node>, r: SearchRequest) -> R<Items> {
     if tokens(&q).next().is_none() {
         return Err("'query' needs a word of at least two letters that is not a stopword".into());
     }
-    let c = match opt_slug(&r.community) {
-        Some(c) => Some(slug(c)?),
-        None => None,
-    };
+    let within = opt_slug(&r.within).map(|w| hex_id(w, "within")).transpose()?;
     let limit = if r.limit == 0 { 20 } else { r.limit.min(200) } as usize;
     let hops = match r.scope.trim() {
         "" | "node" => None,
-        "community" if c.is_none() => return Err("scope 'community' needs 'community'".into()),
-        "community" => Some(1),
         "network" => Some(2),
-        other => return Err(format!("unknown scope '{other}': use node, community or network")),
+        other => return Err(format!("unknown scope '{other}': use node or network")),
     };
     if let Some(hops) = hops {
-        let mut f = Filter { kinds: Some(vec![K_POST, K_REPLY]), search: Some(q.clone()), limit: Some(50), ..Default::default() };
-        if let Some(c) = &c {
-            f.tags = vec![("c".into(), vec![c.clone()])];
+        let mut f = Filter { kinds: Some(vec![K_POST]), search: Some(q.clone()), limit: Some(50), ..Default::default() };
+        if let Some(w) = within {
+            f.tags = vec![("e".into(), vec![w.hex()])]; // everything under it names it
         }
         node.remote_search(vec![f], hops).await;
     }
+    let under = |e: &Event| within.is_none_or(|w| e.id == w || e.ancestors().contains(&w));
     let hits: Vec<(Ev, f64)> = {
         let st = node.store.lock().unwrap();
         st.search(&q, 2000)
             .into_iter()
             .filter_map(|h| st.get(&h.id).map(|e| (e.clone(), h.score * if h.all { 1.0 } else { 0.4 })))
-            .filter(|(e, _)| (e.kind == K_POST || e.kind == K_REPLY) && c.as_deref().is_none_or(|c| e.community() == Some(c)))
+            .filter(|(e, _)| e.kind == K_POST && under(e))
             .take(1000)
             .collect()
     };
-    let mut reps: std::collections::HashMap<String, Arc<RepTable>> = Default::default();
-    for (e, _) in &hits {
-        let cm = e.community().unwrap_or("").to_string();
-        if let std::collections::hash_map::Entry::Vacant(v) = reps.entry(cm) {
-            let t = node.reputation(v.key());
-            v.insert(t);
-        }
-    }
+    let m = node.model();
     let cx = Cx::of(node);
     let mut st = node.store.lock().unwrap();
     let mut items: Vec<(f64, Item)> = hits
         .iter()
-        .map(|(e, m)| {
-            let rep = &reps[e.community().unwrap_or("")];
-            let mut v = view(&st, rep, e, false, &cx);
+        .map(|(e, t)| {
+            let mut v = view(&st, &m, e, false, &cx);
             let quality = (v.relevance + v.score + 0.5 * v.author_rep + 0.3 * (1.0 + v.cited_by as f64).ln() + 0.2 * (1.0 + v.popularity).ln()).max(0.0);
-            let score = m * (1.0 + quality) * if v.low_trust { 0.5 } else { 1.0 };
-            v.text_match = round2(*m);
+            let score = t * (1.0 + quality) * if v.low_trust { 0.5 } else { 1.0 };
+            v.text_match = round2(*t);
             (score, v)
         })
         .collect();
@@ -739,48 +626,22 @@ async fn post(node: &Arc<Node>, r: PostRequest) -> R<Ack> {
         return Err("missing 'content'".into());
     }
     let mut tags = vec![];
-    let kind;
+    // where it sits: under a parent (naming all its ancestors), or a new top-level topic
+    let mut ancestors: Vec<H32> = vec![];
     if let Some(p) = opt_slug(&r.parent) {
         let pid = hex_id(p, "parent")?;
-        let parent = get_or_fetch(node, &pid).await.ok_or("parent event not found")?;
-        let root = if parent.kind == K_POST { pid } else { parent.root().unwrap_or(pid) };
-        // replies stay in their topic's community; independent topics have none
-        if let Some(c) = opt_slug(&r.community).or(parent.community()) {
-            tags.push(t("c", slug(c)?));
+        let parent = get_or_fetch(node, &pid).await.ok_or("parent post not found")?;
+        if parent.kind != K_POST {
+            return Err("'parent' must be a post".into());
         }
-        tags.push(vec!["e".into(), root.hex(), "".into(), "root".into()]);
-        tags.push(vec!["e".into(), pid.hex(), "".into(), "reply".into()]);
+        let pa = parent.ancestors();
+        tags.extend(ancestry_tags(&pid, &pa));
         tags.push(t("p", parent.pubkey.hex()));
-        kind = K_REPLY;
-    } else {
-        // a topic: under another topic (a subtopic, inheriting its community), in a
-        // community, or on its own
-        let parent_topic = match opt_slug(&r.topic) {
-            Some(tp) => {
-                let tid = hex_id(tp, "topic")?;
-                let topic = get_or_fetch(node, &tid).await.ok_or("topic not found")?;
-                if topic.kind != K_POST {
-                    return Err("'topic' must be a topic (a post), not a reply".into());
-                }
-                if r.title.trim().is_empty() {
-                    return Err("a subtopic needs a 'title'".into());
-                }
-                Some(topic)
-            }
-            None => None,
-        };
-        let community = opt_slug(&r.community).map(String::from).or_else(|| parent_topic.as_ref().and_then(|t| t.community().map(String::from)));
-        if let Some(c) = community {
-            tags.push(t("c", slug(&c)?));
-        }
-        if !r.title.trim().is_empty() {
-            tags.push(t("title", r.title.trim().chars().take(200).collect::<String>()));
-        }
-        if let Some(tp) = &parent_topic {
-            tags.push(vec!["e".into(), tp.id.hex(), "".into(), "topic".into()]);
-            tags.push(t("p", tp.pubkey.hex()));
-        }
-        kind = K_POST;
+        ancestors = pa;
+        ancestors.push(pid);
+    }
+    if !r.title.trim().is_empty() {
+        tags.push(t("title", r.title.trim().chars().take(200).collect::<String>()));
     }
     for x in r.refs.iter().take(50) {
         tags.push(t("q", hex_id(x, "refs")?.hex()));
@@ -815,17 +676,18 @@ async fn post(node: &Arc<Node>, r: PostRequest) -> R<Ack> {
     for pk in &mentioned {
         tags.push(vec!["p".into(), pk.hex(), "".into(), "mention".into()]);
     }
-    // NIP-32 labels, so scoped nodes can subscribe to them (`#l`): mentions, and posts
-    // written from outside the community (e.g. answering a mention), addressed to the
-    // people they reply to; both travel through every node to reach them
-    let outsider = !node.cfg.relay_all
-        && tags.iter().any(|x| x[0] == "p")
-        && tags.iter().find(|x| x[0] == "c").is_none_or(|c| !node.joined.lock().unwrap().contains(&c[1]));
+    // NIP-32 labels, so scoped nodes can subscribe to them (`#l`): mentions, and replies
+    // written outside what this node follows (e.g. answering a mention), addressed to
+    // the people they reply to; both travel through every node to reach them
+    let outsider = !node.cfg.relay_all && tags.iter().any(|x| x[0] == "p") && {
+        let f = node.following.lock().unwrap();
+        !ancestors.iter().any(|a| f.contains(a))
+    };
     if !mentioned.is_empty() || outsider {
         tags.push(t("L", "sametra"));
         tags.push(vec!["l".into(), if mentioned.is_empty() { "addressed" } else { "mention" }.into(), "sametra".into()]);
     }
-    let e = node.publish_data(kind, tags, content.into_bytes(), &content_type)?;
+    let e = node.publish_data(K_POST, tags, content.into_bytes(), &content_type)?;
     Ok(Ack { mentioned: mentioned.iter().map(npub).collect(), unresolved, ..ack(Some(&e.id)) })
 }
 
@@ -976,9 +838,8 @@ fn notification_reason(me: &H32, mine: &std::collections::HashSet<H32>, e: &Even
     }
     match e.kind {
         K_JOB if to_me(None) => Some("request"),
-        K_REPLY if e.parent().is_some_and(|p| mine.contains(&p)) => Some("reply"),
-        K_POST if e.topic_parent().is_some_and(|p| mine.contains(&p)) => Some("subtopic"),
-        K_POST | K_REPLY if e.tags_named("q").filter_map(H32::from_hex).any(|q| mine.contains(&q)) => Some("citation"),
+        K_POST if e.parent().is_some_and(|p| mine.contains(&p)) => Some("reply"),
+        K_POST if e.tags_named("q").filter_map(H32::from_hex).any(|q| mine.contains(&q)) => Some("citation"),
         _ => None,
     }
 }
@@ -986,13 +847,13 @@ fn notification_reason(me: &H32, mine: &std::collections::HashSet<H32>, e: &Even
 /// Events addressed to me newer than `since`, newest first.
 fn addressed_to_me(st: &Store, me: &H32, since: u64, cap: usize) -> Vec<(&'static str, Ev)> {
     let mine: std::collections::HashSet<H32> = st
-        .query(&Filter { authors: Some(vec![me.hex()]), kinds: Some(vec![K_POST, K_REPLY]), ..Default::default() }, usize::MAX)
+        .query(&Filter { authors: Some(vec![me.hex()]), kinds: Some(vec![K_POST]), ..Default::default() }, usize::MAX)
         .iter()
         .map(|e| e.id)
         .collect();
     let mut seen = std::collections::HashSet::new();
     let mut out = vec![];
-    // things that tag me, and things that reply to, cite or extend my posts
+    // things that tag me, and posts under or citing mine
     let mut cands: Vec<Ev> = st.query(&Filter { tags: vec![("p".into(), vec![me.hex()])], since: Some(since + 1), ..Default::default() }, usize::MAX);
     for id in &mine {
         cands.extend(st.referencing(id).into_iter().filter(|e| e.created_at > since));
@@ -1012,23 +873,18 @@ fn addressed_to_me(st: &Store, me: &H32, since: u64, cap: usize) -> Vec<(&'stati
     out
 }
 
-/// What concerns me: mentions, replies, subtopics, citations, capability requests.
+/// What concerns me: mentions, replies, citations, capability requests.
 async fn notifications(node: &Arc<Node>, r: NotificationsRequest) -> R<NotificationsResponse> {
     let limit = if r.limit == 0 { 50 } else { r.limit.min(500) } as usize;
     let read = node.notifications_read.load(std::sync::atomic::Ordering::Relaxed);
+    let m = node.model();
     let cx = Cx::of(node);
     let (out, newest) = {
         let st = node.store.lock().unwrap();
         let all = addressed_to_me(&st, &node.keys.pubkey, 0, limit);
         let unread = all.iter().filter(|(_, e)| e.created_at > read).count() as u32;
         let newest = all.iter().map(|(_, e)| e.created_at).max().unwrap_or(0);
-        let mut reps: std::collections::HashMap<String, Arc<RepTable>> = Default::default();
-        let mut list = vec![];
-        for (why, e) in &all {
-            let c = e.community().unwrap_or("").to_string();
-            let rep = reps.entry(c.clone()).or_insert_with(|| Arc::new(RepTable::default())).clone();
-            list.push(Notification { reason: why.to_string(), item: Some(view(&st, &rep, e, false, &cx)), unread: e.created_at > read });
-        }
+        let list = all.iter().map(|(why, e)| Notification { reason: why.to_string(), item: Some(view(&st, &m, e, false, &cx)), unread: e.created_at > read }).collect();
         (NotificationsResponse { notifications: list, unread }, newest)
     };
     if r.mark_read && newest > read {
@@ -1038,9 +894,9 @@ async fn notifications(node: &Arc<Node>, r: NotificationsRequest) -> R<Notificat
     Ok(out)
 }
 
-/// Rate a person or a message. Aspects: "trust" (default; accuracy, feeds the
-/// author's reputation) or "relevance" (how useful this message is here; scores
-/// only the message).
+/// Rate a message. Aspects: "trust" (default; is it accurate? feeds its author's
+/// standing near it) or "relevance" (how useful it is here; scores only the
+/// message); "human" rates a person, "capability" a delivered result.
 async fn rate(node: &Arc<Node>, r: RateRequest) -> R<Ack> {
     check_score(r.score)?;
     let aspect = match r.aspect.trim() {
@@ -1050,52 +906,50 @@ async fn rate(node: &Arc<Node>, r: RateRequest) -> R<Ack> {
         "human" => return rate_human(node, r).await,
         other => return Err(format!("unknown aspect '{other}': use trust, relevance, human or capability")),
     };
-    if aspect == "relevance" && opt_slug(&r.event).is_none() {
-        return Err("relevance rates a message: give 'event'".into());
-    }
-    let (target, ev, comm) = if let Some(eid) = opt_slug(&r.event) {
-        let id = hex_id(eid, "event")?;
-        let e = get_or_fetch(node, &id).await.ok_or("event not found")?;
-        let c = opt_slug(&r.community).or(e.community()).ok_or("community required")?.to_string();
-        (e.pubkey, Some(id), c)
-    } else {
-        let p = parse_pubkey(&r.target).ok_or("give 'event', or 'target' (pubkey/npub) + 'community'")?;
-        (p, None, r.community.clone())
-    };
+    let id = hex_id(opt_slug(&r.event).ok_or("ratings rate a message: give 'event'")?, "event")?;
+    let e = get_or_fetch(node, &id).await.ok_or("event not found")?;
+    let target = e.pubkey;
     if target == node.keys.pubkey {
         return Err("you cannot rate yourself".into());
     }
-    let c = slug(&comm)?;
-    // trust keeps the original slot layout; relevance gets its own slot per message
-    let mut d = format!("{c}:{}:{}", target.hex(), ev.map(|e| e.hex()).unwrap_or_default());
-    let mut tags = vec![t("c", &c), t("p", target.hex()), t("score", score_tag(r.score))];
+    // one slot per message and aspect: rating it again replaces the old score
+    let mut tags = vec![t("d", format!("{}:{aspect}", id.hex())), t("p", target.hex()), t("e", id.hex()), t("score", score_tag(r.score))];
     if aspect == "relevance" {
-        d.push_str(":relevance");
         tags.push(t("aspect", "relevance"));
     }
-    tags.insert(0, t("d", d));
-    if let Some(e) = ev {
-        tags.push(t("e", e.hex()));
-    }
-    let e = node.publish(K_RATING, tags, r.reason)?;
-    let table = node.reputation(&c);
-    // Ack.rep: the person's reputation for trust ratings, the message's relevance otherwise
-    let rep = if aspect == "relevance" { table.relevance(&ev.unwrap()) } else { table.user(&target) };
-    Ok(Ack { rep: round2(rep), community: c, ..ack(Some(&e.id)) })
+    let ev = node.publish(K_RATING, tags, r.reason)?;
+    let m = node.model();
+    // Ack.rep: the author's standing near the message, or the message's relevance
+    let rep = if aspect == "relevance" { m.relevance(&id) } else { m.near(&target, &id) };
+    Ok(Ack { rep: round2(rep), ..ack(Some(&ev.id)) })
 }
 
+/// Contextual standing: one person near a post (or overall), or the people who
+/// stand highest near a post, among those who wrote under it.
 async fn reputation(node: &Arc<Node>, r: ReputationRequest) -> R<ReputationResponse> {
-    let c = slug(&r.community)?;
-    let rep = node.reputation(&c);
+    let near = opt_slug(&r.near).map(|x| hex_id(x, "near")).transpose()?;
+    let m = node.model();
     let st = node.store.lock().unwrap();
-    let entry = |pk: &H32| RepEntry { pubkey: pk.hex(), name: name_of(&st, pk), rep: round2(rep.user(pk)), raters: rep.raters.get(pk).copied().unwrap_or(0) as u32 };
+    let rep_of = |pk: &H32| match &near {
+        Some(x) => m.near(pk, x),
+        None => m.overall(pk),
+    };
+    let entry = |pk: &H32| RepEntry { pubkey: pk.hex(), name: name_of(&st, pk), rep: round2(rep_of(pk)), raters: m.raters(pk) as u32 };
     if let Some(p) = opt_slug(&r.pubkey) {
         let pk = parse_pubkey(p).ok_or("bad pubkey")?;
         return Ok(ReputationResponse { entries: vec![entry(&pk)] });
     }
-    let mut v: Vec<(&H32, &f64)> = rep.user.iter().collect();
-    v.sort_by(|a, b| b.1.total_cmp(a.1));
-    Ok(ReputationResponse { entries: v.into_iter().take(200).map(|(pk, _)| entry(pk)).collect() })
+    let people: std::collections::HashSet<H32> = match &near {
+        Some(x) => {
+            let mut v: std::collections::HashSet<H32> = st.query(&Filter { kinds: Some(vec![K_POST]), tags: vec![("e".into(), vec![x.hex()])], ..Default::default() }, 50_000).iter().map(|e| e.pubkey).collect();
+            v.extend(st.get(x).map(|e| e.pubkey));
+            v
+        }
+        None => m.people().copied().collect(),
+    };
+    let mut v: Vec<(f64, H32)> = people.into_iter().map(|pk| (rep_of(&pk), pk)).filter(|(r, _)| *r != 0.0).collect();
+    v.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+    Ok(ReputationResponse { entries: v.into_iter().take(200).map(|(_, pk)| entry(&pk)).collect() })
 }
 
 async fn profile(node: &Arc<Node>, r: ProfileRequest) -> R<ProfileResponse> {
@@ -1103,21 +957,16 @@ async fn profile(node: &Arc<Node>, r: ProfileRequest) -> R<ProfileResponse> {
         Some(p) => parse_pubkey(p).ok_or("bad pubkey")?,
         None => node.keys.pubkey,
     };
-    let comms: Vec<String> = node.store.lock().unwrap().communities().map(|(c, _)| c.clone()).collect();
-    let mut reputation = vec![];
-    for c in comms {
-        let t = node.reputation(&c);
-        if t.user.contains_key(&pk) {
-            reputation.push(CommunityRep { rep: round2(t.user(&pk)), community: c });
-        }
-    }
+    let m = node.model();
+    let cx = Cx::of(node);
     let hum = node.humanity();
     let st = node.store.lock().unwrap();
     Ok(ProfileResponse {
         pubkey: pk.hex(),
         npub: npub(&pk),
         profile: Some(profile_of(&st, &pk)),
-        reputation,
+        rep: round2(m.overall(&pk)),
+        best: m.best(&pk, 5).iter().filter_map(|id| st.get(id)).map(|e| view(&st, &m, e, false, &cx)).collect(),
         last_seen: st.last_seen.get(&pk).copied().unwrap_or(0),
         humanity: round2(hum.user(&pk)),
         humanity_raters: hum.raters.get(&pk).copied().unwrap_or(0) as u32,
@@ -1202,10 +1051,10 @@ async fn delete(node: &Arc<Node>, r: IdRequest) -> R<Ack> {
 async fn fetch(node: &Arc<Node>, r: FetchRequest) -> R<Items> {
     let f = Filter::from_pb(&r.filter.ok_or("missing 'filter'")?);
     let evs = node.remote_fetch(vec![f], Duration::from_secs(4)).await;
+    let m = node.model();
     let cx = Cx::of(node);
     let st = node.store.lock().unwrap();
-    let empty = RepTable::default();
-    Ok(Items { items: evs.iter().take(500).map(|e| view(&st, &empty, e, false, &cx)).collect() })
+    Ok(Items { items: evs.iter().take(500).map(|e| view(&st, &m, e, false, &cx)).collect() })
 }
 
 async fn memory_get(node: &Arc<Node>, r: MemoryGetRequest) -> R<MemoryResponse> {
@@ -1249,7 +1098,6 @@ fn spec_of(e: &Event) -> Option<CapabilitySpec> {
     Some(CapabilitySpec {
         id: e.d_tag().to_string(),
         topics: e.tags_named("t").map(String::from).collect(),
-        communities: e.tags_named("c").map(String::from).collect(),
         delete: false,
         ..spec
     })
@@ -1323,13 +1171,13 @@ fn cap_stats(st: &Store) -> std::collections::HashMap<(H32, String), CapStats> {
 /// Capability reputation for every (provider, capability), cached until a new
 /// rating or result arrives. A rating counts only if it cites a result that
 /// provider delivered to the rater for that capability; it is weighted by the
-/// rater's reputation in the community the request was made in (1 if none).
+/// rater's standing near the post the request was about (overall if none).
 fn cap_scores(node: &Arc<Node>) -> Arc<CapScores> {
     if let Some(c) = node.cap_cache.lock().unwrap().clone() {
         return c;
     }
-    // result id -> (provider, requester, capability, community of the request)
-    type Ctx = (H32, Option<H32>, String, Option<String>);
+    // result id -> (provider, requester, capability, the post the request was about)
+    type Ctx = (H32, Option<H32>, String, Option<H32>);
     let (ratings, ctx) = {
         let st = node.store.lock().unwrap();
         let ratings: Vec<Ev> = st
@@ -1343,24 +1191,20 @@ fn cap_scores(node: &Arc<Node>) -> Arc<CapScores> {
             let Some(res) = st.get(&rid).filter(|e| e.kind == K_JOB_RESULT) else { continue };
             let req = res.tag("e").and_then(H32::from_hex).and_then(|i| st.get(&i).cloned());
             let cap = param(res, "capability").or(req.as_deref().and_then(|q| param(q, "capability"))).unwrap_or("").to_string();
-            let comm = req.as_deref().and_then(|q| q.community()).map(String::from);
-            ctx.insert(rid, (res.pubkey, res.tag("p").and_then(H32::from_hex), cap, comm));
+            let post = req.as_deref().and_then(|q| input(q, "event")).and_then(H32::from_hex);
+            ctx.insert(rid, (res.pubkey, res.tag("p").and_then(H32::from_hex), cap, post));
         }
         (ratings, ctx)
     };
-    let mut reps: std::collections::HashMap<String, Arc<RepTable>> = Default::default();
-    for (_, _, _, c) in ctx.values() {
-        if let Some(c) = c
-            && !reps.contains_key(c)
-        {
-            reps.insert(c.clone(), node.reputation(c));
-        }
-    }
+    let m = node.model();
     let ctx_of = |r: &rep::Rating| r.event.and_then(|e| ctx.get(&e));
     let table = Arc::new(rep::capability_scores(
         &ratings,
         |r| ctx_of(r).is_some_and(|(prov, req, cap, _)| *prov == r.target && *req == Some(r.rater) && r.aspect == Aspect::Capability(cap.clone())),
-        |r| ctx_of(r).and_then(|c| c.3.as_ref()).map(|c| rep::weight(reps[c].user(&r.rater))).unwrap_or(1.0),
+        |r| rep::weight(match ctx_of(r).and_then(|c| c.3) {
+            Some(post) => m.near(&r.rater, &post),
+            None => m.overall(&r.rater),
+        }),
     ));
     *node.cap_cache.lock().unwrap() = Some(table.clone());
     table
@@ -1399,9 +1243,6 @@ async fn set_capability(node: &Arc<Node>, c: CapabilitySpec) -> R<Ack> {
     for tp in c.topics.iter().map(|x| x.trim()).filter(|x| !x.is_empty()).take(20) {
         tags.push(t("t", tp.to_lowercase().chars().take(50).collect::<String>()));
     }
-    for cm in c.communities.iter().filter(|x| !x.trim().is_empty()).take(10) {
-        tags.push(t("c", slug(cm)?));
-    }
     let spec = CapabilitySpec {
         name: c.name.trim().chars().take(100).collect(),
         about: c.about.chars().take(4000).collect(),
@@ -1415,14 +1256,13 @@ async fn set_capability(node: &Arc<Node>, c: CapabilitySpec) -> R<Ack> {
     Ok(ack(Some(&e.id)))
 }
 
-/// Find capabilities: by need (free text), provider, community or kind.
+/// Find capabilities: by need (free text), provider or kind.
 async fn capabilities(node: &Arc<Node>, r: CapabilitiesRequest) -> R<CapabilitiesResponse> {
     let q = r.query.trim().to_string();
     let provider = match opt_slug(&r.provider) {
         Some(p) => Some(parse_pubkey(p).ok_or("bad 'provider' pubkey")?),
         None => None,
     };
-    let community = opt_slug(&r.community).map(slug).transpose()?;
     let limit = if r.limit == 0 { 30 } else { r.limit.min(200) } as usize;
     if r.network {
         if !q.is_empty() {
@@ -1445,7 +1285,6 @@ async fn capabilities(node: &Arc<Node>, r: CapabilitiesRequest) -> R<Capabilitie
     for e in st.query(&Filter { kinds: Some(vec![K_CAPABILITY]), ..Default::default() }, usize::MAX) {
         let Some(spec) = spec_of(&e) else { continue };
         if provider.is_some_and(|p| p != e.pubkey)
-            || community.as_ref().is_some_and(|c| !spec.communities.contains(c))
             || (!r.kind.trim().is_empty() && spec.kind != r.kind.trim())
         {
             continue;
@@ -1521,17 +1360,10 @@ async fn request(node: &Arc<Node>, r: JobRequest) -> R<Ack> {
         return Err("the input is limited to 32 KiB".into());
     }
     let mut tags = vec![t("p", provider.hex()), vec!["param".into(), "capability".into(), cap.clone()]];
-    let mut community = opt_slug(&r.community).map(slug).transpose()?;
     if let Some(p) = opt_slug(&r.post) {
         let pid = hex_id(p, "post")?;
-        let post = get_or_fetch(node, &pid).await.ok_or("'post' not found")?;
-        if community.is_none() {
-            community = post.community().map(String::from);
-        }
+        get_or_fetch(node, &pid).await.ok_or("'post' not found")?;
         tags.push(vec!["i".into(), pid.hex(), "event".into()]);
-    }
-    if let Some(c) = community {
-        tags.push(t("c", c));
     }
     let e = node.publish_data(K_JOB, tags, content, &content_type)?;
     Ok(ack(Some(&e.id)))
@@ -1591,7 +1423,6 @@ async fn inbox(node: &Arc<Node>, r: InboxRequest) -> R<JobsResponse> {
             input_data: req.content.clone(),
             input_type: req.content_type.clone(),
             post: input(&req, "event").unwrap_or("").into(),
-            community: req.community().unwrap_or("").into(),
             created_at: req.created_at,
             status: j.status.into(),
             status_text: j.text,
@@ -1639,9 +1470,6 @@ async fn respond(node: &Arc<Node>, r: RespondRequest) -> R<Ack> {
             if let Some(cap) = param(&req, "capability") {
                 tags.push(vec!["param".into(), "capability".into(), cap.into()]);
             }
-            if let Some(c) = req.community() {
-                tags.push(t("c", c));
-            }
             node.publish_data(K_JOB_RESULT, tags, content, &ctype)?
         }
         other => return Err(format!("unknown action '{other}': use accept, decline, result or error")),
@@ -1649,7 +1477,7 @@ async fn respond(node: &Arc<Node>, r: RespondRequest) -> R<Ack> {
     Ok(ack(Some(&e.id)))
 }
 
-/// Vouch (or not) that a participant is a human: network-wide, not per community.
+/// Vouch (or not) that a participant is a human: network-wide.
 async fn rate_human(node: &Arc<Node>, r: RateRequest) -> R<Ack> {
     if opt_slug(&r.event).is_some() {
         return Err("humanity rates a person: give 'target', not 'event'".into());
@@ -1758,10 +1586,10 @@ mod tests {
 
     #[test]
     fn write_tools_are_marked() {
-        for w in ["create_community", "join", "leave", "post", "rate", "set_profile", "pin", "unpin", "delete", "fetch", "memory_get", "memory_set"] {
+        for w in ["follow", "unfollow", "post", "rate", "set_profile", "pin", "unpin", "delete", "fetch", "memory_get", "memory_set"] {
             assert!(is_write(w), "{w}");
         }
-        for r in ["info", "communities", "feed", "thread", "event", "search", "reputation", "profile", "peers", "nope"] {
+        for r in ["info", "feed", "thread", "event", "search", "reputation", "profile", "peers", "nope"] {
             assert!(!is_write(r), "{r}");
         }
     }
@@ -1782,21 +1610,24 @@ mod tests {
         let n = node();
         let k = Keys::generate();
         let body = "é".repeat(400); // 800 bytes, 2 per char
-        let e = k.sign(K_POST, vec![t("c", "m"), t("title", "T"), t("q", "ab".repeat(32))], body.clone());
+        let e = k.sign(K_POST, vec![t("title", "T"), t("q", "ab".repeat(32))], body.clone());
         let st = n.store.lock().unwrap();
-        let short = view(&st, &RepTable::default(), &e, false, &test_cx(&n));
+        let none = Model::default();
+        let short = view(&st, &none, &e, false, &test_cx(&n));
         assert!(short.content.ends_with('…') && short.content.len() <= 603);
-        assert_eq!(view(&st, &RepTable::default(), &e, true, &test_cx(&n)).content, body);
-        assert_eq!((short.title.as_str(), short.community.as_str(), short.refs.len()), ("T", "m", 1));
-        assert!(!short.mine && !short.low_trust && short.parent.is_empty());
+        assert_eq!(view(&st, &none, &e, true, &test_cx(&n)).content, body);
+        assert_eq!((short.title.as_str(), short.refs.len(), short.depth), ("T", 1, 0));
+        assert!(!short.mine && !short.low_trust && short.parent.is_empty() && short.root.is_empty());
         assert!(short.author_name.starts_with("npub1"), "falls back to a short npub");
-        let mut rep = RepTable::default();
-        rep.user.insert(k.pubkey, -0.4);
-        assert!(view(&st, &rep, &e, false, &test_cx(&n)).low_trust);
-        let mut rep = RepTable::default();
-        rep.event.insert(e.id, (-0.5, 3));
-        let v = view(&st, &rep, &e, false, &test_cx(&n));
-        assert!(v.low_trust && v.ratings == 3 && v.score == -0.5);
+        // an author standing low near this post
+        let mut m = Model::default();
+        m.by_author.insert(k.pubkey, vec![(e.id, -4.0)]);
+        assert!(view(&st, &m, &e, false, &test_cx(&n)).low_trust);
+        // a post rated down
+        let mut m = Model::default();
+        m.event.insert(e.id, (-2.0, 3));
+        let v = view(&st, &m, &e, false, &test_cx(&n));
+        assert!(v.low_trust && v.ratings == 3 && v.score < -0.3);
     }
 
     #[test]
@@ -1804,15 +1635,15 @@ mod tests {
         let k = Keys::generate();
         let fresh = k.sign(K_POST, vec![], "a".into());
         let old = k.sign_at(K_POST, vec![], "b".into(), now() - 3 * 86400);
-        let rep = RepTable::default();
+        let rep = Model::default();
         assert!(rank(&rep, &fresh, 0, 0) > rank(&rep, &old, 0, 0));
         assert!(rank(&rep, &fresh, 10, 0) > rank(&rep, &fresh, 0, 0));
-        let mut good = RepTable::default();
-        good.user.insert(k.pubkey, 0.8);
+        let mut good = Model::default();
+        good.by_author.insert(k.pubkey, vec![(fresh.id, 6.0)]);
         assert!(rank(&good, &fresh, 0, 0) > rank(&rep, &fresh, 0, 0));
         assert!(rank(&rep, &fresh, 0, 5) > rank(&rep, &fresh, 0, 0), "citations lift");
-        let mut relevant = RepTable::default();
-        relevant.relevance.insert(fresh.id, (0.4, 2));
+        let mut relevant = Model::default();
+        relevant.relevance.insert(fresh.id, (1.6, 2));
         assert!(rank(&relevant, &fresh, 0, 0) > rank(&rep, &fresh, 0, 0), "relevance lifts");
     }
 

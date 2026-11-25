@@ -1,5 +1,5 @@
-//! Full-text index over this node's cache: posts, replies, community
-//! definitions and capability announcements.
+//! Full-text index over this node's cache: posts (at any depth), profiles
+//! and capability announcements.
 //!
 //! An inverted index from token to compact document numbers. Removal is lazy
 //! (a tombstoned slot); the index rebuilds itself once half of it is dead.
@@ -12,7 +12,7 @@ use std::collections::HashMap;
 
 /// Kinds worth searching.
 pub fn indexed(kind: u32) -> bool {
-    matches!(kind, K_POST | K_REPLY | K_COMMUNITY | K_CAPABILITY | K_PROFILE | K_FILE)
+    matches!(kind, K_POST | K_CAPABILITY | K_PROFILE | K_FILE)
 }
 
 /// Cap on distinct tokens indexed per event (bounds memory for huge posts).
@@ -172,11 +172,11 @@ mod tests {
         ix.add(&k.sign(K_RATING, vec![vec!["d".into(), "marker".into()]], "marker".into()));
         assert!(ix.is_empty());
         let cap = k.sign(K_CAPABILITY, vec![vec!["d".into(), "ms".into()], vec!["t".into(), "proteomics".into()]], r#"{"name":"Mass spec"}"#.into());
-        let comm = k.sign(K_COMMUNITY, vec![vec!["d".into(), "oncology".into()], vec!["name".into(), "Oncology".into()]], "tumour biology".into());
+        let file = k.sign(K_FILE, vec![vec!["alt".into(), "tumour biology.csv".into()]], "cohort counts".into());
         ix.add(&cap);
-        ix.add(&comm);
+        ix.add(&file);
         assert_eq!(ix.search("proteomics", 5)[0].id, cap.id);
-        assert_eq!(ix.search("tumour", 5)[0].id, comm.id);
+        assert_eq!(ix.search("tumour", 5)[0].id, file.id);
         ix.remove(&cap.id);
         ix.remove(&cap.id);
         assert!(ix.search("proteomics", 5).is_empty());

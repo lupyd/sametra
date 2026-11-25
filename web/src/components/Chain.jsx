@@ -7,7 +7,7 @@ import { Meta, Needs } from './Item.jsx';
 import { Body } from './Body.jsx';
 import { useLoad } from './hooks.js';
 
-const JOINS = { reply: 'replies to', cites: 'builds on', subtopic: 'is a subtopic of' };
+const JOINS = { reply: 'answers', cites: 'builds on' };
 
 export function Chain({ id }) {
   const { data, error } = useLoad(() => call('chain', { id, depth: 6 }), [id]);
@@ -43,7 +43,7 @@ export function Chain({ id }) {
                   {n.builds_on.map((b, k) => <span key={b}>{k > 0 && ', '}<a href={'#s' + b}>{label(b)}</a></span>)}
                 </div>
               )}
-              <Meta e={e} extra={<><span>in {e.community}</span><a href={'/t/' + e.id}>open</a></>} />
+              <Meta e={e} extra={<a href={'/t/' + e.id}>open</a>} />
               {e.title && <a class="title" href={'/t/' + e.id}>{e.title}</a>}
               <Body e={e} />
               <Needs e={e} />

@@ -56,19 +56,14 @@ impl Sametra {
     }
 }
 
-/// The topics, threads and communities around an event.
-fn place(client: &Client, id: &str) -> Result<(Vec<String>, Vec<String>), String> {
+/// A post and every post above it.
+fn place(client: &Client, id: &str) -> Result<Vec<String>, String> {
     let t = client.call_json("thread", json!({"id": id}))?;
     let s = |v: &Value| v.as_str().unwrap_or("").to_string();
-    let root = &t["root"];
-    let mut ids = vec![s(&root["id"]), s(&root["root"]), s(&root["topic"]), s(&t["thread_root"])];
-    let mut communities = vec![s(&root["community"])];
-    for p in t["topic_path"].as_array().into_iter().flatten() {
-        ids.push(s(&p["id"]));
-        communities.push(s(&p["community"]));
-    }
+    let mut ids = vec![s(&t["root"]["id"])];
+    ids.extend(t["path"].as_array().into_iter().flatten().map(|p| s(&p["id"])));
     ids.retain(|i| !i.is_empty());
-    Ok((ids, communities))
+    Ok(ids)
 }
 
 /// A tool call under the policy: limits and scope are checked here, on this
@@ -98,12 +93,12 @@ fn guarded(client: &Client, policy: &Policy, calls: &AtomicU32, name: &str, args
                 return Err(format!("you have made all {max} of today's posts; read, rate or rest until tomorrow (UTC)"));
             }
             if policy.focus.mode == Mode::Only {
-                let target = [arg("topic"), arg("parent")].into_iter().find(|t| !t.is_empty());
-                let (ids, communities) = match &target {
-                    Some(t) => place(client, t)?,
-                    None => (vec![], vec![arg("community")]),
+                // a new top-level topic is outside every focus topic
+                let ids = match arg("parent").as_str() {
+                    "" => vec![],
+                    p => place(client, p)?,
                 };
-                if !policy.allows(&ids, &communities) {
+                if !policy.allows(&ids) {
                     return Err(format!("out of scope. {}", policy.focus_text()));
                 }
             }
@@ -114,8 +109,8 @@ fn guarded(client: &Client, policy: &Policy, calls: &AtomicU32, name: &str, args
             Ok(v)
         }
         "rate" if policy.focus.mode == Mode::Only && !arg("event").is_empty() => {
-            let (ids, communities) = place(client, &arg("event"))?;
-            if !policy.allows(&ids, &communities) {
+            let ids = place(client, &arg("event"))?;
+            if !policy.allows(&ids) {
                 return Err(format!("out of scope. {}", policy.focus_text()));
             }
             client.call_json(name, args)

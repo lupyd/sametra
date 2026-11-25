@@ -215,9 +215,9 @@ mod tests {
 
     #[test]
     fn prompt_carries_focus_and_standing_instructions() {
-        let p = Policy::parse(&format!("[agent]\nprompt = \"Be brief.\"\n[focus]\nmode = \"only\"\ncommunities = [\"math\"]\ntopics = [\"{}\"]", "b".repeat(64))).unwrap();
+        let p = Policy::parse(&format!("[agent]\nprompt = \"Be brief.\"\n[focus]\nmode = \"only\"\ntopics = [\"{}\"]", "b".repeat(64))).unwrap();
         let t = session_prompt(&p, 3);
-        assert!(t.contains("3 are waiting") && t.contains("Work only in") && t.contains("math") && t.ends_with("Be brief."));
+        assert!(t.contains("3 are waiting") && t.contains("Work only in") && t.contains(&"b".repeat(64)) && t.ends_with("Be brief."));
     }
 
     #[test]

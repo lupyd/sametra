@@ -10,17 +10,17 @@ const hex = (b) => Buffer.from(b).toString('hex');
 describe('call()', () => {
   it('POSTs the protobuf request and decodes the reply', async () => {
     const calls = fakeNode({ post: (r) => ({ ok: true, id: 'x' + r.title }) });
-    const a = await call('post', { community: 'math', title: 'T', content: 'c', refs: ['r1', 'r2'] });
+    const a = await call('post', { parent: 'p', title: 'T', content: 'c', refs: ['r1', 'r2'] });
     expect(a).toMatchObject({ ok: true, id: 'xT', count: 0 });
     const { opts, req } = calls[0];
     expect(opts.method).toBe('POST');
     expect(opts.headers['Content-Type']).toBe('application/x-protobuf');
-    expect(req).toMatchObject({ community: 'math', title: 'T', content: 'c', refs: ['r1', 'r2'], parent: '' });
+    expect(req).toMatchObject({ parent: 'p', title: 'T', content: 'c', refs: ['r1', 'r2'] });
   });
 
   it('defaults to an empty request', async () => {
-    const calls = fakeNode({ info: () => ({ pubkey: 'p', joined: ['m'] }) });
-    expect((await call('info')).joined).toEqual(['m']);
+    const calls = fakeNode({ info: () => ({ pubkey: 'p', following: ['m'] }) });
+    expect((await call('info')).following).toEqual(['m']);
     expect(calls[0].opts.body.length).toBe(0);
   });
 
@@ -35,7 +35,7 @@ describe('call()', () => {
   });
 
   it('round-trips nested messages', async () => {
-    const tree = { root: { id: 'r', author_rep: -2.5, replies: [{ id: 'c', replies: [{ id: 'g' }] }] }, quoted_by: [], ref_events: [], thread_root: '' };
+    const tree = { root: { id: 'r', author_rep: -2.5, replies: [{ id: 'c', replies: [{ id: 'g' }] }] }, quoted_by: [], ref_events: [], path: [] };
     fakeNode({ thread: () => tree });
     const t = await call('thread', { id: 'r' });
     expect(t.root.author_rep).toBe(-2.5);
@@ -48,7 +48,7 @@ describe('wire compatibility with the Rust node', () => {
   it.each([
     ['RateRequest', { score: -0.3, event: 'ab', reason: 'é' }, '09333333333333d3bf120261622a02c3a9'],
     ['FetchRequest', { filter: { kinds: [11, 1111], tags: [{ name: 'c', values: [{ text: 'm' }] }], since: 1700000000, limit: 5 } }, '0a171a030bd70822080a016312030a016d2880e2cfaa063805'],
-    ['Ack', { ok: true, id: 'x', count: 3, rep: -1.5, community: 'm' }, '0801120178180321000000000000f8bf2a016d'],
+    ['Ack', { ok: true, id: 'x', count: 3, rep: -1.5 }, '0801120178180321000000000000f8bf'],
     ['IdRequest', { id: 'i', thread: true }, '0a01691001'],
   ])('%s encodes byte-identically', (type, obj, want) => {
     expect(hex(encode(type, obj))).toBe(want);

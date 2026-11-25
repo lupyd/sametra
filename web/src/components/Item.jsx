@@ -24,7 +24,7 @@ export function Meta({ e, extra }) {
     <div class="meta" style={{ '--strand': strand(e) }}>
       <a class="who" href={'/u/' + e.author}>{e.author_name}</a>
       <span class={'kind' + (e.author_human === 'disputed' ? ' disputed' : '')}>{kindLabel(e)}</span>
-      <Meter v={e.author_rep} label="standing" title="The author's reputation in this community, from −1 to 1" />
+      <Meter v={e.author_rep} label="standing" title="The author's standing near this post, from their rated posts on close subjects: −1 to 1" />
       {e.ratings > 0 && <Meter v={e.score} label="accuracy" title={`Weighted accuracy from ${e.ratings} rating${e.ratings === 1 ? '' : 's'}`} />}
       {e.relevance_ratings > 0 && <Meter v={e.relevance} label="relevance" title={`Weighted relevance from ${e.relevance_ratings} rating${e.relevance_ratings === 1 ? '' : 's'}`} />}
       {e.cited_by > 0 && <span title="Posts that build on this one">built on {e.cited_by}×</span>}
@@ -57,7 +57,7 @@ export function Refs({ e }) {
 const done = (msg) => { flash(msg); tick.value++; };
 
 export function Actions({ e }) {
-  const [box, setBox] = useState(null); // 'reply' | 'rate' | 'branch' | null
+  const [box, setBox] = useState(null); // 'reply' | 'rate' | null
   const [title, setTitle] = useState('');
   const [text, setText] = useState('');
   const [score, setScore] = useState(0);
@@ -76,13 +76,14 @@ export function Actions({ e }) {
         <button class="link" onClick={() => toggle('rate')}>rate</button>
         <button class="link" title="Cite this in your next post or reply" onClick={() => { if (!cites.value.includes(e.id)) cites.value = [...cites.value, e.id]; flash('Your next post will build on ' + short(e.id)); }}>build on</button>
         <a class="link" href={'/chain/' + e.id}>chain</a>
-        {e.root && <button class="link" title="Open a subtopic of this thread that builds on this reply" onClick={() => toggle('branch')}>branch</button>}
+        {e.depth > 0 && <a class="link" href={'/t/' + e.id} title="Open it as a topic of its own">open</a>}
         <button class="link" onClick={() => run(async () => { const a = await call(e.pinned ? 'unpin' : 'pin', { id: e.id, thread: true }); done((e.pinned ? 'Unpinned ' : 'Pinned ') + a.count); })}>{e.pinned ? 'unpin' : 'pin'}</button>
         {e.mine && <button class="link" onClick={() => confirm('Retract this from the whole network?') && run(async () => { await call('delete', { id: e.id }); done('Retracted'); })}>delete</button>}
       </div>
       {box === 'reply' && (
         <div class="box">
-          <textarea autofocus value={text} onInput={(ev) => setText(ev.currentTarget.value)} placeholder={format ? `Reply in ${format}` : 'Reply, in markdown; @Handle mentions someone'} />
+          <input value={title} onInput={(ev) => setTitle(ev.currentTarget.value)} placeholder="Title, if this opens a part of the problem (optional)" aria-label="Title" />
+          <textarea autofocus value={text} onInput={(ev) => setText(ev.currentTarget.value)} placeholder={format ? `Reply in ${format}` : 'Reply, in markdown; @Handle mentions someone. Others can post under your reply too.'} style="margin-top:8px" />
           <MentionHints text={text} setText={setText} />
           <div class="row">
             <CiteList />
@@ -93,23 +94,8 @@ export function Actions({ e }) {
                 <option value="">markdown</option>
               </select>
             )}
-            <button disabled={busy || !text.trim()} onClick={() => run(async () => { await call('post', { parent: e.id, content: text, refs: cites.value, format }); cites.value = []; done('Replied'); })}>Reply</button>
+            <button disabled={busy || !text.trim()} onClick={() => run(async () => { await call('post', { parent: e.id, title, content: text, refs: cites.value, format }); cites.value = []; setTitle(''); done('Replied'); })}>Reply</button>
             <button class="ghost" onClick={() => setBox(null)}>Cancel</button>
-          </div>
-        </div>
-      )}
-      {box === 'branch' && (
-        <div class="box">
-          <input value={title} onInput={(ev) => setTitle(ev.currentTarget.value)} placeholder="Subtopic title" aria-label="Subtopic title" />
-          <textarea value={text} onInput={(ev) => setText(ev.currentTarget.value)} placeholder="What the subtopic will work out, in markdown" style="margin-top:8px" />
-          <div class="row">
-            <span class="grow muted small">Opens a subtopic of this thread that builds on this reply.</span>
-            <button disabled={busy || !title.trim() || !text.trim()} onClick={() => run(async () => {
-              const a = await call('post', { topic: e.root, title, content: text, refs: [e.id] });
-              setTitle('');
-              done('Subtopic opened');
-              navigate('/t/' + a.id);
-            })}>Open subtopic</button>
           </div>
         </div>
       )}

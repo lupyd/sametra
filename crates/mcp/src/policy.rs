@@ -89,7 +89,7 @@ pub enum Mode {
     Free,
     /// start from the focus topics, but free to wander when it can help elsewhere
     Prefer,
-    /// only the focus topics, their subtopics and threads (and the focus communities)
+    /// only the focus topics and everything under them
     Only,
 }
 
@@ -99,8 +99,6 @@ pub struct Focus {
     pub mode: Mode,
     /// topic event ids (hex); their subtopics and replies are included
     pub topics: Vec<String>,
-    /// community slugs; every topic in them is included
-    pub communities: Vec<String>,
 }
 
 /// "90s", "30m", "6h", "1d", or plain seconds.
@@ -136,8 +134,8 @@ impl Policy {
         for d in [&self.agent.every, &self.agent.poll, &self.agent.max_session] {
             duration(d)?;
         }
-        if self.focus.mode != Mode::Free && self.focus.topics.is_empty() && self.focus.communities.is_empty() {
-            return Err("focus: mode \"prefer\" or \"only\" needs topics or communities".into());
+        if self.focus.mode != Mode::Free && self.focus.topics.is_empty() {
+            return Err("focus: mode \"prefer\" or \"only\" needs topics".into());
         }
         if let Some(t) = self.focus.topics.iter().find(|t| t.len() != 64 || !t.chars().all(|c| c.is_ascii_hexdigit())) {
             return Err(format!("focus.topics: '{t}' is not an event id (64 hex characters)"));
@@ -168,18 +166,11 @@ impl Policy {
     /// The focus, as words for the agent.
     pub fn focus_text(&self) -> String {
         let f = &self.focus;
-        let mut places = vec![];
-        if !f.topics.is_empty() {
-            places.push(format!("the topics {} (with their subtopics and threads; read them with `thread`)", f.topics.join(", ")));
-        }
-        if !f.communities.is_empty() {
-            places.push(format!("the communities {}", f.communities.join(", ")));
-        }
-        let places = places.join(" and ");
+        let places = format!("the topics {} and everything under them (read them with `thread`)", f.topics.join(", "));
         match f.mode {
             Mode::Free => "You choose where to contribute: anywhere you can add something real.".into(),
             Mode::Prefer => format!("Your priority is {places}. Start there and spend most of your effort there; contribute elsewhere when you can clearly help."),
-            Mode::Only => format!("Work only in {places}. Posts and ratings elsewhere are refused. You may still read anything, answer requests sent to you, and open subtopics under your topics."),
+            Mode::Only => format!("Work only in {places}. Posts and ratings elsewhere are refused. You may still read anything and answer requests sent to you."),
         }
     }
 
@@ -217,9 +208,8 @@ impl Policy {
     }
 
     /// Is this place in scope? `ids`: the event and every topic and thread around
-    /// it; `communities`: the communities they are in.
-    pub fn allows(&self, ids: &[String], communities: &[String]) -> bool {
-        self.focus.mode != Mode::Only || ids.iter().any(|i| self.focus.topics.contains(i)) || communities.iter().any(|c| !c.is_empty() && self.focus.communities.contains(c))
+    pub fn allows(&self, ids: &[String]) -> bool {
+        self.focus.mode != Mode::Only || ids.iter().any(|i| self.focus.topics.contains(i))
     }
 }
 
@@ -318,7 +308,6 @@ posts_per_day = 20
 [focus]
 mode = "free"               # free: anywhere; prefer: start here, may wander; only: just these
 # topics = ["<event id of a topic>"]   # includes its subtopics and threads
-# communities = ["math"]
 "#;
 
 #[cfg(test)]
@@ -358,13 +347,12 @@ mod tests {
 
     #[test]
     fn scope() {
-        let only = Policy::parse(&format!("[focus]\nmode = \"only\"\ntopics = [\"{T}\"]\ncommunities = [\"math\"]")).unwrap();
-        assert!(only.allows(&["x".into(), T.into()], &[]));
-        assert!(only.allows(&["x".into()], &["math".into()]));
-        assert!(!only.allows(&["x".into()], &["bio".into()]));
-        assert!(!only.allows(&[], &["".into()]));
+        let only = Policy::parse(&format!("[focus]\nmode = \"only\"\ntopics = [\"{T}\"]")).unwrap();
+        assert!(only.allows(&["x".into(), T.into()]));
+        assert!(!only.allows(&["x".into()]));
+        assert!(!only.allows(&[]));
         let prefer = Policy::parse(&format!("[focus]\nmode = \"prefer\"\ntopics = [\"{T}\"]")).unwrap();
-        assert!(prefer.allows(&["x".into()], &["bio".into()]), "prefer steers, it does not refuse");
+        assert!(prefer.allows(&["x".into()]), "prefer steers, it does not refuse");
         assert!(prefer.focus_text().contains("Start there"));
         assert!(only.focus_text().contains("refused"));
     }

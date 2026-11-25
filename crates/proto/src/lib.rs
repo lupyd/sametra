@@ -19,16 +19,13 @@ macro_rules! tools {
     ($m:ident) => {
         $m! {
             info: Empty => InfoResponse, false;
-            communities: Empty => CommunitiesResponse, false;
-            create_community: CreateCommunityRequest => Ack, true;
-            join: CommunityRequest => Ack, true;
-            leave: CommunityRequest => Ack, true;
+            follow: FollowRequest => Ack, true;
+            unfollow: FollowRequest => Ack, true;
             feed: FeedRequest => Items, false;
             thread: IdRequest => ThreadResponse, false;
             event: IdRequest => EventResponse, false;
             chain: ChainRequest => ChainResponse, false;
             search: SearchRequest => Items, false;
-            find_communities: FindCommunitiesRequest => CommunitiesResponse, false;
             find_people: FindPeopleRequest => PeopleResponse, false;
             notifications: NotificationsRequest => NotificationsResponse, true;
             post: PostRequest => Ack, true;

@@ -79,7 +79,7 @@ async fn api_transport_rules() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn body_split_across_packets() {
     let n = spawn(|_| {}).await;
-    let body = pb::encode(&post("m", "slow", "client"));
+    let body = pb::encode(&post("slow", "client"));
     let head = format!("POST /api/post HTTP/1.1\r\nHost: {}\r\n{PB}Content-Length: {}\r\n\r\n", n.host(), body.len());
     let mut s = tokio::net::TcpStream::connect(n.addr).await.unwrap();
     s.write_all(head.as_bytes()).await.unwrap();
@@ -98,7 +98,7 @@ async fn body_split_across_packets() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn csrf_and_dns_rebinding_are_refused() {
     let n = spawn(|_| {}).await;
-    let body = pb::encode(&post("m", "t", "x"));
+    let body = pb::encode(&post("t", "x"));
     let send = |host: String, origin: Option<&str>, tool: &str| {
         let origin = origin.map(|o| format!("Origin: {o}\r\n")).unwrap_or_default();
         format!("POST /api/{tool} HTTP/1.1\r\nHost: {host}\r\n{origin}{PB}Content-Length: {}\r\n\r\n", body.len()).into_bytes()
@@ -128,7 +128,7 @@ async fn csrf_and_dns_rebinding_are_refused() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn api_token_admits_other_hosts() {
     let n = spawn(|c| c.api_token = Some("tok".into())).await;
-    let body = pb::encode(&post("m", "t", "x"));
+    let body = pb::encode(&post("t", "x"));
     let req = |auth: &str| {
         let mut v = format!("POST /api/post HTTP/1.1\r\nHost: node.example\r\n{auth}{PB}Content-Length: {}\r\n\r\n", body.len()).into_bytes();
         v.extend_from_slice(&body);
@@ -154,7 +154,7 @@ async fn concurrent_clients() {
             let n = n.clone();
             tokio::spawn(async move {
                 if i % 2 == 0 {
-                    n.ok::<_, pb::Ack>("post", &post("load", &format!("t{i}"), "x")).await;
+                    n.ok::<_, pb::Ack>("post", &post(&format!("t{i}"), "x")).await;
                 } else {
                     assert_eq!(n.get("/").await.status, 200);
                 }
@@ -164,7 +164,7 @@ async fn concurrent_clients() {
     for t in tasks {
         t.await.unwrap();
     }
-    let f: pb::Items = n.ok("feed", &pb::FeedRequest { community: "load".into(), limit: 100, ..Default::default() }).await;
+    let f: pb::Items = n.ok("feed", &pb::FeedRequest { limit: 100, ..Default::default() }).await;
     assert_eq!(f.items.len(), 32);
 }
 

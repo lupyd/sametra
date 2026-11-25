@@ -13,12 +13,12 @@ const T: Duration = Duration::from_secs(10);
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn events_flow_both_ways_over_one_link() {
     let (a, b) = (spawn(|_| {}).await, spawn(|_| {}).await);
-    let before: pb::Ack = a.ok("post", &post("m", "history", "before the link")).await;
+    let before: pb::Ack = a.ok("post", &post("history", "before the link")).await;
     b.connect(&a).await; // b dials a; a cannot dial b (think NAT)
     assert!(eventually(T, || b.has(&before.id)).await, "dialer syncs history on connect");
-    let from_a: pb::Ack = a.ok("post", &post("m", "from a", "x")).await;
+    let from_a: pb::Ack = a.ok("post", &post("from a", "x")).await;
     assert!(eventually(T, || b.has(&from_a.id)).await, "a -> b via b's subscription");
-    let from_b: pb::Ack = b.ok("post", &post("m", "from b", "x")).await;
+    let from_b: pb::Ack = b.ok("post", &post("from b", "x")).await;
     assert!(eventually(T, || a.has(&from_b.id)).await, "b -> a pushed over the outbound link");
     let ab: pb::PeersResponse = a.ok("peers", &pb::Empty {}).await;
     assert!(ab.peers.len() == 1 && !ab.peers[0].outbound);
@@ -30,8 +30,8 @@ async fn two_hops_and_no_loops() {
     b.connect(&a).await;
     c.connect(&b).await;
     c.connect(&a).await; // a triangle: every event has two paths
-    let ea: pb::Ack = a.ok("post", &post("m", "from a", "x")).await;
-    let ec: pb::Ack = c.ok("post", &post("m", "from c", "x")).await;
+    let ea: pb::Ack = a.ok("post", &post("from a", "x")).await;
+    let ec: pb::Ack = c.ok("post", &post("from c", "x")).await;
     let r: pb::Ack = b.ok("post", &reply(&ea.id, "b replies")).await;
     for n in [&a, &b, &c] {
         for id in [&ea.id, &ec.id, &r.id] {
@@ -50,17 +50,17 @@ async fn two_hops_and_no_loops() {
 async fn deletes_ratings_and_profiles_propagate() {
     let (a, b) = (spawn(|_| {}).await, spawn(|_| {}).await);
     b.connect(&a).await;
-    let p: pb::Ack = a.ok("post", &post("m", "oops", "wrong")).await;
+    let p: pb::Ack = a.ok("post", &post("oops", "wrong")).await;
     assert!(eventually(T, || b.has(&p.id)).await);
     a.ok::<_, pb::Ack>("delete", &id(&p.id)).await;
     assert!(eventually(T, || !b.has(&p.id)).await, "retraction reaches peers");
 
-    let good: pb::Ack = a.ok("post", &post("m", "good", "work")).await;
+    let good: pb::Ack = a.ok("post", &post("good", "work")).await;
     assert!(eventually(T, || b.has(&good.id)).await);
     b.ok::<_, pb::Ack>("set_profile", &pb::Profile { name: "Bee".into(), ..Default::default() }).await;
     b.ok::<_, pb::Ack>("rate", &pb::RateRequest { score: 0.7, event: good.id.clone(), ..Default::default() }).await;
-    let ka = a.node.keys.pubkey.hex();
-    let rep_on = |n: &TestNode| n.node.reputation("m").user(&H32::from_hex(&ka).unwrap());
+    let (ka, gid) = (a.node.keys.pubkey, H32::from_hex(&good.id).unwrap());
+    let rep_on = |n: &TestNode| n.node.model().near(&ka, &gid);
     assert!(eventually(T, || rep_on(&a) > 0.0).await, "rating reached the author's node");
     assert!((rep_on(&a) - rep_on(&b)).abs() < 1e-9, "both nodes compute the same reputation");
     let pr: pb::ProfileResponse = a.ok("profile", &pb::ProfileRequest { pubkey: b.node.keys.pubkey.hex() }).await;
@@ -68,23 +68,25 @@ async fn deletes_ratings_and_profiles_propagate() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn scoped_nodes_only_keep_their_communities() {
+async fn scoped_nodes_only_keep_what_they_follow() {
     let a = spawn(|_| {}).await;
-    let b = spawn(|c| {
+    let topic: pb::Ack = a.ok("post", &post("Followed", "x")).await;
+    let old_inside: pb::Ack = a.ok("post", &reply(&topic.id, "old, under it")).await;
+    let old_outside: pb::Ack = a.ok("post", &post("Elsewhere", "x")).await;
+    a.ok::<_, pb::Ack>("set_profile", &pb::Profile { name: "A".into(), ..Default::default() }).await;
+    let tid = H32::from_hex(&topic.id).unwrap();
+    let b = spawn(move |c| {
         c.relay_all = false;
-        c.join = vec!["math".into()];
+        c.follow = vec![tid];
     })
     .await;
-    let old_bio: pb::Ack = a.ok("post", &post("bio", "old", "x")).await;
-    let old_math: pb::Ack = a.ok("post", &post("math", "old", "x")).await;
-    a.ok::<_, pb::Ack>("set_profile", &pb::Profile { name: "A".into(), ..Default::default() }).await;
     b.connect(&a).await;
-    assert!(eventually(T, || b.has(&old_math.id)).await);
-    let bio: pb::Ack = a.ok("post", &post("bio", "new", "x")).await;
-    let math: pb::Ack = a.ok("post", &post("math", "new", "x")).await;
-    assert!(eventually(T, || b.has(&math.id)).await);
+    assert!(eventually(T, || b.has(&topic.id) && b.has(&old_inside.id)).await, "the followed post and its history");
+    let deep: pb::Ack = a.ok("post", &reply(&old_inside.id, "new, deeper under it")).await;
+    let outside: pb::Ack = a.ok("post", &post("new elsewhere", "x")).await;
+    assert!(eventually(T, || b.has(&deep.id)).await, "everything under it, at any depth");
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(!b.has(&bio.id) && !b.has(&old_bio.id));
+    assert!(!b.has(&outside.id) && !b.has(&old_outside.id));
     assert!(b.node.store.lock().unwrap().replaceable(&a.node.keys.pubkey, K_PROFILE, "").is_some(), "global metadata still syncs");
 }
 
@@ -156,7 +158,7 @@ async fn client_publish_and_refusals() {
     let n = spawn(|_| {}).await;
     let mut ws = client(&n).await;
     let k = Keys::generate();
-    let e = k.sign(K_POST, tags(&[&["c", "m"], &["title", "from a client"]]), "hi".into());
+    let e = k.sign(K_POST, tags(&[&["title", "from a client"]]), "hi".into());
     // accepted events need no answer; refusals get one
     send(&mut ws, publish(&e)).await;
     send(&mut ws, publish(&e)).await;
@@ -172,7 +174,7 @@ async fn client_publish_and_refusals() {
     ws.send(Message::binary(vec![0xff, 0xff, 0xff])).await.unwrap();
     assert_eq!(recv(&mut ws).await.type_pb, pb::F_NOTICE);
     // the post is visible through the API like any other
-    let f: pb::Items = n.ok("feed", &pb::FeedRequest { community: "m".into(), ..Default::default() }).await;
+    let f: pb::Items = n.ok("feed", &pb::FeedRequest::default()).await;
     assert_eq!(f.items[0].title, "from a client");
     // text is not part of the protocol: the relay says so and hangs up
     ws.send(Message::text(r#"["REQ","s",{}]"#)).await.unwrap();
@@ -193,12 +195,14 @@ async fn client_publish_and_refusals() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn client_subscriptions() {
     let n = spawn(|_| {}).await;
+    let topic: pb::Ack = n.ok("post", &post("Topic", "x")).await;
     for i in 0..3 {
-        n.ok::<_, pb::Ack>("post", &post("m", &format!("old{i}"), "x")).await;
+        n.ok::<_, pb::Ack>("post", &reply(&topic.id, &format!("old{i}"))).await;
     }
-    n.ok::<_, pb::Ack>("post", &post("other", "elsewhere", "x")).await;
+    n.ok::<_, pb::Ack>("post", &post("elsewhere", "x")).await;
+    let under_topic = || Filter { kinds: Some(vec![11]), tags: vec![("e".into(), vec![topic.id.clone()])], limit: Some(2), ..Default::default() };
     let mut ws = client(&n).await;
-    send(&mut ws, req("feed", Filter { kinds: Some(vec![11]), tags: vec![("c".into(), vec!["m".into()])], limit: Some(2), ..Default::default() })).await;
+    send(&mut ws, req("feed", under_topic())).await;
     let mut got = vec![];
     loop {
         let m = recv(&mut ws).await;
@@ -212,18 +216,18 @@ async fn client_subscriptions() {
         got.push(e);
     }
     assert_eq!(got.len(), 2, "limit honoured");
-    assert!(got.iter().all(|e| e.community() == Some("m")));
+    assert!(got.iter().all(|e| e.parent().map(|p| p.hex()) == Some(topic.id.clone())));
     assert!(got[0].created_at <= got[1].created_at, "stored events are sent oldest first");
 
     // live: new matching events stream in, others do not
-    let live: pb::Ack = n.ok("post", &post("m", "live", "x")).await;
+    let live: pb::Ack = n.ok("post", &reply(&topic.id, "live")).await;
     let m = recv(&mut ws).await;
     assert_eq!((m.type_pb, hex::encode(&m.event.unwrap().id)), (pb::F_EVENT, live.id.clone()));
-    n.ok::<_, pb::Ack>("post", &post("other", "not for us", "x")).await;
+    n.ok::<_, pb::Ack>("post", &post("not for us", "x")).await;
     assert!(quiet(&mut ws, Duration::from_millis(300)).await);
     send(&mut ws, pb::Frame { type_pb: pb::F_CLOSE, sub_id: "feed".into(), ..Default::default() }).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
-    n.ok::<_, pb::Ack>("post", &post("m", "after close", "x")).await;
+    n.ok::<_, pb::Ack>("post", &reply(&topic.id, "after close")).await;
     assert!(quiet(&mut ws, Duration::from_millis(300)).await, "closed subscriptions stop");
 }
 
@@ -247,7 +251,7 @@ async fn client_limits() {
     // (a burst may straddle one second boundary, so at most 400 get through)
     let mut ws = client(&n).await;
     let k = Keys::generate();
-    let evs: Vec<Event> = (0..600).map(|i| k.sign(K_REPLY, vec![], format!("{i}"))).collect();
+    let evs: Vec<Event> = (0..600).map(|i| k.sign(K_POST, vec![], format!("{i}"))).collect();
     for e in &evs {
         ws.feed(Message::binary(pb::encode(&publish(e)))).await.unwrap();
     }
@@ -285,11 +289,11 @@ async fn clients_on_different_nodes_see_each_other() {
     let (a, b) = (spawn(|_| {}).await, spawn(|_| {}).await);
     b.connect(&a).await;
     let mut on_b = client(&b).await;
-    send(&mut on_b, req("s", Filter { tags: vec![("c".into(), vec!["m".into()])], ..Default::default() })).await;
+    send(&mut on_b, req("s", of_kinds(&[K_POST]))).await;
     assert_eq!(recv(&mut on_b).await.type_pb, pb::F_EOSE);
     // a client publishes to a; it reaches b's subscriber unchanged, signature and all
     let mut on_a = client(&a).await;
-    let e = Keys::generate().sign(K_POST, tags(&[&["c", "m"]]), "across".into());
+    let e = Keys::generate().sign(K_POST, vec![], "across".into());
     send(&mut on_a, publish(&e)).await;
     let m = recv(&mut on_b).await;
     assert_eq!(m.type_pb, pb::F_EVENT);
@@ -307,74 +311,44 @@ async fn clients_on_different_nodes_see_each_other() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn search_reaches_beyond_direct_peers() {
-    // a <- b <- c <- e, where b, c and e only relay what they joined: content stays on a
-    let a = spawn(|c| {
-        c.relay_all = false;
-        c.join = vec!["bio".into()];
-    })
-    .await;
+    // a <- b <- c <- e, where every node keeps only what it follows: content stays on a
+    let a = spawn(|c| c.relay_all = false).await;
     let b = spawn(|c| c.relay_all = false).await;
     let c = spawn(|c| c.relay_all = false).await;
     let e = spawn(|c| c.relay_all = false).await;
     b.connect(&a).await;
     c.connect(&b).await;
     e.connect(&c).await;
-    let found: pb::Ack = a.ok("post", &post("bio", "Zebrafish fin regeneration", "single-cell atlas")).await;
-    a.ok::<_, pb::Ack>("post", &post("bio", "Unrelated", "nothing to see")).await;
+    let found: pb::Ack = a.ok("post", &post("Zebrafish fin regeneration", "single-cell atlas")).await;
+    a.ok::<_, pb::Ack>("post", &post("Unrelated", "nothing to see")).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(!b.has(&found.id) && !c.has(&found.id), "not gossiped to non-members");
-    let s = |scope: &str| pb::SearchRequest { query: "zebrafish regeneration".into(), community: "bio".into(), scope: scope.into(), ..Default::default() };
-    let local: pb::Items = e.ok("search", &s("node")).await;
+    assert!(!b.has(&found.id) && !c.has(&found.id), "not gossiped to nodes that do not follow it");
+    let s = |scope: &str, within: &str| pb::SearchRequest { query: "zebrafish regeneration".into(), scope: scope.into(), within: within.into(), ..Default::default() };
+    let local: pb::Items = e.ok("search", &s("node", "")).await;
     assert!(local.items.is_empty());
-    // community scope: peers and their peers (e -> c -> b): a is three levels away
-    let near: pb::Items = e.ok("search", &s("community")).await;
-    assert!(near.items.is_empty(), "community scope stops two levels out");
     // network scope: three levels (e -> c -> b -> a)
-    let net: pb::Items = e.ok("search", &pb::SearchRequest { query: "zebrafish regeneration".into(), scope: "network".into(), ..Default::default() }).await;
+    let net: pb::Items = e.ok("search", &s("network", "")).await;
     assert_eq!(net.items.len(), 1, "three levels reach a");
     assert_eq!(net.items[0].id, found.id);
     assert!(e.has(&found.id), "found content is cached where it was searched");
-    // from c, a is two levels away: community scope finds it
-    let r: pb::Items = c.ok("search", &s("community")).await;
-    assert_eq!(r.items.len(), 1);
+    // within a subtree, across the network: only what is under that post
+    let part: pb::Ack = a.ok("post", &reply(&found.id, "regeneration of zebrafish fins, part two")).await;
+    a.ok::<_, pb::Ack>("post", &post("Zebrafish regeneration elsewhere", "another tree")).await;
+    let inside: pb::Items = c.ok("search", &s("network", &found.id)).await;
+    let ids: Vec<&str> = inside.items.iter().map(|i| i.id.as_str()).collect();
+    assert!(ids.contains(&part.id.as_str()) && ids.len() <= 2, "{ids:?}");
     // a search REQ without hops is answered from the local index (no forwarding)
     let mut ws = client(&a).await;
-    send(&mut ws, req("s", Filter { search: Some("zebrafish".into()), kinds: Some(vec![11]), ..Default::default() })).await;
+    send(&mut ws, req("s", Filter { search: Some("atlas".into()), kinds: Some(vec![11]), ..Default::default() })).await;
     let m = recv(&mut ws).await;
     assert_eq!((m.type_pb, hex::encode(&m.event.unwrap().id)), (pb::F_EVENT, found.id.clone()));
     assert_eq!(recv(&mut ws).await.type_pb, pb::F_EOSE);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn communities_found_across_the_network_with_members() {
-    let a = spawn(|c| c.join = vec!["glaciology".into()]).await;
-    let b = spawn(|_| {}).await;
-    a.ok::<_, pb::Ack>("create_community", &pb::CreateCommunityRequest { slug: "glaciology".into(), name: "Glaciology".into(), about: "ice sheets and sea level".into() }).await;
-    b.connect(&a).await;
-    // definitions are global metadata: b learns them through gossip, and a's heartbeat counts a member
-    let f = pb::FindCommunitiesRequest { query: "ice sheets".into(), network: true, ..Default::default() };
-    let mut found = None;
-    for _ in 0..40 {
-        let r: pb::CommunitiesResponse = b.ok("find_communities", &f).await;
-        if let Some(c) = r.communities.into_iter().find(|c| c.slug == "glaciology" && c.members >= 1) {
-            found = Some(c);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    let c = found.expect("community and its member visible from b");
-    assert_eq!(c.name, "Glaciology");
-    assert!(!c.joined);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mentions_reach_people_through_scoped_nodes() {
-    // asker <- relay -> argon, where nobody but asker follows "chem": only the mention travels
-    let asker = spawn(|c| {
-        c.relay_all = false;
-        c.join = vec!["chem".into()];
-    })
-    .await;
+    // asker <- relay -> argon, nodes that keep only what they follow: only the mention travels
+    let asker = spawn(|c| c.relay_all = false).await;
     let relay = spawn(|c| c.relay_all = false).await;
     let argon = spawn(|c| c.relay_all = false).await;
     relay.connect(&asker).await;
@@ -393,13 +367,13 @@ async fn mentions_reach_people_through_scoped_nodes() {
     }
     let p = found.first().expect("asker finds Argon by handle");
     assert_eq!((p.handle.as_str(), p.model.as_str(), p.capabilities, p.human_status.as_str()), ("DoctorArgon", "claude-opus-5-5", 1, "agent"));
-    let quiet: pb::Ack = asker.ok("post", &post("chem", "Unrelated", "nobody is mentioned")).await;
-    let a: pb::Ack = asker.ok("post", &post("chem", "Odd spectral line", "@DoctorArgon could you look at this? Also @nobody.")).await;
+    let quiet: pb::Ack = asker.ok("post", &post("Unrelated", "nobody is mentioned")).await;
+    let a: pb::Ack = asker.ok("post", &post("Odd spectral line", "@DoctorArgon could you look at this? Also @nobody.")).await;
     assert_eq!(a.mentioned, [argon.node.keys.npub()]);
     assert_eq!(a.unresolved, ["nobody"]);
-    assert!(eventually(T, || argon.has(&a.id)).await, "the mention reached Argon through a node that ignores chem");
+    assert!(eventually(T, || argon.has(&a.id)).await, "the mention reached Argon through a node that does not follow it");
     tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(!argon.has(&quiet.id) && !relay.has(&quiet.id), "posts without mentions stay in their community");
+    assert!(!argon.has(&quiet.id) && !relay.has(&quiet.id), "posts without mentions stay where they are followed");
     let n: pb::NotificationsResponse = argon.ok("notifications", &pb::NotificationsRequest::default()).await;
     assert_eq!(n.unread, 1);
     assert_eq!((n.notifications[0].reason.as_str(), n.notifications[0].unread), ("mention", true));
@@ -415,9 +389,9 @@ async fn mentions_reach_people_through_scoped_nodes() {
     assert!(!n.notifications[0].unread);
     let st: pb::NodeState = pb::decode(&std::fs::read(argon.dir.0.join("state.pb")).unwrap()).unwrap();
     assert!(st.notifications_read > 0);
-    // Argon replies and opens a subtopic: the asker is told about both
+    // Argon answers, and opens a part of it as a topic of its own: the asker is told about both
     let r: pb::Ack = argon.ok("post", &reply(&a.id, "That is the 696 nm argon line.")).await;
-    let s: pb::Ack = argon.ok("post", &pb::PostRequest { topic: a.id.clone(), title: "Calibrate the spectrometer".into(), content: "first".into(), ..Default::default() }).await;
+    let s: pb::Ack = argon.ok("post", &pb::PostRequest { title: "Calibrate the spectrometer".into(), ..reply(&a.id, "first") }).await;
     let mut reasons = vec![];
     for _ in 0..100 {
         let n: pb::NotificationsResponse = asker.ok("notifications", &pb::NotificationsRequest::default()).await;
@@ -428,5 +402,7 @@ async fn mentions_reach_people_through_scoped_nodes() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     reasons.sort();
-    assert_eq!(reasons, [("reply".to_string(), r.id), ("subtopic".to_string(), s.id)]);
+    let mut want = [("reply".to_string(), r.id), ("reply".to_string(), s.id)];
+    want.sort();
+    assert_eq!(reasons, want);
 }

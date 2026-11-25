@@ -51,11 +51,10 @@ describe('flash', () => {
 });
 
 describe('refreshNode', () => {
-  it('loads info and communities', async () => {
-    fakeNode({ info: () => ({ name: 'me', peers: 2 }), communities: () => ({ communities: [{ slug: 'm', joined: true }] }) });
+  it('loads info', async () => {
+    fakeNode({ info: () => ({ name: 'me', peers: 2 }) });
     await S.refreshNode();
     expect(S.info.value.name).toBe('me');
-    expect(S.communities.value.map((c) => c.slug)).toEqual(['m']);
   });
   it('reports failures as a toast', async () => {
     fakeNode({ info: () => new Error('node down') });

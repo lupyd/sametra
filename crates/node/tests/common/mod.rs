@@ -5,7 +5,7 @@
 pub mod kubo;
 
 use quick_protobuf::{MessageRead, MessageWrite};
-use sametra_node::event::Keys;
+use sametra_node::event::{Event, K_POST, Keys, ancestry_tags};
 use sametra_node::node::{self, Config, Node};
 use sametra_node::{http, pb};
 use std::net::SocketAddr;
@@ -178,11 +178,16 @@ pub async fn eventually(timeout: Duration, mut f: impl FnMut() -> bool) -> bool 
     f()
 }
 
-pub fn post(c: &str, title: &str, content: &str) -> pb::PostRequest {
-    pb::PostRequest { community: c.into(), title: title.into(), content: content.into(), ..Default::default() }
+/// A new top-level topic.
+pub fn post(title: &str, content: &str) -> pb::PostRequest {
+    pb::PostRequest { title: title.into(), content: content.into(), ..Default::default() }
 }
 pub fn reply(parent: &str, content: &str) -> pb::PostRequest {
     pb::PostRequest { parent: parent.into(), content: content.into(), ..Default::default() }
+}
+/// A signed post by `k` under `parent` (naming all of parent's ancestors).
+pub fn under(k: &Keys, parent: &Event, content: &str) -> Event {
+    k.sign(K_POST, ancestry_tags(&parent.id, &parent.ancestors()), content.into())
 }
 pub fn id(i: &str) -> pb::IdRequest {
     pb::IdRequest { id: i.into(), thread: false }

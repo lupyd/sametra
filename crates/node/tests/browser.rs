@@ -34,8 +34,7 @@ async fn spa_renders_node_data() {
         return;
     }
     n.ok::<_, pb::Ack>("set_profile", &pb::Profile { name: "Dr Browser".into(), about: "tests UIs".into(), ..Default::default() }).await;
-    n.ok::<_, pb::Ack>("create_community", &pb::CreateCommunityRequest { slug: "oncology".into(), name: "Oncology".into(), about: "tumour biology".into() }).await;
-    let root: pb::Ack = n.ok("post", &post("oncology", "Is marker X predictive?", "Looking for cohort data.")).await;
+    let root: pb::Ack = n.ok("post", &post("Is marker X predictive?", "Looking for cohort data.")).await;
     let r1: pb::Ack = n.ok("post", &reply(&root.id, "We saw it in 40 patients.")).await;
     n.ok::<_, pb::Ack>("post", &reply(&r1.id, "Which assay did you use?")).await;
     let profile = tempdir("chrome");
@@ -46,10 +45,9 @@ async fn spa_renders_node_data() {
         tokio::task::spawn_blocking(move || dom(&c, &u, &p))
     };
 
-    let feed = run("/c/oncology").await.unwrap();
-    assert!(feed.contains("Is marker X predictive?"), "feed shows the thread:\n{feed}");
-    assert!(feed.contains("Oncology") && feed.contains("tumour biology"));
-    assert!(feed.contains("2 replies"));
+    let feed = run("/").await.unwrap();
+    assert!(feed.contains("Is marker X predictive?"), "home lists the topics:\n{feed}");
+    assert!(feed.contains("2 posts under it"));
     assert!(feed.contains("Dr Browser"));
 
     let thread = run(&format!("/t/{}", root.id)).await.unwrap();
@@ -57,8 +55,8 @@ async fn spa_renders_node_data() {
         assert!(thread.contains(s), "thread view missing {s:?}");
     }
 
-    let home = run("/").await.unwrap();
-    assert!(home.contains("Is marker X predictive?"), "home redirects to the joined community");
+    let sub = run(&format!("/t/{}", r1.id)).await.unwrap();
+    assert!(sub.contains("Which assay did you use?") && sub.contains("Where this sits") && sub.contains("Is marker X predictive?"), "a reply opens as a topic, with where it sits");
 
     let me = run("/me").await.unwrap();
     assert!(me.contains("Dr Browser") && me.contains("tests UIs") && me.contains(&n.node.keys.npub()));
@@ -70,9 +68,6 @@ async fn spa_renders_node_data() {
     let search = run("/search?q=assay").await.unwrap();
     assert!(search.contains("Which assay did you use?"));
 
-    let rep = run("/c/oncology/reputation").await.unwrap();
-    assert!(rep.contains("Nobody here has been rated yet."));
-
     assert!(feed.contains("href=\"/docs\""), "the app links to the docs");
     let docs = run("/docs/architecture").await.unwrap();
     assert!(docs.contains("A node at a glance") && docs.contains("<svg class=\"dg\""), "docs render with diagrams");
@@ -80,7 +75,7 @@ async fn spa_renders_node_data() {
 
     // capabilities: offered on the profile, found by need, requested into the inbox
     n.ok::<_, pb::Ack>("set_capability", &pb::CapabilitySpec { id: "assay".into(), name: "Plasma marker assay".into(), kind: "skill".into(), topics: vec!["proteomics".into()], ..Default::default() }).await;
-    let need: pb::Ack = n.ok("post", &pb::PostRequest { needs: vec!["proteomics".into()], ..post("oncology", "Who can quantify marker X?", "plasma samples") }).await;
+    let need: pb::Ack = n.ok("post", &pb::PostRequest { needs: vec!["proteomics".into()], ..post("Who can quantify marker X?", "plasma samples") }).await;
     let asker = sametra_node::event::Keys::generate();
     let job = asker.sign(
         sametra_node::event::K_JOB,
@@ -102,8 +97,8 @@ async fn spa_renders_node_data() {
     assert!(inbox.contains("asked for your help") && inbox.contains("Open requests to me"), "the inbox opens on what concerns you");
     let search = run("/search?q=marker&scope=network").await.unwrap();
     assert!(search.contains("Who can quantify marker X?") && search.contains("best effort"));
-    let comms = run("/communities?q=tumour").await.unwrap();
-    assert!(comms.contains("tumour biology"));
+    let within = run(&format!("/search?q=assay&w={}", root.id)).await.unwrap();
+    assert!(within.contains("Which assay did you use?") && within.contains("Only under"));
 
     let missing = run("/nope/at/all").await.unwrap();
     assert!(missing.contains("There is nothing at this address"));

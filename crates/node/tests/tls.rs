@@ -50,9 +50,9 @@ async fn wss_gossip_between_nodes() {
     let b = spawn(move |c| c.tls_ca = vec![ca]).await;
     let url = format!("wss://localhost:{}", a.addr.port());
     b.connect_url(&a, &url).await;
-    let from_a: pb::Ack = a.ok("post", &post("m", "over tls", "x")).await;
+    let from_a: pb::Ack = a.ok("post", &post("over tls", "x")).await;
     assert!(eventually(T, || b.has(&from_a.id)).await);
-    let from_b: pb::Ack = b.ok("post", &post("m", "back over tls", "x")).await;
+    let from_b: pb::Ack = b.ok("post", &post("back over tls", "x")).await;
     assert!(eventually(T, || a.has(&from_b.id)).await);
     let peers: pb::PeersResponse = b.ok("peers", &pb::Empty {}).await;
     assert_eq!(peers.peers[0].addr, url);
@@ -70,7 +70,7 @@ async fn one_port_serves_plain_and_tls() {
     let r = n.raw_tls(&cert.cert(), format!("GET /c/math HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n").as_bytes()).await.unwrap();
     assert_eq!((r.status, r.text()), (200, plain.text()));
     // the API over HTTPS, with the browser's https:// origin
-    let body = pb::encode(&post("m", "via https", "x"));
+    let body = pb::encode(&post("via https", "x"));
     let req = |origin: &str| {
         let mut v = format!("POST /api/post HTTP/1.1\r\nHost: localhost:{port}\r\nOrigin: {origin}\r\nContent-Type: application/x-protobuf\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes();
         v.extend_from_slice(&body);
@@ -85,7 +85,7 @@ async fn one_port_serves_plain_and_tls() {
     // a relay client over wss://: binary frames
     let req = |sid: &str, f: Filter| Message::binary(pb::encode(&pb::Frame { type_pb: pb::F_REQ, sub_id: sid.into(), filters: vec![f.to_pb()], ..Default::default() }));
     let mut ws = Dialer::new(&[cert.cert()]).unwrap().connect(&format!("wss://localhost:{port}")).await.unwrap();
-    ws.send(req("s", Filter { tags: vec![("c".into(), vec!["m".into()])], ..Default::default() })).await.unwrap();
+    ws.send(req("s", Filter { kinds: Some(vec![sametra_node::event::K_POST]), ..Default::default() })).await.unwrap();
     let mut events = 0;
     loop {
         let m = tokio::time::timeout(T, ws.next()).await.unwrap().unwrap().unwrap();

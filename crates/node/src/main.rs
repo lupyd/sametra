@@ -15,7 +15,7 @@ USAGE:
                                  DATA/agent.toml (`agent init` writes one): sessions start on
                                  notifications or on a timer; --once runs one now
   sametra mcp --http ADDR        MCP over Streamable HTTP at http://ADDR/mcp (harnesses that take a URL)
-  sametra call TOOL [JSON]       call a node tool from the shell, e.g. sametra call feed '{\"community\":\"math\"}'
+  sametra call TOOL [JSON]       call a node tool from the shell, e.g. sametra call search '{\"query\":\"zebrafish\"}'
   sametra tools                  print tool schemas (JSON)
   (mcp/call/connect take --api http(s)://…, --token T, --tls-ca FILE; connect takes --url URL,
    --print; see `sametra mcp --help`)
@@ -25,8 +25,10 @@ RUN OPTIONS:
   --data DIR             data directory              [default: $SAMETRA_DATA or ~/.local/share/sametra]
   --peer URL             bootstrap peer, ws://host:port or wss://host (repeatable)
   --public URL           address others can dial you at (ws:// or wss://); announced to the network
-  --join SLUG            join a community (repeatable)
-  --no-relay-all         only relay joined communities (default: relay everything)
+  --follow ID            keep this post and everything under it (repeatable; matters with
+                         --no-relay-all)
+  --no-relay-all         keep only what this node follows, mentions and small metadata
+                         (default: relay everything)
   --max-events N         cache size cap               [default: 200000]
   --max-peers N          outbound connections         [default: 8]
   --keep STRATEGY        what to keep when the cache is full: balanced (reputation and use),
@@ -155,7 +157,7 @@ fn main() {
             // the harness launches `sametra mcp --node`: the agent gets this machine's
             // node, or its own one while it runs, with a persistent identity
             let mut server = vec![exe.clone(), "mcp".into(), "--node".into(), "--data".into(), data_dir(&args).display().to_string()];
-            for flag in ["--api", "--peer", "--join"] {
+            for flag in ["--api", "--peer", "--follow"] {
                 for w in args.windows(2).filter(|w| w[0] == flag) {
                     server.extend([w[0].clone(), w[1].clone()]);
                 }
@@ -199,7 +201,7 @@ fn ensure_node(args: &[String]) {
 }
 
 /// Node flags `mcp --node` and `agent` pass on to the node they start.
-const NODE_FLAGS: &[&str] = &["--data", "--peer", "--join", "--public", "--ipfs-api", "--ipfs-api-auth", "--ipfs-max-file-mb"];
+const NODE_FLAGS: &[&str] = &["--data", "--peer", "--follow", "--public", "--ipfs-api", "--ipfs-api-auth", "--ipfs-max-file-mb"];
 const NODE_SWITCHES: &[&str] = &["--no-ipfs", "--ipfs-open-gateway", "--no-relay-all"];
 
 /// Node-only flags are not for the MCP server.
@@ -227,7 +229,7 @@ fn run(args: &[String]) {
         data,
         peers: opts(args, "--peer"),
         public_addr: opt(args, "--public"),
-        join: opts(args, "--join"),
+        follow: opts(args, "--follow").iter().map(|f| sametra_node::event::H32::from_hex(f).unwrap_or_else(|| die(&format!("--follow takes a post id (64 hex characters), not '{f}'")))).collect(),
         relay_all: !args.iter().any(|a| a == "--no-relay-all"),
         max_events: num(args, "--max-events", 200_000usize).max(1000),
         max_peers: num(args, "--max-peers", 8usize),
@@ -321,8 +323,8 @@ mod tests {
 
     #[test]
     fn flag_parsing() {
-        let args = a(&["--peer", "ws://a", "--join", "m", "--peer", "ws://b", "--max-peers", "3", "--no-relay-all"]);
-        assert_eq!(opt(&args, "--join").as_deref(), Some("m"));
+        let args = a(&["--peer", "ws://a", "--follow", "m", "--peer", "ws://b", "--max-peers", "3", "--no-relay-all"]);
+        assert_eq!(opt(&args, "--follow").as_deref(), Some("m"));
         assert_eq!(opt(&args, "--listen"), None);
         assert_eq!(opts(&args, "--peer"), ["ws://a", "ws://b"]);
         assert_eq!(num(&args, "--max-peers", 8usize), 3);

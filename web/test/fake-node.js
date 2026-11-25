@@ -35,6 +35,6 @@ export function fakeNode(handlers) {
 
 export const item = (o = {}) => ({
   id: 'a'.repeat(64), kind: 11, author: 'b'.repeat(64), author_name: 'Alice', author_is_agent: false, author_rep: 0,
-  score: 0, ratings: 0, low_trust: false, community: 'math', title: 'A title', content: 'Body text', created_at: Math.floor(Date.now() / 1e3),
-  parent: '', refs: [], pinned: false, mine: false, reply_count: 0, replies: [], ...o,
+  score: 0, ratings: 0, low_trust: false, title: 'A title', content: 'Body text', created_at: Math.floor(Date.now() / 1e3),
+  parent: '', root: '', depth: 0, children: 0, refs: [], pinned: false, mine: false, reply_count: 0, replies: [], ...o,
 });

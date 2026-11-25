@@ -139,7 +139,7 @@ mod tests {
     fn json_bridge_fills_missing_fields() {
         let r: PostRequest = serde_json::from_value(serde_json::json!({"content": "hi"})).unwrap();
         assert_eq!(r.content, "hi");
-        assert!(r.community.is_empty() && r.refs.is_empty());
+        assert!(r.parent.is_empty() && r.refs.is_empty());
         let r: RateRequest = serde_json::from_value(serde_json::json!({"score": -0.3})).unwrap();
         assert_eq!(r.score, -0.3);
         let back = serde_json::to_value(&r).unwrap();
@@ -166,7 +166,7 @@ mod golden {
             ("FetchRequest", encode(&FetchRequest {
                 filter: Some(Filter { kinds: vec![11, 1111], tags: vec![TagFilter { name: "c".into(), values: vec!["m".into()] }], since: 1700000000, limit: 5, ..Default::default() }),
             })),
-            ("Ack", encode(&Ack { ok: true, id: "x".into(), count: 3, rep: -1.5, community: "m".into(), ..Default::default() })),
+            ("Ack", encode(&Ack { ok: true, id: "x".into(), count: 3, rep: -1.5, ..Default::default() })),
             ("IdRequest", encode(&IdRequest { id: "i".into(), thread: true })),
         ]
     }
@@ -176,7 +176,7 @@ mod golden {
         let want = [
             ("RateRequest", "09333333333333d3bf120261622a02c3a9"),
             ("FetchRequest", "0a171a030bd70822080a016312030a016d2880e2cfaa063805"),
-            ("Ack", "0801120178180321000000000000f8bf2a016d"),
+            ("Ack", "0801120178180321000000000000f8bf"),
             ("IdRequest", "0a01691001"),
         ];
         for ((name, got), (wname, hexs)) in vectors().into_iter().zip(want) {

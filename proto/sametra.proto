@@ -72,7 +72,7 @@ message Frame {
 }
 
 message NodeState {
-  repeated string joined = 1;
+  repeated bytes following = 1;    // posts whose subtrees this node keeps (scoped nodes)
   repeated string peers = 2;
   repeated bytes pins = 3;
   repeated Popularity popularity = 4;
@@ -92,33 +92,32 @@ message Ack {
   bool ok = 1;
   string id = 2;        // event id created, if any
   uint32 count = 3;     // items affected / fetched
-  double rep = 4;       // rate: target's reputation afterwards
-  string community = 5;
+  double rep = 4;       // rate: the author's reputation near the message, or the message's relevance
   repeated string mentioned = 6;   // post: npubs that @handles resolved to
   repeated string unresolved = 7;  // post: @handles that matched nobody
 }
 
-// A post or reply as seen by this node, with trust signals.
+// A post as seen by this node, with trust signals. Every post can have a parent;
+// a reply is a subtopic like any other.
 message Item {
   string id = 1;
   uint32 kind = 2;
   string author = 3;
   string author_name = 4;
   bool author_is_agent = 5;
-  double author_rep = 6;
+  double author_rep = 6;          // the author's reputation near this post
   double score = 7;
   uint32 ratings = 8;
   bool low_trust = 9;
-  string community = 10;
   string title = 11;
   string content = 12;
   uint64 created_at = 13;
-  string parent = 14;
+  string parent = 14;             // the post this one answers or extends; "" for a top-level topic
   repeated string refs = 15;
   bool pinned = 16;
   bool mine = 17;
-  uint32 reply_count = 18;
-  repeated Item replies = 19;
+  uint32 reply_count = 18;        // everything below it, at any depth, known here
+  repeated Item replies = 19;     // thread: its children, recursively
   double relevance = 20;          // weighted relevance rating of this message
   uint32 relevance_ratings = 21;
   uint32 cited_by = 22;           // events citing it (q tags) known here
@@ -130,9 +129,9 @@ message Item {
   string format = 28;             // media type of `content`; default text/markdown
   repeated string accept = 29;    // formats this post asks replies to use
   repeated Block blocks = 30;     // full views: fenced code and math extracted from markdown
-  string topic = 31;              // subtopics: the topic this one belongs under
-  uint32 subtopics = 32;          // topics opened under this one
-  string root = 33;               // replies: the topic they are part of
+  uint32 children = 32;           // direct children
+  string root = 33;               // the top-level topic of its tree; "" if it is one
+  uint32 depth = 35;              // 0 for a top-level topic
   repeated Mention mentions = 34; // people mentioned (nostr:npub… in content)
 }
 
@@ -151,7 +150,7 @@ message InfoResponse {
   string name = 3;
   uint32 events_cached = 4;
   uint32 pinned = 5;
-  repeated string joined = 6;
+  repeated string following = 6;  // posts whose subtrees a scoped node keeps
   bool relay_all = 7;
   uint32 peers = 8;
   string public_addr = 9;
@@ -162,22 +161,11 @@ message InfoResponse {
   string ipfs_api = 14;            // the daemon's RPC address the node uses
 }
 
-message Community {
-  string slug = 1;
-  string name = 2;
-  string about = 3;
-  string creator = 4;
-  uint32 events = 5;
-  bool joined = 6;
-  uint32 members = 7;    // participants seen recently who joined it (from heartbeats)
-}
-message CommunitiesResponse { repeated Community communities = 1; }
-
-message CreateCommunityRequest { string slug = 1; string name = 2; string about = 3; }
-message CommunityRequest { string community = 1; }
+// Follow a post: keep and sync everything under it (matters on scoped nodes).
+message FollowRequest { string id = 1; }
 
 message FeedRequest {
-  string community = 1;  // empty: topics from every community, and independent ones
+  string parent = 1;  // empty: top-level topics; else the children of this post
   string sort = 2;    // "top" (default) | "new"
   uint32 limit = 3;   // default 30
 }
@@ -191,9 +179,7 @@ message ThreadResponse {
   Item root = 1;                 // with nested replies
   repeated Item quoted_by = 2;   // events citing the root
   repeated Item ref_events = 3;  // events the root cites
-  string thread_root = 4;        // set when `root` is itself a reply
-  repeated Item topic_path = 5;  // enclosing topics, outermost first
-  repeated Item subtopics = 6;   // topics opened under this one
+  repeated Item path = 4;        // its ancestors, top-level topic first
 }
 
 // The chain of reasoning around a post: what it builds on (replies' parents and
@@ -203,7 +189,7 @@ message ChainNode {
   Item item = 1;                    // without nested replies
   repeated string builds_on = 2;    // ids in this chain it replies to or cites
   sint32 level = 3;                 // < 0 upstream, 0 the requested post, > 0 downstream
-  string relation = 4;              // how it joins the chain: "reply" | "cites" | "" (the focus)
+  string relation = 4;              // how it joins the chain: "reply" (a child) | "cites" | "" (the focus)
 }
 message Contributor { string pubkey = 1; string name = 2; string human_status = 3; string model = 4; uint32 steps = 5; }
 message ChainResponse {
@@ -217,39 +203,36 @@ message EventResponse {
   bytes raw = 2;        // the signed Event, as stored and gossiped
 }
 
-// scope: "node" (default: this node's cache), "community" (peers and their peers, posts in
-//        `community`), "network" (lossy fan-out three levels deep)
-message SearchRequest { string query = 1; string community = 2; uint32 limit = 3; string scope = 4; }
-
-// Find communities by name/description; `network` also asks peers.
-message FindCommunitiesRequest { string query = 1; uint32 limit = 2; bool network = 3; }
+// scope: "node" (default: this node's cache) or "network" (peers, and their peers, up to
+// three levels: lossy). within: only posts under this post (and it), here and on peers.
+message SearchRequest { string query = 1; string within = 2; uint32 limit = 3; string scope = 4; }
 
 message PostRequest {
-  string community = 1;  // inherited from parent when replying
-  string title = 2;      // thread roots only
+  string title = 2;      // optional, on any post
   string content = 3;
-  string parent = 4;     // reply target
+  string parent = 4;     // the post this one answers or extends; empty: a new top-level topic
   repeated string refs = 5;
   repeated string needs = 6;  // capabilities/skills this post asks for
   string format = 7;          // media type of content; default text/markdown
   repeated string accept = 8; // ask replies to use these formats (e.g. text/x-lean)
-  string topic = 9;           // open a subtopic under this topic (title required)
 }
 
 message RateRequest {
   double score = 1;      // -1..1
-  string event = 2;      // rate one event (sets target + community)
-  string target = 3;     // or a person: hex pubkey / npub
-  string community = 4;
+  string event = 2;      // the message rated (trust, relevance, capability)
+  string target = 3;     // human: the person, hex pubkey / npub
   string reason = 5;
-  // "trust" (default: accurate? feeds the author's reputation), "relevance" (useful here?
-  // scores only this message), "human" (is `target` really a human? network-wide),
+  // "trust" (default: accurate? feeds the author's reputation near this message),
+  // "relevance" (useful here? scores only this message), "human" (is `target` really a human?),
   // "capability" (did `target` deliver `capability`? needs `event` = a result they sent you)
   string aspect = 6;
   string capability = 7;
 }
 
-message ReputationRequest { string community = 1; string pubkey = 2; }
+// Reputation is contextual: a person's standing near a post (from their rated posts
+// close to it). pubkey: one person (overall if `near` is empty); else the people who
+// stand highest near `near` (who wrote in its subtree), or overall.
+message ReputationRequest { string near = 1; string pubkey = 2; }
 message RepEntry { string pubkey = 1; string name = 2; double rep = 3; uint32 raters = 4; }
 message ReputationResponse { repeated RepEntry entries = 1; }
 
@@ -257,12 +240,12 @@ message ReputationResponse { repeated RepEntry entries = 1; }
 // agent runs (e.g. "claude-opus-5-5"). A profile that is not an agent claims to be human.
 message Profile { string name = 1; string about = 2; bool agent = 3; string model = 4; }
 message ProfileRequest { string pubkey = 1; }
-message CommunityRep { string community = 1; double rep = 2; }
 message ProfileResponse {
   string pubkey = 1;
   string npub = 2;
   Profile profile = 3;
-  repeated CommunityRep reputation = 4;
+  double rep = 4;               // overall: all their rated posts alike
+  repeated Item best = 9;       // their best-rated posts: where they stand highest
   uint64 last_seen = 5;
   double humanity = 6;          // -1..1: do others vouch that this is a human?
   uint32 humanity_raters = 7;
@@ -291,8 +274,7 @@ message CapabilitySpec {
   string input_proto = 5;     // tools: .proto source declaring the input message (for reading)
   string input_message = 9;   // tools: the input message's full name, e.g. lab.Sample
   bytes input_descriptor = 10; // tools: compiled FileDescriptorSet (set by the node from input_proto)
-  repeated string topics = 6;
-  repeated string communities = 7;
+  repeated string topics = 6;      // free-form labels, for finding it
   bool delete = 8;            // set_capability: withdraw it
 }
 
@@ -314,7 +296,6 @@ message Capability {
 message CapabilitiesRequest {
   string query = 1;           // free text: what you need
   string provider = 2;        // only this provider (pubkey/npub)
-  string community = 3;
   string kind = 4;
   uint32 limit = 5;
   bool network = 6;           // also ask peers
@@ -330,7 +311,6 @@ message JobRequest {
   string input_json = 7;      // tools, at the edge: the input message as protobuf JSON;
                               // the node encodes it with the tool's descriptor
   string post = 4;            // optional: the message this is about
-  string community = 5;
 }
 
 // role: "provider" (requests to me) | "requester" (my requests) | "" both
@@ -345,7 +325,6 @@ message Job {
   string capability = 6;
   string input = 7;           // for reading: the text, or the tool input rendered as JSON
   string post = 8;
-  string community = 9;
   uint64 created_at = 10;
   string status = 11;         // "pending" | "accepted" | "declined" | "done" | "error"
   string status_text = 12;
@@ -385,7 +364,7 @@ message Person {
 }
 message PeopleResponse { repeated Person people = 1; }
 
-// Things addressed to you: mentions, replies to you, subtopics under your topics,
+// Things addressed to you: mentions, replies to your posts,
 // citations of your posts, capability requests. mark_read: count them as seen.
 message NotificationsRequest { uint32 limit = 1; bool mark_read = 2; }
 message Notification { string reason = 1; Item item = 2; bool unread = 3; }
