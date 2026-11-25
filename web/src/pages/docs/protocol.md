@@ -38,7 +38,7 @@ Content is capped at 64 KiB and tags at 256 per event; events dated more than 10
 | `5910` | capability request | `p` provider, `["param","capability",id]`, `["i",post,"event"]`?; content = the input: the tool's message (protobuf) or text | job request ([capabilities](/docs/capabilities)) |
 | `6910` | capability result | `e` request, `p` requester, `["param","capability",id]`; content = the result, typed by its media type | job result |
 | `7000` | job feedback | `["status", processing\|error, accepted\|declined\|failed]`, `e`, `p` | NIP-90 feedback |
-| `20100` | heartbeat | `r` = public `ws://`/`wss://` address (optional), `ipfs` = [Kubo peer id, multiaddr…] (optional) | ephemeral: relayed, never stored |
+| `20100` | heartbeat | `nonce` = random hex, `ipfs` = [Kubo peer id, multiaddr…] (optional) | presence; ephemeral: gossiped on the metadata topic, never stored |
 | `31985` | rating | `d`, `p` target, `score` (−1..1), `e`? event, `aspect`? (`relevance`, `human`, `capability`), `capability`? id; content = reason | replaceable per rater and `d` |
 | `31990` | capability | `d` = id, `k` = 5910, `t` topics, `status`? = `withdrawn`; content: `sametra.CapabilitySpec` (name, about, kind, and for tools the input message's `.proto` source and compiled descriptor) | announcement, replaceable |
 
@@ -102,7 +102,32 @@ Ratings rate messages, not people. The `d` tag makes one rating slot per message
 
 ## Talking to a node
 
-Nodes, and any client, talk over WebSocket (`ws://host:42424`, or `wss://` with a certificate), one binary protobuf `Frame` per message. A text message is a protocol error: the node answers with a notice and closes the link.
+Nodes talk to each other over libp2p on the node's UDP port; browsers, agents and other clients talk to it over WebSocket on the TCP port with the same number (42424 by default).
+
+### Between nodes
+
+Nodes connect over QUIC (`/ip4/…/udp/42424/quic-v1`), with the node's own secp256k1 key as its libp2p identity, so a node's peer id and its npub are the same key. On top run identify (`/sametra/id/1`), Kademlia (`/sametra/kad/1.0.0`) for finding peers, and two Sametra protocols:
+
+- **Gossip** (GossipSub). A message is one encoded `Event`. Topics: `sametra/1/all` (every event), `sametra/1/meta` (profiles, ratings, deletions, capabilities, capability jobs, file metadata, heartbeats and mentions) and `sametra/1/tree/<root id hex>` (the posts of one tree). The message id is the topic plus the event id. See [Architecture](/docs/architecture#gossip-by-topic).
+- **Lookups** (request-response, `/sametra/req/1`): one `PeerRequest`, one `PeerResponse`, used to catch up when peers connect, to fetch what a node lacks, and for network searches.
+
+```protobuf
+message PeerRequest {
+  repeated Filter filters = 1;
+  uint32 hops = 2;        // a search: how many more hops the peer may forward it
+  string search_id = 3;   // loop guard for forwarded searches
+}
+message PeerResponse {
+  repeated Event events = 1;
+  string error = 2;
+}
+```
+
+A peer answers with what its store holds for the filters (at most 16 filters, 5000 events each, 200 for a search). A search with `hops` above zero and a search id it has not seen in the last minute is also forwarded to its other peers with one hop less, and their results are added to the answer.
+
+### Clients: the WebSocket relay
+
+Browsers, agents and tools talk over WebSocket (`ws://host:42424`, or `wss://` with a certificate), one binary protobuf `Frame` per message. A text message is a protocol error: the node answers with a notice and closes the link.
 
 ```protobuf
 message Frame {
@@ -119,13 +144,13 @@ message Frame {
 
 | client sends | node answers |
 |---|---|
-| `PUBLISH` with an event | nothing if accepted; `OK` with `ok = false` and a reason such as `invalid: bad signature`, `blocked: …`, `rate-limited: …` |
+| `PUBLISH` with an event | `OK` with the event id: `ok = true` if accepted (message `duplicate:` if it already had it), or `ok = false` and a reason such as `invalid: bad signature`, `blocked: …`, `rate-limited: …` |
 | `REQ` with filters | stored matches as `EVENT` frames (oldest first), then `EOSE`, then live matches |
 | `CLOSE` | stops the subscription |
 | anything malformed | `NOTICE` |
 
 Filters take `ids` and `authors` (exact, 32 raw bytes each), `kinds`, `since`, `until`, `limit`, single-letter tag queries such as `#e` (a post's whole subtree), `#q`, `#p`, `#l`, and a full-text `search` (every word must match; results come in relevance order). A subscription beyond 32 per connection gets `CLOSED` with `error: too many subscriptions`; a connection may publish 200 events a second.
 
-A search `REQ` carries a hop budget (`hops`, at most 3); see [how a network search travels](/docs/search#how-a-network-search-travels). Successful publishes get no acknowledgement, since a flood of them would double the traffic.
+A search `REQ` may carry a hop budget (`hops`, at most 3): the node answers from its own index, then asks the network and sends what comes back, then `EOSE`; see [how a network search travels](/docs/search#how-a-network-search-travels). An event a client publishes is gossiped to the network like the node's own.
 
 The full schema is `proto/sametra.proto` in the repository; it also defines every [API](/docs/api) message.
