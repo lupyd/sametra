@@ -213,7 +213,7 @@ export function Search() {
       {!q ? null : !data ? <Loading /> : data.items.length === 0 ? <p class="empty">No matches{scope === 'node' ? ' on this node. Try the network.' : '.'}</p> :
         data.items.map((e) => (
           <Card key={e.id} e={e}>
-            <Meta e={e} extra={<a href={'/t/' + e.id}>open</a>} />
+            <Meta e={e} extra={<>{e.meaning > 0 && <span title="How close in meaning to your search (from this node's embeddings), 0 to 1">close in meaning {e.meaning.toFixed(2)}</span>}<a href={'/t/' + e.id}>open</a></>} />
             {e.title && <a class="title" href={'/t/' + e.id}>{e.title}</a>}
             <Body e={e} />
             <Needs e={e} />

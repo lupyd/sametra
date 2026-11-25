@@ -362,6 +362,13 @@ describe('relevance, needs and search scopes', () => {
     expect(sent('request')).toMatchObject([{ provider: 'h'.repeat(64), capability: 'assay', input_json: '{"sample":"S1"}', input_text: '', post: 'f'.repeat(64) }]);
   });
 
+  it('search results found by meaning say so', async () => {
+    await mount('/search?q=car%20breakdown', { search: () => ({ items: [item({ title: 'Automobile engine failure', meaning: 0.81 }), item({ id: 'b'.repeat(64), title: 'By words' })] }) });
+    const cards = $$('article');
+    expect(cards[0].textContent).toContain('close in meaning 0.81');
+    expect(cards[1].textContent).not.toContain('close in meaning');
+  });
+
   it('search scopes, and search within a post', async () => {
     await mount('/search?q=marker', { search: () => ({ items: [item({ needs: ['assay'] })] }) });
     expect(sent('search').at(-1)).toMatchObject({ query: 'marker', scope: 'node', within: '' });

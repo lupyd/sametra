@@ -160,6 +160,7 @@ fn view(st: &Store, m: &Model, e: &Event, full: bool, cx: &Cx) -> Item {
             .map(|pk| Mention { pubkey: pk.hex(), npub: npub(&pk), name: name_of(st, &pk) })
             .collect(),
         text_match: 0.0,
+        meaning: 0.0,
     }
 }
 
@@ -607,33 +608,66 @@ async fn search(node: &Arc<Node>, r: SearchRequest) -> R<Items> {
         "network" => Some(2),
         other => return Err(format!("unknown scope '{other}': use node or network")),
     };
+    // what peers matched (by words or meaning), in the order they came
+    let mut remote: Vec<H32> = vec![];
     if let Some(hops) = hops {
         let mut f = Filter { kinds: Some(vec![K_POST]), search: Some(q.clone()), limit: Some(50), ..Default::default() };
         if let Some(w) = within {
             f.tags = vec![("e".into(), vec![w.hex()])]; // everything under it names it
         }
-        node.remote_search(vec![f], hops).await;
+        remote = node.remote_search(vec![f], hops).await.iter().filter(|e| e.kind == K_POST).map(|e| e.id).collect();
     }
     let under = |e: &Event| within.is_none_or(|w| e.id == w || e.ancestors().contains(&w));
-    let hits: Vec<(Ev, f64)> = {
+    // by meaning too, when this node has an embeddings service
+    let close: std::collections::HashMap<H32, f64> = node.semantic_hits(&q, 200).await.into_iter().collect();
+    let hits: Vec<(Ev, f64, f64, f64)> = {
         let st = node.store.lock().unwrap();
-        st.search(&q, 2000)
+        let text: Vec<(Ev, f64)> = st
+            .search(&q, 2000)
             .into_iter()
             .filter_map(|h| st.get(&h.id).map(|e| (e.clone(), h.score * if h.all { 1.0 } else { 0.4 })))
             .filter(|(e, _)| e.kind == K_POST && under(e))
             .take(1000)
-            .collect()
+            .collect();
+        let only_text = close.is_empty() && remote.iter().all(|id| text.iter().any(|(e, _)| e.id == *id));
+        if only_text {
+            text.into_iter().map(|(e, t)| (e, t, t, 0.0)).collect()
+        } else {
+            // reciprocal rank fusion (k = 60) of the rankings: by words here, by
+            // meaning here, and what peers matched (which this node may not have
+            // indexed or embedded yet); scaled so the top of one list alone is 1
+            let mut by_meaning: Vec<(H32, f64)> = close.iter().map(|(k, v)| (*k, *v)).collect();
+            by_meaning.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+            let rrf = |rank: usize| 61.0 / (61.0 + rank as f64);
+            let mut fused: std::collections::HashMap<H32, (Ev, f64, f64)> = std::collections::HashMap::new();
+            for (i, (e, t)) in text.into_iter().enumerate() {
+                fused.insert(e.id, (e, rrf(i), t));
+            }
+            let others = by_meaning.iter().map(|x| x.0).enumerate().chain(remote.iter().copied().enumerate());
+            for (j, id) in others {
+                if let Some(x) = fused.get_mut(&id) {
+                    x.1 += rrf(j);
+                } else if let Some(e) = st.get(&id).filter(|e| e.kind == K_POST && under(e)) {
+                    fused.insert(id, (e.clone(), rrf(j), 0.0));
+                }
+            }
+            fused.into_values().map(|(e, f, t)| {
+                let m = close.get(&e.id).copied().unwrap_or(0.0);
+                (e, f, t, m)
+            }).collect()
+        }
     };
     let m = node.model();
     let cx = Cx::of(node);
     let mut st = node.store.lock().unwrap();
     let mut items: Vec<(f64, Item)> = hits
         .iter()
-        .map(|(e, t)| {
+        .map(|(e, matched, t, meaning)| {
             let mut v = view(&st, &m, e, false, &cx);
             let quality = (v.relevance + v.score + 0.5 * v.author_rep + 0.3 * (1.0 + v.cited_by as f64).ln() + 0.2 * (1.0 + v.popularity).ln()).max(0.0);
-            let score = t * (1.0 + quality) * if v.low_trust { 0.5 } else { 1.0 };
+            let score = matched * (1.0 + quality) * if v.low_trust { 0.5 } else { 1.0 };
             v.text_match = round2(*t);
+            v.meaning = round2(*meaning);
             (score, v)
         })
         .collect();

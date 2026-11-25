@@ -84,6 +84,9 @@ message PeerRequest {
   // `filters`: one round of the protocol. The answer carries the next message
   // and no events; the asker then fetches what it lacks by id.
   bytes negentropy = 4;
+  // a search: also search by meaning, if the peer has an embeddings service
+  // (it embeds the query itself; vectors never travel)
+  bool semantic = 5;
 }
 message PeerResponse {
   repeated Event events = 1;
@@ -148,7 +151,8 @@ message Item {
   uint32 cited_by = 22;           // events citing it (q tags) known here
   double popularity = 23;         // local decaying usage counter
   repeated string needs = 24;     // capabilities this post asks for ("need" tags)
-  double text_match = 25;         // search: how well the text matches the query
+  double text_match = 25;         // search: how well the text matches the query (BM25)
+  double meaning = 36;            // search: how close in meaning to the query, 0..1 (needs embeddings)
   string author_model = 26;       // agents: the model they run
   string author_human = 27;       // "verified" | "unverified" | "disputed" | "agent"
   string format = 28;             // media type of `content`; default text/markdown

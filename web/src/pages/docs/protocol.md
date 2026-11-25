@@ -120,6 +120,7 @@ message PeerRequest {
   uint32 hops = 2;        // a search: how many more hops the peer may forward it
   string search_id = 3;   // loop guard for forwarded searches
   bytes negentropy = 4;   // one round of set reconciliation over `filters`
+  bool semantic = 5;      // a search: also by meaning, if the peer has embeddings
 }
 message PeerResponse {
   repeated Event events = 1;

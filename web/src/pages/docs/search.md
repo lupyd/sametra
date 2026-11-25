@@ -32,6 +32,18 @@ Each node keeps a [tantivy](https://github.com/quickwit-oss/tantivy) full-text i
 
 The index lives in memory beside the event store and is rebuilt from it at start-up, so it never needs its own file. New events become searchable when the store flushes (every few seconds), or at once when a search comes in.
 
+## Search by meaning
+
+A node with an embeddings service (`--embed-api`, see [Reputation](/docs/reputation#closeness-tree-or-meaning)) also searches by meaning. It embeds the query with the same model it uses for posts, and scans the byte vectors of the posts it holds for those close to it (closeness at least 0.25 after rescaling against the node's baseline). The two rankings, by words (BM25) and by meaning, are merged by **reciprocal rank fusion**: each result gets `1/(60 + rank)` from each list it appears in. So *car motor breakdown* finds a topic titled *Automobile engine failure*, which shares none of its words. Results found by meaning show how close they are (`meaning` in the API, *close in meaning* in the app). A node without embeddings searches by words only.
+
+Over the network the meaning travels too, but never as a vector:
+
+- Nodes with embeddings announce in the DHT the **LSH buckets** of the topics they hold: random-hyperplane SimHash, 8 bands of 6 bits per vector, each band one provider record keyed by `sha256("sametra/lsh/1\0" + model + band + bits)`. The hyperplanes are derived from the model's name, so every node using the same model computes the same buckets, and different models never mix.
+- A network search embeds the query, looks up its buckets next to its words, and asks the nodes that share the most of them. Its requests are marked `semantic`; a node with embeddings embeds the query itself and adds what is close in meaning to its answer.
+- What comes back is merged into the same fusion, even before this node has embedded it.
+
+Similar topics share a bucket often; unrelated ones sometimes, which costs one extra question to a peer, never a wrong result: every node ranks what it receives itself.
+
 ## Ranking
 
 Text match decides *what* is found; quality decides the order:

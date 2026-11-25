@@ -617,6 +617,22 @@ async fn answer(node: &Arc<Node>, peer: PeerId, r: pb::PeerRequest) -> pb::PeerR
     };
     let mut seen = HashSet::new();
     hits.retain(|e| seen.insert(e.id));
+    // by meaning too, when asked and when this node can
+    if r.semantic
+        && let Some(q) = filters.iter().find_map(|f| f.search.clone())
+    {
+        let close = node.semantic_hits(&q, 50).await;
+        let rest: Vec<Filter> = filters.iter().map(|f| Filter { search: None, limit: None, ..f.clone() }).collect();
+        let st = node.store.lock().unwrap();
+        for (id, _) in close {
+            if let Some(e) = st.get(&id)
+                && rest.iter().any(|f| f.matches(e))
+                && seen.insert(e.id)
+            {
+                hits.push(e.clone());
+            }
+        }
+    }
     {
         // popularity: found by a search, or fetched by id
         let by_id = filters.iter().any(|f| f.ids.is_some());
@@ -634,7 +650,8 @@ async fn answer(node: &Arc<Node>, peer: PeerId, r: pb::PeerRequest) -> pb::PeerR
         .then(|| node.search_slots.clone().try_acquire_owned().ok())
         .flatten();
     if let Some(_slot) = slot {
-        let more = node.ask_peers(filters, crate::node::search_timeout(hops - 1), hops - 1, Some(peer), Some(r.search_id)).await;
+        let near = node.near_peers(Some(peer));
+        let more = node.ask_with(&near, filters, crate::node::search_timeout(hops - 1), hops - 1, Some(r.search_id), r.semantic).await;
         for e in more {
             if seen.insert(e.id) {
                 hits.push(e);
@@ -705,16 +722,22 @@ impl Node {
     /// they return until all answered or `timeout` passed. What comes back is
     /// stored (it was asked for).
     pub async fn ask_peers(&self, filters: Vec<Filter>, timeout: Duration, hops: u32, exclude: Option<PeerId>, sid: Option<String>) -> Vec<Ev> {
-        let Some(p2p) = self.p2p.get().cloned() else { return vec![] };
-        let peers: Vec<PeerId> = p2p.peers().into_iter().map(|x| x.0).filter(|p| Some(*p) != exclude).take(crate::node::FANOUT).collect();
-        self.ask(&peers, filters, timeout, hops, sid).await
+        let peers = self.near_peers(exclude);
+        self.ask_with(&peers, filters, timeout, hops, sid, false).await
+    }
+
+    /// Up to FANOUT connected peers (except `exclude`).
+    pub fn near_peers(&self, exclude: Option<PeerId>) -> Vec<PeerId> {
+        let Some(p2p) = self.p2p.get() else { return vec![] };
+        p2p.peers().into_iter().map(|x| x.0).filter(|p| Some(*p) != exclude).take(crate::node::FANOUT).collect()
     }
 
     /// Send `filters` to these peers (connecting if needed) and collect, store
-    /// and return what they answer within `timeout`.
-    pub async fn ask(&self, peers: &[PeerId], filters: Vec<Filter>, timeout: Duration, hops: u32, sid: Option<String>) -> Vec<Ev> {
+    /// and return what they answer within `timeout`. `semantic`: a search that
+    /// peers may also run by meaning.
+    pub async fn ask_with(&self, peers: &[PeerId], filters: Vec<Filter>, timeout: Duration, hops: u32, sid: Option<String>, semantic: bool) -> Vec<Ev> {
         let Some(p2p) = self.p2p.get().cloned() else { return vec![] };
-        let req = pb::PeerRequest { filters: filters.iter().map(Filter::to_pb).collect(), hops, search_id: sid.unwrap_or_default(), ..Default::default() };
+        let req = pb::PeerRequest { filters: filters.iter().map(Filter::to_pb).collect(), hops, search_id: sid.unwrap_or_default(), semantic, ..Default::default() };
         let started = tokio::time::Instant::now();
         let asks = peers.iter().map(|p| {
             let (p2p, req) = (p2p.clone(), req.clone());
@@ -850,8 +873,23 @@ impl Node {
                 }
             }
         }
+        // the meaning of the topics held: LSH buckets of their vectors (only
+        // nodes with the same embedding model share these keys)
+        let mut semantic = BTreeSet::new();
+        {
+            let vs = self.vectors.read().unwrap();
+            if !vs.model.is_empty() {
+                for v in anchors.iter().filter_map(|a| vs.get(a)) {
+                    if semantic.len() >= MAX_TERMS {
+                        break;
+                    }
+                    semantic.extend(crate::embed::lsh_keys(&vs.model, v));
+                }
+            }
+        }
         let mut out = anchors;
         out.extend(words.iter().map(|w| crate::index::term_key(w)));
+        out.extend(semantic);
         out
     }
 
@@ -902,9 +940,10 @@ impl Node {
             if targets.is_empty() {
                 return vec![];
             }
-            self.ask(&targets, filters.clone(), crate::node::search_timeout(0) + Duration::from_secs(2), 0, None).await
+            self.ask_with(&targets, filters.clone(), crate::node::search_timeout(0) + Duration::from_secs(2), 0, None, true).await
         };
-        let around = self.ask_peers(filters.clone(), crate::node::search_timeout(hops), hops, None, Some(sid));
+        let near = self.near_peers(None);
+        let around = self.ask_with(&near, filters.clone(), crate::node::search_timeout(hops), hops, Some(sid), true);
         let (a, b) = libp2p::futures::future::join(targeted, around).await;
         let mut seen = HashSet::new();
         a.into_iter().chain(b).filter(|e| seen.insert(e.id)).collect()
@@ -922,7 +961,12 @@ impl Node {
                 let anchor = self.store.lock().unwrap().get(&w).and_then(|e| e.anchors().last().copied()).unwrap_or(w);
                 vec![anchor]
             }
-            None => crate::index::analyze(&q).iter().take(5).map(|w| crate::index::term_key(w)).collect(),
+            None => {
+                // its words, and (with an embeddings service) its meaning's buckets
+                let mut k: Vec<H32> = crate::index::analyze(&q).iter().take(5).map(|w| crate::index::term_key(w)).collect();
+                k.extend(self.semantic_keys(&q).await);
+                k
+            }
         };
         let lists = tokio::time::timeout(Duration::from_secs(4), libp2p::futures::future::join_all(keys.iter().map(|k| p2p.find_providers(*k)))).await.unwrap_or_default();
         let mut count: HashMap<PeerId, usize> = HashMap::new();
