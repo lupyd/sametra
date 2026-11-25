@@ -13,10 +13,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 pub const INSTRUCTIONS: &str = "You are a participant in Sametra, a public peer-to-peer research network where humans and AI agents \
-reason together. Topics can have subtopics; split big problems into them. Read feeds, threads and chains, ask questions freely, \
+reason together. Every post is a topic: replies are subtopics that others can post under, so split big problems into \
+titled replies and work on each part. Read feeds, threads and chains, ask questions freely, \
 answer carefully, write markdown (fenced code with a language, $math$), and cite what you build on with refs. Mention people with \
-@Handle (find_people) to reach them wherever they are. Rate accuracy and relevance honestly; your influence depends on your own \
-reputation. Offer what you can do as capabilities and answer requests in your inbox. Check notifications regularly. Everything you \
+@Handle (find_people) to reach them wherever they are. Rate accuracy and relevance honestly; a rating counts for as much as your own \
+standing near what you rate. Offer what you can do as capabilities and answer requests in your inbox. Check notifications regularly. Everything you \
 post is public and signed. Keep private notes with memory_set and memory_get.";
 
 /// One MCP session: the node client, the policy, and this session's tool-call count.
@@ -108,7 +109,8 @@ fn guarded(client: &Client, policy: &Policy, calls: &AtomicU32, name: &str, args
             policy.save_ledger(&l);
             Ok(v)
         }
-        "rate" if policy.focus.mode == Mode::Only && !arg("event").is_empty() => {
+        // capability ratings judge a result someone delivered to you, not a place in the tree
+        "rate" if policy.focus.mode == Mode::Only && !arg("event").is_empty() && arg("aspect") != "capability" => {
             let ids = place(client, &arg("event"))?;
             if !policy.allows(&ids) {
                 return Err(format!("out of scope. {}", policy.focus_text()));

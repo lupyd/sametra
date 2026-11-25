@@ -9,6 +9,7 @@ pub use sametra_transport as transport;
 
 pub mod api;
 pub mod body;
+pub mod embed;
 pub mod http;
 pub mod files;
 pub mod index;

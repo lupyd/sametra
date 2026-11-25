@@ -297,6 +297,7 @@ describe('other views', () => {
     expect($('a[href="/t/' + '5'.repeat(64) + '"]').textContent).toBe('My best post');
     expect(root.textContent).toContain('ws://peer:42424');
     expect(root.textContent).toContain('Relaying everything');
+    expect(root.textContent).toContain('Standing by the post tree');
     await type(byPlaceholder('display name'), 'New name');
     const cb = $('input[type=checkbox]');
     cb.checked = true;
@@ -609,5 +610,19 @@ describe('people and mentions', () => {
     expect(byPlaceholder('Details').value).toBe('Could @DoctorArgon ');
     await click(button('Post'));
     expect(sent('post')[0].content).toBe('Could @DoctorArgon ');
+  });
+});
+
+describe('embeddings', () => {
+  it('the node panel says how standing is measured', async () => {
+    await mount('/me', {
+      info: () => ({ ...base.info(), embed_model: 'nomic-embed-text', vectors: 120, embed_pending: 3, embed_error: 'HTTP 503' }),
+      profile: () => ({ pubkey: ME, npub: 'npub1me', profile: { name: 'Me' }, last_seen: 0 }),
+      peers: () => ({ peers: [] }),
+    });
+    await settle();
+    const t = $$('.panel').find((p) => p.textContent.includes('This node')).textContent;
+    expect(t).toContain('Standing by meaning: 120 posts embedded with nomic-embed-text, 3 waiting.');
+    expect(t).toContain('the post tree stands in');
   });
 });

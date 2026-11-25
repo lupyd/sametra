@@ -7,12 +7,14 @@ build = "build.rs"
 default-run = "sametra"
 
 [features]
-default = ["tls", "mcp-http", "ipfs"]
+default = ["tls", "mcp-http", "ipfs", "embed"]
 tls = ["sametra-transport/tls", "sametra-mcp/tls"]
 # `sametra mcp --http`: MCP over Streamable HTTP for harnesses that connect by URL
 mcp-http = ["sametra-mcp/http"]
 # files on IPFS through a Kubo daemon (its RPC API): /ipfs/CID, uploads, peering
 ipfs = ["dep:hyper", "dep:hyper-util", "dep:http-body-util"]
+# contextual standing from text embeddings, through an OpenAI-compatible /v1/embeddings service
+embed = ["dep:hyper", "dep:hyper-util", "dep:http-body-util"]
 
 [dependencies]
 sametra-proto.workspace = true

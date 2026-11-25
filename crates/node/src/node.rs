@@ -163,6 +163,11 @@ pub struct Node {
     seen: Mutex<HashMap<H32, u64>>, // recent ephemeral ids
     /// message scores and contextual standing, rebuilt when ratings change
     model_cache: Mutex<Option<(Arc<Model>, u64)>>,
+    /// post embeddings, for closeness in meaning (see embed.rs)
+    pub vectors: Arc<std::sync::RwLock<crate::embed::Vectors>>,
+    /// the embeddings service, if configured
+    #[cfg(feature = "embed")]
+    pub embedder: std::sync::OnceLock<Arc<crate::embed::Embedder>>,
     pub memory: Mutex<BTreeMap<String, String>>,
     /// notifications up to this time have been seen
     pub notifications_read: AtomicU64,
@@ -193,19 +198,9 @@ pub const ORIGIN_LOCAL: u64 = 0;
 /// jobs (so requests and results find their way through scoped nodes).
 const GLOBAL_KINDS: [u32; 8] = [K_PROFILE, K_RATING, K_DELETE, K_CAPABILITY, K_JOB, K_JOB_RESULT, K_JOB_FEEDBACK, K_FILE];
 
-/// Closeness from the post tree: posts in the same tree are close, the rest far.
-/// (The fallback when no embeddings are available.)
-pub struct TreeCloseness {
-    root_of: HashMap<H32, H32>,
-}
-/// How much standing in one tree counts in another.
+/// How much standing in one tree counts in another, when the posts have no
+/// embeddings to compare (see embed::Closeness).
 pub const FAR: f64 = 0.1;
-impl rep::Closeness for TreeCloseness {
-    fn closeness(&self, a: &H32, b: &H32) -> f64 {
-        let r = |x: &H32| self.root_of.get(x).copied().unwrap_or(*x);
-        if a == b || r(a) == r(b) { 1.0 } else { FAR }
-    }
-}
 
 impl Node {
     pub fn new(cfg: Config, keys: Keys) -> std::io::Result<Arc<Node>> {
@@ -237,6 +232,7 @@ impl Node {
             .map(|m| m.entries.into_iter().map(|e| (e.key, e.value)).collect())
             .unwrap_or_default();
         let (tx, _) = broadcast::channel(4096);
+        let vectors_path = cfg.data.join("vectors.pb");
         let node = Arc::new(Node {
             cfg,
             keys,
@@ -247,6 +243,9 @@ impl Node {
             pending: Mutex::new(HashMap::new()),
             seen: Mutex::new(HashMap::new()),
             model_cache: Mutex::new(None),
+            vectors: Arc::new(std::sync::RwLock::new(crate::embed::Vectors::load(&vectors_path))),
+            #[cfg(feature = "embed")]
+            embedder: std::sync::OnceLock::new(),
             memory: Mutex::new(memory),
             notifications_read: AtomicU64::new(state.notifications_read),
             searches: Mutex::new(HashMap::new()),
@@ -366,6 +365,12 @@ impl Node {
                 if rating {
                     *self.model_cache.lock().unwrap() = None;
                 }
+                #[cfg(feature = "embed")]
+                if e.kind == K_POST
+                    && let Some(emb) = self.embedder.get()
+                {
+                    emb.enqueue(e.id);
+                }
                 // keep the files posts link to, and help serve them
                 #[cfg(feature = "ipfs")]
                 if e.kind == K_POST
@@ -449,9 +454,28 @@ impl Node {
         m
     }
 
-    /// How close two posts are: the post tree (embeddings come next).
+    /// How close two posts are: in meaning where both are embedded, else by
+    /// the post tree.
     fn closeness(&self, roots: HashMap<H32, H32>) -> Arc<dyn rep::Closeness> {
-        Arc::new(TreeCloseness { root_of: roots })
+        Arc::new(crate::embed::Closeness { vectors: self.vectors.clone(), root_of: roots })
+    }
+
+    /// Save post vectors (dropping those of forgotten posts) when they changed.
+    pub fn save_vectors(&self) {
+        let pb = {
+            let mut vs = self.vectors.write().unwrap();
+            if !vs.dirty {
+                return;
+            }
+            {
+                let st = self.store.lock().unwrap();
+                vs.retain(|id| st.get(id).is_some());
+            }
+            vs.calibrate();
+            vs.dirty = false;
+            vs.to_pb()
+        };
+        write_atomic(&self.cfg.data.join("vectors.pb"), &pb::encode(&pb));
     }
 
     /// Who the network vouches is human (see rep::humanity), cached until a new
@@ -816,6 +840,7 @@ pub fn spawn_background(node: Arc<Node>) {
             i += 1;
             n.store.lock().unwrap().flush();
             if i.is_multiple_of(12) {
+                n.save_vectors();
                 let evicted = {
                     let rank = n.ranking();
                     let r = crate::store::Retention { max_events: n.cfg.max_events, max_age: n.cfg.max_age };

@@ -318,6 +318,9 @@ function NodePanel() {
     <div class="panel">
       <h3>This node</h3>
       <p class="small">Keeps {plural(i.events_cached, 'event', 'events')}, {i.pinned} pinned. Relaying {i.relay_all ? 'everything' : 'only what it follows'}.{i.public_addr && <> Reachable at <code>{i.public_addr}</code>.</>}</p>
+      <p class="small">{i.embed_model
+        ? <>Standing by meaning: {plural(i.vectors, 'post', 'posts')} embedded with <code>{i.embed_model}</code>{i.embed_pending > 0 && <>, {i.embed_pending} waiting</>}.{i.embed_error && <span class="neg"> The service is not answering ({i.embed_error}); the post tree stands in.</span>}</>
+        : <span class="muted">Standing by the post tree. Give the node an embeddings service (<code>--embed-api</code>) to carry it across close subjects. <a href="/docs/reputation">How</a></span>}</p>
       {data && (data.peers.length === 0 ? <p class="muted small">No peers connected. Start the node with <code>--peer ws://host:42424</code>.</p> :
         <table class="rep"><tbody>{data.peers.map((p, k) => <tr key={k}><td class="mono small">{p.addr}</td><td class="muted small">{p.outbound ? 'outbound' : 'inbound'}</td><td class="muted small">{ago(p.since)}</td></tr>)}</tbody></table>)}
     </div>

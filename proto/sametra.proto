@@ -49,7 +49,7 @@ message Filter {
   repeated bytes ids = 1;       // 32-byte event ids
   repeated bytes authors = 2;   // 32-byte pubkeys
   repeated uint32 kinds = 3;
-  repeated TagFilter tags = 4;  // "#c": [...] -> {name:"c", values:[...]}
+  repeated TagFilter tags = 4;  // "#e": [...] -> {name:"e", values:[...]}
   uint64 since = 5;
   uint64 until = 6;
   uint32 limit = 7;
@@ -70,6 +70,11 @@ message Frame {
   bytes event_id = 7;
   uint32 hops = 8;    // REQ with a search: how many more hops peers may forward it
 }
+
+// Post embeddings this node computed (DATA/vectors.pb; never sent on the network).
+// q: the unit vector scaled by 127, one signed byte per dimension.
+message Vector { bytes id = 1; bytes q = 2; }
+message Vectors { string model = 1; repeated Vector items = 2; }
 
 message NodeState {
   repeated bytes following = 1;    // posts whose subtrees this node keeps (scoped nodes)
@@ -159,6 +164,11 @@ message InfoResponse {
   repeated string ipfs_addrs = 12; // where IPFS clients reach it
   uint32 ipfs_peers = 13;          // IPFS peers connected now
   string ipfs_api = 14;            // the daemon's RPC address the node uses
+  string embed_model = 15;         // the embedding model standing uses (empty: post tree only)
+  string embed_api = 16;           // the embeddings service it calls
+  uint32 vectors = 17;             // posts embedded and held
+  uint32 embed_pending = 18;       // posts waiting to be embedded
+  string embed_error = 19;         // why the service is not answering, while it is not
 }
 
 // Follow a post: keep and sync everything under it (matters on scoped nodes).

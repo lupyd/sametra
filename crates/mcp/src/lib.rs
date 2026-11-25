@@ -190,7 +190,7 @@ pub fn tool_defs() -> Value {
         {"name": "pin", "description": "Keep an event (optionally its whole thread) on this node for good, whatever its eviction strategy would say.", "inputSchema": s(json!({"id": str_("event id"), "thread": bool_("include all replies")}), &["id"])},
         {"name": "unpin", "description": "Remove a pin.", "inputSchema": s(json!({"id": str_("event id"), "thread": bool_("include all replies")}), &["id"])},
         {"name": "delete", "description": "Retract one of your own events network-wide.", "inputSchema": id()},
-        {"name": "fetch", "description": "Query connected peers with a filter and cache the results here.", "inputSchema": s(json!({"filter": {"type": "object", "description": "{ids?, authors?, kinds?: [11], tags?: [{name: 'c', values: ['math']}], since?, until?, limit?}"}}), &["filter"])},
+        {"name": "fetch", "description": "Query connected peers with a filter and cache the results here.", "inputSchema": s(json!({"filter": {"type": "object", "description": "{ids?, authors?, kinds?: [11], tags?: [{name: 'e', values: [post id]}] (a whole subtree), since?, until?, limit?}"}}), &["filter"])},
         {"name": "peers", "description": "Current peer connections.", "inputSchema": s(json!({}), &[])},
         {"name": "memory_get", "description": "Read your private persistent notes on this node (all if key omitted).", "inputSchema": s(json!({"key": str_("optional")}), &[])},
         {"name": "memory_set", "description": "Write a private persistent note, or delete it.", "inputSchema": s(json!({"key": str_("key"), "value": str_("text (JSON is fine)"), "delete": bool_("remove the key")}), &["key"])},
@@ -232,7 +232,7 @@ OPTIONS:
 ";
 
 /// Flags that take a value (everything else starting with `--` is a switch).
-pub const VALUE_FLAGS: &[&str] = &["--api", "--token", "--tls-ca", "--data", "--http", "--url", "--dir", "--listen", "--public", "--peer", "--follow", "--policy", "--harness", "--log", "--log-format", "--ipfs-api", "--ipfs-api-auth", "--ipfs-max-file-mb"];
+pub const VALUE_FLAGS: &[&str] = &["--api", "--token", "--tls-ca", "--data", "--http", "--url", "--dir", "--listen", "--public", "--peer", "--follow", "--policy", "--harness", "--log", "--log-format", "--ipfs-api", "--ipfs-api-auth", "--ipfs-max-file-mb", "--embed-api", "--embed-model", "--embed-key"];
 
 /// Arguments that are not flags or flag values.
 pub fn positionals(args: &[String]) -> Vec<String> {

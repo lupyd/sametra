@@ -191,6 +191,8 @@ pub fn compute(ratings: &[Ev], author_of: impl Fn(&H32) -> Option<H32>, close: A
     let mut trust: HashMap<H32, HashMap<H32, (f64, usize)>> = HashMap::new();
     let mut rel: HashMap<H32, HashMap<H32, (f64, usize)>> = HashMap::new();
     let mut author: HashMap<H32, H32> = HashMap::new();
+    // when each message was last rated: the cap keeps the most recent
+    let mut last: HashMap<H32, u64> = HashMap::new();
     for r in ratings.iter().filter_map(|e| parse_rating(e)) {
         let into = match r.aspect {
             Aspect::Trust => &mut trust,
@@ -200,6 +202,8 @@ pub fn compute(ratings: &[Ev], author_of: impl Fn(&H32) -> Option<H32>, close: A
         let m = r.event.unwrap();
         let Some(a) = author_of(&m).filter(|a| *a == r.target) else { continue };
         author.insert(m, a);
+        let l = last.entry(m).or_default();
+        *l = (*l).max(r.at);
         let v = into.entry(m).or_default().entry(r.rater).or_insert((0.0, 0));
         v.0 += r.score * decay(r.at, now);
         v.1 += 1;
@@ -221,7 +225,7 @@ pub fn compute(ratings: &[Ev], author_of: impl Fn(&H32) -> Option<H32>, close: A
         by_author0.entry(author[m]).or_default().push((*m, votes));
     }
     for ms in by_author0.values_mut() {
-        ms.sort_by_key(|x| x.0);
+        ms.sort_by_key(|x| (last[&x.0], x.0));
         let n = ms.len();
         ms.drain(..n.saturating_sub(MAX_PER_AUTHOR));
     }
@@ -258,7 +262,7 @@ pub fn compute(ratings: &[Ev], author_of: impl Fn(&H32) -> Option<H32>, close: A
         raters.entry(author[m]).or_default().extend(trust[m].iter().map(|v| v.0));
     }
     for ms in by_author.values_mut() {
-        ms.sort_by_key(|x| x.0);
+        ms.sort_by_key(|x| (last[&x.0], x.0));
         let n = ms.len();
         ms.drain(..n.saturating_sub(MAX_PER_AUTHOR));
     }
@@ -473,6 +477,31 @@ mod tests {
         w.rate(&b, &ma, 1.0);
         let both = w.model(1.0).event(&mb);
         assert!((both - single).abs() < 1e-9, "{both} vs {single}");
+    }
+
+    #[test]
+    fn the_cap_keeps_the_most_recently_rated() {
+        let mut w = World::new();
+        let (a, r) = (Keys::generate(), Keys::generate());
+        let n = MAX_PER_AUTHOR + 10;
+        let ids: Vec<H32> = (0..n)
+            .map(|i| {
+                let mut b = [0xAB; 32];
+                b[..8].copy_from_slice(&(i as u64).to_be_bytes());
+                let id = H32(b);
+                w.authors.insert(id, a.pubkey);
+                w.areas.insert(id, 1);
+                id
+            })
+            .collect();
+        // rated oldest first; ids sort the other way round, so order by id would keep the wrong ones
+        for (i, id) in ids.iter().rev().enumerate() {
+            w.rate_aged(&r, id, 1.0, NOW - (n - i) as u64, "trust");
+        }
+        let m = w.model(1.0);
+        let kept: HashSet<H32> = m.by_author[&a.pubkey].iter().map(|x| x.0).collect();
+        assert_eq!(kept.len(), MAX_PER_AUTHOR);
+        assert!(kept.contains(&ids[0]) && !kept.contains(&ids[n - 1]), "the last rated stays, the first rated goes");
     }
 
     #[test]

@@ -62,7 +62,8 @@ async fn deletes_ratings_and_profiles_propagate() {
     let (ka, gid) = (a.node.keys.pubkey, H32::from_hex(&good.id).unwrap());
     let rep_on = |n: &TestNode| n.node.model().near(&ka, &gid);
     assert!(eventually(T, || rep_on(&a) > 0.0).await, "rating reached the author's node");
-    assert!((rep_on(&a) - rep_on(&b)).abs() < 1e-9, "both nodes compute the same reputation");
+    // (models built a second apart differ by the decay over that second, ~1e-8)
+    assert!((rep_on(&a) - rep_on(&b)).abs() < 1e-6, "both nodes compute the same reputation");
     let pr: pb::ProfileResponse = a.ok("profile", &pb::ProfileRequest { pubkey: b.node.keys.pubkey.hex() }).await;
     assert_eq!(pr.profile.unwrap().name, "Bee");
 }

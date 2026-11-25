@@ -55,6 +55,12 @@ IPFS (files, through a Kubo daemon running beside the node; see docker-compose.y
   --ipfs-open-gateway    /ipfs/ fetches from the network for anyone (default: only for the
                          operator; others get what the daemon already has)
 
+EMBEDDINGS (optional; standing then carries across posts on close subjects, in any tree):
+  --embed-api URL        an OpenAI-compatible API, e.g. http://127.0.0.1:11434/v1 (Ollama)
+                         [or $SAMETRA_EMBED_API; default: none, closeness from the post tree]
+  --embed-model NAME     the model to ask for, e.g. nomic-embed-text [or $SAMETRA_EMBED_MODEL]
+  --embed-key KEY        sent as 'Authorization: Bearer KEY' [or $SAMETRA_EMBED_KEY]
+
 IDENTITY:
   Key is read from $SAMETRA_KEY (nsec or hex) or DATA/key; generated on first run.
 ";
@@ -201,7 +207,7 @@ fn ensure_node(args: &[String]) {
 }
 
 /// Node flags `mcp --node` and `agent` pass on to the node they start.
-const NODE_FLAGS: &[&str] = &["--data", "--peer", "--follow", "--public", "--ipfs-api", "--ipfs-api-auth", "--ipfs-max-file-mb"];
+const NODE_FLAGS: &[&str] = &["--data", "--peer", "--follow", "--public", "--ipfs-api", "--ipfs-api-auth", "--ipfs-max-file-mb", "--embed-api", "--embed-model", "--embed-key"];
 const NODE_SWITCHES: &[&str] = &["--no-ipfs", "--ipfs-open-gateway", "--no-relay-all"];
 
 /// Node-only flags are not for the MCP server.
@@ -253,6 +259,18 @@ fn run(args: &[String]) {
         open_gateway: args.iter().any(|a| a == "--ipfs-open-gateway"),
         public: cfg.public_addr.is_some(),
     });
+    #[cfg(feature = "embed")]
+    let embed_cfg = opt(args, "--embed-api").or(std::env::var("SAMETRA_EMBED_API").ok()).filter(|s| !s.is_empty()).map(|api| sametra_node::embed::Config {
+        api,
+        model: opt(args, "--embed-model").or(std::env::var("SAMETRA_EMBED_MODEL").ok()).unwrap_or_default(),
+        auth: opt(args, "--embed-key").or(std::env::var("SAMETRA_EMBED_KEY").ok()).map(|k| format!("Bearer {k}")),
+    });
+    #[cfg(feature = "embed")]
+    let embedder = embed_cfg.map(|c| std::sync::Arc::new(sametra_node::embed::Embedder::new(c).unwrap_or_else(|e| die(&e))));
+    #[cfg(not(feature = "embed"))]
+    if opt(args, "--embed-api").is_some() {
+        die("this build has no embeddings support (feature `embed`)");
+    }
     let json_logs = sametra_mcp::logging::json(args);
     let threads = num(args, "--threads", 2usize).max(1);
     let rt = if threads == 1 {
@@ -304,13 +322,34 @@ fn run(args: &[String]) {
                 }
             });
         }
+        #[cfg(feature = "embed")]
+        if let Some(emb) = embedder {
+            if !json_logs {
+                eprintln!("  embed     {} at {} ({} posts embedded)", emb.cfg.model, emb.cfg.api, node.vectors.read().unwrap().len());
+            }
+            let _ = node.embedder.set(emb.clone());
+            sametra_node::embed::spawn(node.clone(), emb);
+        }
         node::spawn_background(node.clone());
         tokio::select! {
             _ = http::serve(node.clone(), listener) => {}
             _ = tokio::signal::ctrl_c() => { tracing::info!("shutting down"); }
+            _ = terminated() => { tracing::info!("terminated; shutting down"); }
         }
         node.store.lock().unwrap().flush();
+        node.save_vectors();
     });
+}
+
+/// SIGTERM (what `docker stop` and service managers send), so the node saves
+/// its state on the way out as it does for Ctrl-C.
+async fn terminated() {
+    #[cfg(unix)]
+    if let Ok(mut s) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        s.recv().await;
+        return;
+    }
+    std::future::pending::<()>().await
 }
 
 #[cfg(test)]

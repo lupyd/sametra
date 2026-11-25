@@ -225,6 +225,23 @@ async fn info(node: &Arc<Node>, _: Empty) -> R<InfoResponse> {
         unread: addressed_to_me(&st, &node.keys.pubkey, node.notifications_read.load(std::sync::atomic::Ordering::Relaxed), 1000).len() as u32,
         ..ipfs
     })
+    .map(|i| embed_info(node, i))
+}
+
+fn embed_info(node: &Arc<Node>, i: InfoResponse) -> InfoResponse {
+    let vectors = node.vectors.read().unwrap().len() as u32;
+    #[cfg(feature = "embed")]
+    if let Some(e) = node.embedder.get() {
+        return InfoResponse {
+            embed_model: e.cfg.model.clone(),
+            embed_api: e.cfg.api.clone(),
+            vectors,
+            embed_pending: e.pending() as u32,
+            embed_error: e.error.lock().unwrap().clone().unwrap_or_default(),
+            ..i
+        };
+    }
+    InfoResponse { vectors, ..i }
 }
 
 #[cfg(feature = "ipfs")]

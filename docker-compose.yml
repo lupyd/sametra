@@ -7,6 +7,11 @@
 # To join a network, add peers to the node's command, e.g.
 #   command: ["run", "--listen", "0.0.0.0:42424", "--peer", "wss://node.example"]
 # and for a public node also "--public", "wss://your.host" and IPFS_ANNOUNCE below.
+#
+# Optional: embeddings, so standing carries across posts on close subjects.
+#   docker compose --profile embed up -d
+# starts Ollama and pulls a small embedding model (nomic-embed-text, ~270 MB);
+# then uncomment SAMETRA_EMBED_API and SAMETRA_EMBED_MODEL below.
 
 services:
   kubo:
@@ -43,6 +48,8 @@ services:
       # treat it like localhost, so the web app can post (Host/Origin checks still apply)
       SAMETRA_TRUST_NET: 10.42.0.1/32
       # SAMETRA_API_TOKEN: change-me    # allow write tools from outside the container
+      # SAMETRA_EMBED_API: http://ollama:11434/v1   # with --profile embed
+      # SAMETRA_EMBED_MODEL: nomic-embed-text
     command: ["run", "--listen", "0.0.0.0:42424"]
     ports:
       # the app, the API, the nostr relay and /ipfs/ on one port; only on this
@@ -50,6 +57,22 @@ services:
       - "127.0.0.1:42424:42424"
     volumes:
       - sametra:/data
+
+  ollama:
+    profiles: [embed]
+    image: ollama/ollama:0.12.3
+    restart: unless-stopped
+    volumes:
+      - ollama:/root/.ollama
+
+  ollama-pull:
+    profiles: [embed]
+    image: ollama/ollama:0.12.3
+    depends_on: [ollama]
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: ["ollama", "pull", "nomic-embed-text"]
+    restart: "no"
 
 networks:
   default:
@@ -61,3 +84,4 @@ networks:
 volumes:
   kubo:
   sametra:
+  ollama:

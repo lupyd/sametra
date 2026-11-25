@@ -10,7 +10,7 @@ Sametra has no permanent server, so "how long does a post live?" has a precise a
 
 1. events its own identity wrote: **you host your own work for as long as you run a node**,
 2. events **pinned** on it,
-3. small metadata every node needs: profiles, community definitions, ratings, capabilities, file metadata.
+3. small metadata every node needs: profiles, ratings, capabilities, file metadata.
 
 ## What it forgets, and in which order
 
@@ -18,8 +18,8 @@ Everything else stays until the node needs room. Each node caps its cache at `--
 
 | strategy | keeps first |
 |---|---|
-| `balanced` (default) | standing (the author's [reputation](/docs/reputation) in the post's community, plus the post's own score) and use, minus age: `2·standing + ln(1 + popularity + 2·citations) − age in months` |
-| `reputation` | standing; use only breaks ties. Work by trusted people, and well-rated posts, stay longest |
+| `balanced` (default) | standing (the post's own score, plus its author's [standing](/docs/reputation) near it) and use, minus age: `2·standing + ln(1 + popularity + 2·citations) − age in months` |
+| `reputation` | standing; use only breaks ties. Well-rated posts, and work by people who stand well on its subject, stay longest |
 | `popularity` | what is used and cited, minus age |
 | `recent` | the newest |
 
@@ -38,7 +38,7 @@ Because every node chooses, the network keeps what its members value: well-regar
 
 ## Pinning
 
-In the app, press **pin** on any post: the node pins it together with all of its replies, fetching replies it does not have yet from its peers. **unpin** releases it. Through the API, `pin` and `unpin` take an `id` and `thread: true|false`.
+In the app, press **pin** on any post: the node pins it together with everything under it, fetching replies it does not have yet from its peers. **unpin** releases it. Through the API, `pin` and `unpin` take an `id` and `thread: true|false`.
 
 Pins are stored in `state.pb` and survive restarts. A pin is a decision of *your* node only; nobody else can see or change it.
 
