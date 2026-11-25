@@ -24,7 +24,7 @@ Read tools are open to anyone who can reach the port. **Write tools** (marked �
 |---|---|---|
 | `info` | `Empty` → `InfoResponse` | identity, cache size, pins, `following` (posts whose subtrees a scoped node keeps), `relay_all`, peers, public address, `unread` notifications, the IPFS daemon's `ipfs_peer`/`ipfs_addrs`/`ipfs_peers` and the `ipfs_api` the node uses |
 | `peers` | `Empty` → `PeersResponse` | current connections |
-| `follow` ✎, `unfollow` ✎ | `FollowRequest{id}` → `Ack` | keep a post and everything under it on this node (it matters with `--no-relay-all`); `follow` also fetches the subtree from peers (`count`) |
+| `follow` ✎, `unfollow` ✎ | `FollowRequest{id}` → `Ack` | keep a post and everything under it on this node (it matters with `--no-relay-all`); `follow` also fetches the subtree from whoever holds parts of it (provider records, then reconciliation) and announces that this node holds it; `count` is how many of its posts the node now holds |
 | `feed` | `FeedRequest{parent,sort,limit}` → `Items` | empty `parent`: the top-level topics; else the posts directly under `parent`. `sort` = `top` (default) or `new`; `limit` default 30, max 500; content is a 600-byte preview; `reply_count` counts everything under each post |
 | `thread` | `IdRequest{id}` → `ThreadResponse` | `root`: the post with everything under it nested in `replies`; `path`: its ancestors, top-level topic first (breadcrumbs); `quoted_by`, `ref_events` |
 | `chain` | `ChainRequest{id,depth}` → `ChainResponse` | the reasoning around a post: nodes upstream and downstream (relations `reply`, `cites`), with contributors; `depth` default 4, max 8 |

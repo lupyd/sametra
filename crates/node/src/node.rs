@@ -1,9 +1,9 @@
-//! Node state, gossip, and peer connections.
+//! Node state: the store, ingest (validate, store, spread), interests, the
+//! reputation model, persistence, and the WebSocket relay for clients.
 //!
-//! Every connection is symmetric: we act as a nostr relay for whatever the
-//! remote asks (REQ/EVENT/CLOSE) and as a client towards relays we dialed
-//! (subscribe + push). New events flood to neighbours once, de-duplicated by
-//! id, so the mesh converges without any coordinator.
+//! Other nodes are reached over libp2p (see `p2p.rs`): every event a node
+//! stores is spread on its GossipSub topics; lookups and catch-up are
+//! request-response, with Negentropy reconciliation.
 
 use crate::event::*;
 use crate::rep::{self, Model, RepTable};
@@ -147,7 +147,7 @@ pub struct Node {
     pub following: Mutex<BTreeSet<H32>>,
     /// WebSocket clients of the relay (nodes talk to each other over libp2p)
     pub clients: Mutex<HashMap<u64, Client>>,
-    /// peer addresses that worked, saved for the next start
+    /// peer addresses to try on the next start (all but those that kept failing)
     saved_peers: Mutex<Vec<String>>,
     /// the libp2p swarm (absent outside a tokio runtime, e.g. in unit tests)
     pub p2p: std::sync::OnceLock<Arc<crate::p2p::P2p>>,
@@ -165,7 +165,7 @@ pub struct Node {
     /// recently seen search subscription ids (loop guard for forwarded searches)
     searches: Mutex<HashMap<String, u64>>,
     /// concurrent outgoing forwarded searches
-    search_slots: Arc<tokio::sync::Semaphore>,
+    pub(crate) search_slots: Arc<tokio::sync::Semaphore>,
     /// capability reputation table, rebuilt on demand (see api.rs)
     pub cap_cache: Mutex<Option<Arc<CapScores>>>,
     /// humanity table (network-wide "human" ratings), rebuilt on demand
@@ -925,7 +925,7 @@ mod tests {
         assert!(n.following.lock().unwrap().contains(&e.id));
         assert!(n.store.lock().unwrap().pinned.contains(&e.id));
         assert!(n.store.lock().unwrap().get(&e.id).is_some());
-        assert_eq!(n.saved_peers(), ["/ip4/10.0.0.2/udp/42424/quic-v1"], "peers that worked are tried first next time");
+        assert_eq!(n.saved_peers(), ["/ip4/10.0.0.2/udp/42424/quic-v1"], "saved peer addresses are tried on the next start");
         assert_eq!(n.memory.lock().unwrap().get("k").map(String::as_str), Some("v"));
         assert!(!dir.join("state.tmp").exists());
         let _ = std::fs::remove_dir_all(dir);

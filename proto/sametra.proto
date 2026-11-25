@@ -80,10 +80,15 @@ message PeerRequest {
   repeated Filter filters = 1;
   uint32 hops = 2;        // a search: how many more hops the peer may forward it
   string search_id = 3;   // loop guard for forwarded searches
+  // Set reconciliation (Negentropy, as in NIP-77) over the events matching
+  // `filters`: one round of the protocol. The answer carries the next message
+  // and no events; the asker then fetches what it lacks by id.
+  bytes negentropy = 4;
 }
 message PeerResponse {
   repeated Event events = 1;
   string error = 2;
+  bytes negentropy = 3;   // the answer to a reconciliation round
 }
 
 // Post embeddings this node computed (DATA/vectors.pb; never sent on the network).

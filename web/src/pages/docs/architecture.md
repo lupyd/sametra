@@ -99,7 +99,7 @@ Once a connection is up it works the same both ways, whoever dialed: both sides 
 <figcaption>Arrows show who dialed whom. Events travel both ways over every link, so D and E take full part although nobody can dial them.</figcaption>
 </figure>
 
-When a connection comes up, each side asks the other for what it may have missed: one lookup (below) with everything since an hour before its newest cached event, or, on a scoped node, just what it keeps (see below). The answer holds at most 5000 events per filter. From then on, new events arrive by gossip.
+When a connection comes up, each side **reconciles** with the other what it keeps: everything, or on a scoped node what it follows and needs (see below). Reconciliation is [Negentropy](https://github.com/hoytech/negentropy) range-based set reconciliation, the protocol behind Nostr's NIP-77: the two sides compare fingerprints of ranges of their (time, id) sets and narrow down to the events one has and the other lacks, in a few round trips whose size depends on the difference, not on how much they hold. The node then fetches what it lacks by id (at most 20 000 per catch-up). From then on, new events arrive by gossip.
 
 ### Gossip by topic
 
@@ -139,9 +139,19 @@ By default a node relays everything, bounded by its cache cap. That is the frien
 
 It subscribes to `sametra/1/meta` and to the tree topics of the posts it follows or has posted in, and updates these subscriptions as that changes.
 
+### Finding the parts of a tree
+
+Nodes rarely hold whole trees. A scoped node keeps the posts it follows and everything under them; others keep what they read, wrote, or found worth keeping. So a tree is spread over many nodes in chunks, and finding a part of it means finding the nodes that hold that part.
+
+- **Anchors.** A post's anchors are the top of its tree and every titled post above it (a reply with a title opens a subtopic; see [ancestry](/docs/protocol#posts-and-their-ancestry)). Posts mark which of their ancestors are titled, so any node holding a post knows its anchors without fetching them.
+- **Provider records.** Every minute a node announces in the Kademlia DHT the anchors it holds posts under: what it follows first, then the anchors it holds the most posts under, at most 1000. These are standard Kademlia provider records, stored on the nodes closest to the anchor's id, republished every 6 hours and expiring after a day.
+- **Fetching a subtree** (following a post, opening a thread or the posts under one): the node looks up who provides the post's nearest anchor, connects to them, adds the peers it is already connected to, and reconciles the subtree (`{ids: [X]}` and `{#e: [X]}`) with up to four of them at once. Each holder contributes the part it has, and only what is missing moves.
+
+A newcomer that knows a single bootstrap node can so reach the chunk of a tree held by a node it has never heard of, even after the author has gone offline.
+
 ### Reaching the rest of the network
 
-Lookups use a request-response protocol, `/sametra/req/1`: one protobuf `PeerRequest` (filters, and for a search a hop budget and a search id) answered by one `PeerResponse` (the matching events from the peer's store, or an error). Catch-up on connect uses it too.
+Lookups use a request-response protocol, `/sametra/req/1`: one protobuf `PeerRequest` (filters, and for a search a hop budget and a search id, or one round of a reconciliation) answered by one `PeerResponse` (the matching events from the peer's store, the next reconciliation message, or an error). Catch-up and subtree fetches use it too.
 
 Searches can travel further than one hop: a search request carries a hop budget, and each node answers from its own index and forwards it to its peers until the budget runs out. See [how a network search travels](/docs/search#how-a-network-search-travels).
 

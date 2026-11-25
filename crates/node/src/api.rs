@@ -387,10 +387,18 @@ async fn follow(node: &Arc<Node>, r: FollowRequest) -> R<Ack> {
     let id = hex_id(&r.id, "id")?;
     node.following.lock().unwrap().insert(id);
     node.save_state();
-    let f = vec![Filter { ids: Some(vec![id.hex()]), ..Default::default() }, Filter { tags: vec![("e".into(), vec![id.hex()])], limit: Some(2000), ..Default::default() }];
-    let n = node.remote_fetch(f, Duration::from_secs(3)).await.len();
-    // listen to its tree from now on (its root is known once we hold it)
+    // from whoever holds parts of it (see Node::fetch_subtree)
+    node.fetch_subtree(id, Duration::from_secs(8)).await;
+    // what this node now holds of it (some may have come with the catch-up of a
+    // peer met on the way)
+    let n = {
+        let st = node.store.lock().unwrap();
+        st.descendant_count(&id, 1_000_000) + st.get(&id).is_some() as usize
+    };
+    // listen to its tree from now on (its root is known once we hold it), and
+    // announce that we hold it
     node.update_topics();
+    node.announce_anchors();
     Ok(Ack { count: n as u32, ..ack(Some(&id)) })
 }
 
@@ -409,8 +417,7 @@ async fn feed(node: &Arc<Node>, r: FeedRequest) -> R<Items> {
     if let Some(p) = parent
         && node.peer_count() > 0
     {
-        let f = Filter { tags: vec![("e".into(), vec![p.hex()])], limit: Some(2000), ..Default::default() };
-        node.remote_fetch(vec![f], Duration::from_millis(1500)).await;
+        node.fetch_subtree(p, Duration::from_millis(2500)).await;
     }
     let m = node.model();
     let cx = Cx::of(node);
@@ -439,8 +446,7 @@ async fn thread(node: &Arc<Node>, r: IdRequest) -> R<ThreadResponse> {
     let root = get_or_fetch(node, &id).await.ok_or("event not found on this node or its peers")?;
     node.store.lock().unwrap().bump(&id, 1.0); // viewed
     if node.peer_count() > 0 {
-        let f = Filter { tags: vec![("e".into(), vec![id.hex()])], limit: Some(5000), ..Default::default() };
-        node.remote_fetch(vec![f], Duration::from_millis(1500)).await;
+        node.fetch_subtree(id, Duration::from_millis(2500)).await;
     }
     // its ancestors: the post names them all, top first
     let mut path: Vec<Ev> = vec![];
@@ -655,7 +661,7 @@ async fn post(node: &Arc<Node>, r: PostRequest) -> R<Ack> {
             return Err("'parent' must be a post".into());
         }
         let pa = parent.ancestors();
-        tags.extend(ancestry_tags(&pid, &pa));
+        tags.extend(tags_under(&parent));
         tags.push(t("p", parent.pubkey.hex()));
         ancestors = pa;
         ancestors.push(pid);

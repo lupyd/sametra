@@ -407,3 +407,50 @@ async fn mentions_reach_people_through_scoped_nodes() {
     want.sort();
     assert_eq!(reasons, want);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn chunks_of_a_tree_are_found_where_they_are() {
+    // public nodes (Kademlia servers)
+    let public = |c: &mut sametra_node::node::Config| c.public_addr = Some(c.listen.clone());
+    let scoped = |follow: Vec<H32>| {
+        move |c: &mut sametra_node::node::Config| {
+            c.public_addr = Some(c.listen.clone());
+            c.relay_all = false;
+            c.follow = follow;
+        }
+    };
+    // the author writes a tree: a question, an answer branch, and a titled subtopic
+    let author = spawn(public).await;
+    let root: pb::Ack = author.ok("post", &post("Classify all groups of order p^2", "x")).await;
+    let other: pb::Ack = author.ok("post", &reply(&root.id, "another branch")).await;
+    let sub: pb::Ack = author.ok("post", &pb::PostRequest { title: "Case: the group is cyclic".into(), ..reply(&root.id, "subtopic") }).await;
+    let s1: pb::Ack = author.ok("post", &reply(&sub.id, "lemma 1")).await;
+    let s2: pb::Ack = author.ok("post", &reply(&s1.id, "lemma 2, deeper")).await;
+    let sid = H32::from_hex(&sub.id).unwrap();
+
+    // a scoped node keeps only the subtopic: one chunk of the tree
+    let holder = spawn(scoped(vec![sid])).await;
+    holder.connect(&author).await;
+    assert!(eventually(T, || holder.has(&sub.id) && holder.has(&s1.id) && holder.has(&s2.id)).await, "the chunk arrived by reconciliation");
+    assert!(!holder.has(&other.id) && !holder.has(&root.id), "and nothing else");
+
+    // a bootstrap node that holds nothing of it; the holder announces its anchors there
+    let boot = spawn(scoped(vec![])).await;
+    holder.connect(&boot).await;
+    holder.node.announce_anchors();
+    drop(author); // the author goes offline
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // a newcomer that only knows the bootstrap node finds the chunk's holder through
+    // the DHT, connects to it, and reconciles the subtopic
+    let newcomer = spawn(scoped(vec![])).await;
+    newcomer.connect(&boot).await;
+    let f: pb::Ack = newcomer.ok("follow", &pb::FollowRequest { id: sub.id.clone() }).await;
+    assert_eq!(f.count, 3, "the subtopic and everything under it");
+    assert!(newcomer.has(&sub.id) && newcomer.has(&s1.id) && newcomer.has(&s2.id));
+    let hp = holder.node.p2p.get().unwrap().peer_id;
+    assert!(newcomer.node.p2p.get().unwrap().peers().iter().any(|(p, _)| *p == hp), "it met the holder it was never told about");
+    // the thread opens from what it holds
+    let t: pb::ThreadResponse = newcomer.ok("thread", &id(&sub.id)).await;
+    assert_eq!(t.root.unwrap().replies.len(), 1);
+}

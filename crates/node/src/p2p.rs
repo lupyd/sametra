@@ -47,6 +47,12 @@ const MAX_REQUEST: u64 = 1 << 20;
 const MAX_RESPONSE: u64 = 32 << 20;
 /// Largest gossip message: one event (64 KiB content, plus tags and signature).
 const MAX_GOSSIP: usize = 256 << 10;
+/// Anchors a node announces at most (the ones it holds most under, and what it follows).
+const MAX_PROVIDED: usize = 1000;
+/// Largest reconciliation message the asker sends (Negentropy frame size limit).
+const NEG_FRAME: u64 = 256 << 10;
+/// Round trips of one reconciliation, at most.
+const NEG_ROUNDS: usize = 24;
 
 /// `host:port` (QUIC on that UDP port), `/ip4/…/udp/…/quic-v1[/p2p/…]` or any
 /// other multiaddr.
@@ -143,6 +149,8 @@ pub struct State {
     pub listen: Vec<Multiaddr>,
     /// topics this node subscribes to
     pub topics: BTreeSet<String>,
+    /// anchors this node announces in the DHT (it holds posts under them)
+    pub provided: BTreeSet<H32>,
 }
 
 enum Cmd {
@@ -152,6 +160,10 @@ enum Cmd {
     Unsubscribe(String),
     Request(PeerId, pb::PeerRequest, oneshot::Sender<Result<pb::PeerResponse, String>>),
     Respond(ResponseChannel<pb::PeerResponse>, pb::PeerResponse),
+    /// who announced they hold posts under this anchor
+    FindProviders(H32, mpsc::UnboundedSender<PeerId>),
+    /// announce exactly these anchors
+    SetProvided(BTreeSet<H32>),
 }
 
 pub struct P2p {
@@ -179,9 +191,35 @@ impl P2p {
         st.topics = want;
     }
     pub async fn request(&self, peer: PeerId, req: pb::PeerRequest) -> Result<pb::PeerResponse, String> {
+        // a peer just found (e.g. a provider) may still be connecting: give it a moment
+        let end = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !self.state.lock().unwrap().peers.contains_key(&peer) && tokio::time::Instant::now() < end {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         let (tx, rx) = oneshot::channel();
         self.cmd.send(Cmd::Request(peer, req, tx)).map_err(|_| "network stopped".to_string())?;
         rx.await.map_err(|_| "network stopped".to_string())?
+    }
+    /// Peers that announced they hold posts under `anchor` (Kademlia provider
+    /// records), at most a handful; they are being dialed when this returns.
+    pub async fn find_providers(&self, anchor: H32) -> Vec<PeerId> {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        if self.cmd.send(Cmd::FindProviders(anchor, tx)).is_err() {
+            return vec![];
+        }
+        // the first one may take a DHT walk; others found soon after are welcome too
+        let mut found = vec![];
+        let mut until = tokio::time::Instant::now() + Duration::from_secs(6);
+        while let Ok(Some(p)) = tokio::time::timeout_at(until, rx.recv()).await {
+            if found.is_empty() {
+                until = until.min(tokio::time::Instant::now() + Duration::from_millis(400));
+            }
+            found.push(p);
+        }
+        found
+    }
+    fn set_provided(&self, anchors: BTreeSet<H32>) {
+        let _ = self.cmd.send(Cmd::SetProvided(anchors));
     }
     pub fn peers(&self) -> Vec<(PeerId, PeerInfo)> {
         self.state.lock().unwrap().peers.iter().map(|(p, i)| (*p, i.clone())).collect()
@@ -218,6 +256,8 @@ pub fn start(node: &Arc<Node>) -> Result<Arc<P2p>, String> {
             let gossip = gossipsub::Behaviour::new(gossipsub::MessageAuthenticity::Anonymous, gossip_cfg)?;
             let mut kcfg = kad::Config::new(KAD_PROTOCOL);
             kcfg.set_query_timeout(Duration::from_secs(30));
+            kcfg.set_provider_publication_interval(Some(Duration::from_secs(6 * 3600)));
+            kcfg.set_provider_record_ttl(Some(Duration::from_secs(24 * 3600)));
             let kad = kad::Behaviour::with_config(key.public().to_peer_id(), kad::store::MemoryStore::new(key.public().to_peer_id()), kcfg);
             let req = request_response::Behaviour::with_codec(
                 Codec,
@@ -270,6 +310,9 @@ async fn run(mut swarm: libp2p::Swarm<Behaviour>, mut rx: mpsc::UnboundedReceive
     let mut book: HashMap<Multiaddr, (u32, u64)> = HashMap::new();
     let mut dialing: HashMap<libp2p::swarm::ConnectionId, Multiaddr> = HashMap::new();
     let hello = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut finding: HashMap<kad::QueryId, (mpsc::UnboundedSender<PeerId>, Vec<PeerId>)> = HashMap::new();
+    let mut routed = false;
+    let mut ticks = 0u64;
     if let Some(n) = node.upgrade() {
         for a in n.cfg.peers.iter().chain(n.saved_peers().iter()) {
             match parse_addr(a) {
@@ -311,6 +354,23 @@ async fn run(mut swarm: libp2p::Swarm<Behaviour>, mut rx: mpsc::UnboundedReceive
                         pending.insert(id, back);
                     }
                     Cmd::Respond(ch, r) => { let _ = b.req.send_response(ch, r); }
+                    Cmd::FindProviders(anchor, back) => {
+                        let id = b.kad.get_providers(kad::RecordKey::new(&anchor.0));
+                        finding.insert(id, (back, vec![]));
+                    }
+                    Cmd::SetProvided(want) => {
+                        let mut st = p2p.state.lock().unwrap();
+                        for a in st.provided.difference(&want) {
+                            b.kad.stop_providing(&kad::RecordKey::new(&a.0));
+                        }
+                        for a in want.difference(&st.provided) {
+                            let _ = b.kad.start_providing(kad::RecordKey::new(&a.0));
+                        }
+                        if !want.is_empty() && want != st.provided {
+                            tracing::debug!(anchors = want.len(), "announcing anchors");
+                        }
+                        st.provided = want;
+                    }
                 }
             }
             ev = swarm.select_next_some() => {
@@ -359,6 +419,47 @@ async fn run(mut swarm: libp2p::Swarm<Behaviour>, mut rx: mpsc::UnboundedReceive
                             }
                         }
                     }
+                    SwarmEvent::Behaviour(BehaviourEvent::Kad(ev)) => match ev {
+                        kad::Event::OutboundQueryProgressed { id, result: kad::QueryResult::GetProviders(r), step, .. } => {
+                            let mut done = step.last;
+                            match r {
+                                Ok(kad::GetProvidersOk::FoundProviders { providers, .. }) => {
+                                    if let Some((back, found)) = finding.get_mut(&id) {
+                                        for p in providers {
+                                            if p == p2p.peer_id || found.contains(&p) {
+                                                continue;
+                                            }
+                                            // dial now, while the query still knows their addresses
+                                            if !swarm.is_connected(&p) {
+                                                let _ = swarm.dial(DialOpts::peer_id(p).build());
+                                            }
+                                            found.push(p);
+                                            let _ = back.send(p);
+                                        }
+                                        if found.len() >= 8 {
+                                            done = true;
+                                            if let Some(mut q) = swarm.behaviour_mut().kad.query_mut(&id) {
+                                                q.finish();
+                                            }
+                                        }
+                                    }
+                                }
+                                Ok(kad::GetProvidersOk::FinishedWithNoAdditionalRecord { .. }) | Err(_) => done = true,
+                            }
+                            if done {
+                                finding.remove(&id); // closes the channel: no more to come
+                            }
+                        }
+                        kad::Event::RoutingUpdated { .. } if !routed => {
+                            // the first route: announce what we hold now that someone can store it
+                            routed = true;
+                            let provided = p2p.state.lock().unwrap().provided.clone();
+                            for a in provided {
+                                let _ = swarm.behaviour_mut().kad.start_providing(kad::RecordKey::new(&a.0));
+                            }
+                        }
+                        _ => {}
+                    },
                     SwarmEvent::Behaviour(BehaviourEvent::Gossip(ev)) => match ev {
                         gossipsub::Event::Message { propagation_source, message_id, message } => {
                             let acc = match pb::decode::<pb::Event>(&message.data).ok().and_then(Event::from_pb) {
@@ -449,33 +550,60 @@ async fn run(mut swarm: libp2p::Swarm<Behaviour>, mut rx: mpsc::UnboundedReceive
                     let _ = swarm.behaviour_mut().kad.bootstrap();
                 }
                 n.remember_peers(book.iter().filter(|(_, (fails, _))| *fails < 8).map(|(a, _)| a.to_string()).collect());
+                // every minute (and soon after start): announce the anchors we hold posts under
+                if ticks % 6 == 1 {
+                    let (n, p) = (n.clone(), p2p.clone());
+                    tokio::task::spawn_blocking(move || p.set_provided(n.anchors_held(MAX_PROVIDED)));
+                }
+                ticks += 1;
             }
         }
     }
     tracing::debug!("p2p loop stopped");
 }
 
-/// Pull what we missed from a peer that just connected.
-async fn catch_up(node: &Arc<Node>, p2p: &P2p, peer: PeerId) {
-    let since = node.store.lock().unwrap().iter().next().map(|e| e.created_at.saturating_sub(3600)).unwrap_or(0);
-    let req = pb::PeerRequest { filters: node.sync_filters(since).iter().map(Filter::to_pb).collect(), ..Default::default() };
-    match p2p.request(peer, req).await {
-        Ok(r) => {
-            let (mut new, total) = (0, r.events.len());
-            for e in r.events.into_iter().filter_map(Event::from_pb) {
-                if matches!(node.ingest(e, ORIGIN_SYNC, false), Ok((_, true))) {
-                    new += 1;
-                }
-            }
-            tracing::debug!(peer = %peer, total, new, "caught up");
-        }
+/// Pull what we missed from a peer that just connected: reconcile everything we
+/// keep (or, on a scoped node, what it follows and needs) and fetch the difference.
+async fn catch_up(node: &Arc<Node>, _p2p: &P2p, peer: PeerId) {
+    let filters: Vec<Filter> = node.sync_filters(0).into_iter().map(|f| Filter { since: None, limit: None, ..f }).collect();
+    match node.reconcile(peer, filters, false, CATCH_UP_MAX).await {
+        Ok((fetched, they_lack)) => tracing::debug!(peer = %peer, fetched, they_lack, "caught up"),
         Err(e) => tracing::debug!(peer = %peer, error = %e, "catch-up failed"),
     }
+}
+/// Events fetched in one catch-up, at most (the newest first is not guaranteed;
+/// later catch-ups and gossip fill the rest).
+const CATCH_UP_MAX: usize = 20_000;
+
+/// The (time, id) set of what we hold that matches `filters`, for Negentropy.
+fn neg_storage(node: &Node, filters: &[Filter]) -> Result<negentropy::NegentropyStorageVector, String> {
+    let mut s = negentropy::NegentropyStorageVector::new();
+    let mut seen = HashSet::new();
+    let st = node.store.lock().unwrap();
+    for f in filters {
+        for e in st.query(f, 1_000_000) {
+            if seen.insert(e.id) {
+                s.insert(e.created_at, negentropy::Id::from_byte_array(e.id.0)).map_err(|e| e.to_string())?;
+            }
+        }
+    }
+    s.seal().map_err(|e| e.to_string())?;
+    Ok(s)
 }
 
 /// Answer a peer's request from our store; forward searches that may travel on.
 async fn answer(node: &Arc<Node>, peer: PeerId, r: pb::PeerRequest) -> pb::PeerResponse {
     let filters: Vec<Filter> = r.filters.iter().take(16).map(Filter::from_pb).collect();
+    if !r.negentropy.is_empty() {
+        // one reconciliation round: answer with the next message, no events
+        let out = neg_storage(node, &filters)
+            .and_then(|s| negentropy::Negentropy::owned(s, 0).map_err(|e| e.to_string()))
+            .and_then(|mut n| n.reconcile(&r.negentropy).map_err(|e| e.to_string()));
+        return match out {
+            Ok(m) => pb::PeerResponse { negentropy: m, ..Default::default() },
+            Err(e) => pb::PeerResponse { error: format!("reconcile: {e}"), ..Default::default() },
+        };
+    }
     let search = filters.iter().any(|f| f.search.is_some());
     let hops = r.hops.min(crate::node::MAX_HOPS);
     let mut hits: Vec<Ev> = {
@@ -496,7 +624,11 @@ async fn answer(node: &Arc<Node>, peer: PeerId, r: pb::PeerRequest) -> pb::PeerR
             }
         }
     }
-    if search && hops > 0 && !r.search_id.is_empty() && r.search_id.len() <= 64 && node.fresh_search(&r.search_id) {
+    // forward a search further only while few are in flight (shared with clients' searches)
+    let slot = (search && hops > 0 && !r.search_id.is_empty() && r.search_id.len() <= 64 && node.fresh_search(&r.search_id))
+        .then(|| node.search_slots.clone().try_acquire_owned().ok())
+        .flatten();
+    if let Some(_slot) = slot {
         let more = node.ask_peers(filters, crate::node::search_timeout(hops - 1), hops - 1, Some(peer), Some(r.search_id)).await;
         for e in more {
             if seen.insert(e.id) {
@@ -504,7 +636,7 @@ async fn answer(node: &Arc<Node>, peer: PeerId, r: pb::PeerRequest) -> pb::PeerR
             }
         }
     }
-    pb::PeerResponse { events: hits.iter().map(|e| e.to_pb()).collect(), error: String::new() }
+    pb::PeerResponse { events: hits.iter().map(|e| e.to_pb()).collect(), ..Default::default() }
 }
 
 /// Which gossip topics an event goes to.
@@ -570,7 +702,7 @@ impl Node {
     pub async fn ask_peers(&self, filters: Vec<Filter>, timeout: Duration, hops: u32, exclude: Option<PeerId>, sid: Option<String>) -> Vec<Ev> {
         let Some(p2p) = self.p2p.get().cloned() else { return vec![] };
         let peers: Vec<PeerId> = p2p.peers().into_iter().map(|x| x.0).filter(|p| Some(*p) != exclude).take(crate::node::FANOUT).collect();
-        let req = pb::PeerRequest { filters: filters.iter().map(Filter::to_pb).collect(), hops, search_id: sid.unwrap_or_default() };
+        let req = pb::PeerRequest { filters: filters.iter().map(Filter::to_pb).collect(), hops, search_id: sid.unwrap_or_default(), ..Default::default() };
         let started = tokio::time::Instant::now();
         let asks = peers.iter().map(|p| {
             let (p2p, req) = (p2p.clone(), req.clone());
@@ -596,6 +728,115 @@ impl Node {
             }
         }
         tracing::debug!(hops, asked = peers.len(), unanswered, found = out.len(), ms = started.elapsed().as_millis() as u64, "asked peers");
+        out
+    }
+
+    /// Reconcile the events matching `filters` with `peer` (Negentropy) and fetch
+    /// what we lack, up to `max`. `force` keeps them even outside our interests
+    /// (they were asked for). Returns (fetched, how many we have that they lack).
+    pub async fn reconcile(&self, peer: PeerId, filters: Vec<Filter>, force: bool, max: usize) -> Result<(usize, usize), String> {
+        let p2p = self.p2p.get().cloned().ok_or("no network")?;
+        let storage = neg_storage(self, &filters)?;
+        let mut neg = negentropy::Negentropy::owned(storage, NEG_FRAME).map_err(|e| e.to_string())?;
+        let mut msg = neg.initiate().map_err(|e| e.to_string())?;
+        let pf: Vec<pb::Filter> = filters.iter().map(Filter::to_pb).collect();
+        let (mut have, mut need) = (Vec::new(), Vec::new());
+        for round in 0.. {
+            if round == NEG_ROUNDS {
+                return Err("reconciliation did not converge".into());
+            }
+            let r = p2p.request(peer, pb::PeerRequest { filters: pf.clone(), negentropy: msg, ..Default::default() }).await?;
+            if !r.error.is_empty() {
+                return Err(r.error);
+            }
+            match neg.reconcile_with_ids(&r.negentropy, &mut have, &mut need).map_err(|e| e.to_string())? {
+                Some(next) => msg = next,
+                None => break,
+            }
+        }
+        // fetch what we lack, in batches
+        let mut fetched = 0;
+        for chunk in need.chunks(200).take(max.div_ceil(200)) {
+            let ids: Vec<String> = chunk.iter().map(|i| hex::encode(i.as_bytes())).collect();
+            let req = pb::PeerRequest { filters: vec![Filter { ids: Some(ids), ..Default::default() }.to_pb()], ..Default::default() };
+            let r = p2p.request(peer, req).await?;
+            for e in r.events.into_iter().filter_map(Event::from_pb) {
+                if matches!(self.ingest(e, ORIGIN_SYNC, force), Ok((_, true))) {
+                    fetched += 1;
+                }
+            }
+        }
+        Ok((fetched, have.len()))
+    }
+
+    /// Bring a post and everything under it here, from whoever holds parts of it:
+    /// the peers that announced its nearest anchor (Kademlia provider records),
+    /// plus connected peers; each is reconciled with (Negentropy), so only what
+    /// is missing moves. Returns how many events arrived.
+    pub async fn fetch_subtree(&self, id: H32, budget: Duration) -> usize {
+        let Some(p2p) = self.p2p.get().cloned() else { return 0 };
+        let work = async {
+            // where to look: the post's nearest anchor (itself if we do not hold it yet)
+            let known = self.store.lock().unwrap().get(&id).cloned();
+            let mut fetched = 0;
+            let known = match known {
+                Some(e) => Some(e),
+                None => {
+                    let got = self.remote_fetch(vec![Filter { ids: Some(vec![id.hex()]), ..Default::default() }], Duration::from_millis(1500)).await;
+                    fetched += got.len();
+                    got.into_iter().find(|e| e.id == id)
+                }
+            };
+            let anchor = known.as_ref().and_then(|e| e.anchors().last().copied()).unwrap_or(id);
+            let mut peers = p2p.find_providers(anchor).await;
+            for (p, _) in p2p.peers() {
+                if !peers.contains(&p) {
+                    peers.push(p);
+                }
+            }
+            peers.truncate(4);
+            let filters = vec![Filter { ids: Some(vec![id.hex()]), ..Default::default() }, Filter { tags: vec![("e".into(), vec![id.hex()])], ..Default::default() }];
+            let results = libp2p::futures::future::join_all(peers.iter().map(|p| self.reconcile(*p, filters.clone(), true, 5000))).await;
+            for (p, r) in peers.iter().zip(results) {
+                match r {
+                    Ok((n, _)) => fetched += n,
+                    Err(e) => tracing::debug!(peer = %p, error = %e, "subtree reconcile failed"),
+                }
+            }
+            tracing::debug!(id = %id.hex(), anchor = %anchor.hex(), peers = peers.len(), fetched, "fetched subtree");
+            fetched
+        };
+        tokio::time::timeout(budget, work).await.unwrap_or(0)
+    }
+
+    /// Announce the anchors we hold posts under now (also done every minute).
+    pub fn announce_anchors(self: &Arc<Self>) {
+        let Some(p) = self.p2p.get().cloned() else { return };
+        let n = self.clone();
+        tokio::task::spawn_blocking(move || p.set_provided(n.anchors_held(MAX_PROVIDED)));
+    }
+
+    /// The anchors to announce: what we follow, then those we hold the most
+    /// posts under (see Event::anchors), at most `max`.
+    pub fn anchors_held(&self, max: usize) -> BTreeSet<H32> {
+        let mut counts: HashMap<H32, usize> = HashMap::new();
+        {
+            let st = self.store.lock().unwrap();
+            for e in st.query(&Filter { kinds: Some(vec![K_POST]), ..Default::default() }, usize::MAX) {
+                for a in e.anchors() {
+                    *counts.entry(a).or_default() += 1;
+                }
+            }
+        }
+        let mut out: BTreeSet<H32> = self.following.lock().unwrap().iter().copied().take(max).collect();
+        let mut by: Vec<(H32, usize)> = counts.into_iter().collect();
+        by.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        for (a, _) in by {
+            if out.len() >= max {
+                break;
+            }
+            out.insert(a);
+        }
         out
     }
 

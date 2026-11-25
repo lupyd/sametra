@@ -60,6 +60,9 @@ A post without a parent is a top-level topic. A post with a parent names its who
 - `root` is the top-level topic of the tree. A direct answer to a topic has the topic as both `root` and `reply`.
 - `path` lists the ancestors between the root and the parent, at most 30 of them (the nearest 30, if the tree is deeper).
 - `reply` is the direct parent.
+- A fifth field `"topic"` on a `path` or `reply` tag marks an ancestor that has a title: a subtopic, e.g. `["e", "<id>", "", "path", "topic"]`.
+
+A post's **anchors** are its root, its titled ancestors, and itself if it is top-level or has a title. Nodes announce the anchors they hold posts under as Kademlia provider records (key: the anchor's 32-byte id), and look up the nearest anchor of a post to find who holds the posts under it. See [Architecture](/docs/architecture#finding-the-parts-of-a-tree).
 
 Because every post names its ancestors, the whole subtree under any post `X` is one filter: `{kinds: [11], #e: [X]}`. A node finds a post's parents from its own tags, and its children and descendants from the events that name it. A post opened on its own links back to its whole path, and a node that follows `X` keeps everything under it without walking the tree. Nesting has no limit. A post more than 32 levels deep still names its root, its parent and the 30 ancestors nearest the parent; the subtree of an ancestor it skips is found by walking down.
 
@@ -116,12 +119,16 @@ message PeerRequest {
   repeated Filter filters = 1;
   uint32 hops = 2;        // a search: how many more hops the peer may forward it
   string search_id = 3;   // loop guard for forwarded searches
+  bytes negentropy = 4;   // one round of set reconciliation over `filters`
 }
 message PeerResponse {
   repeated Event events = 1;
   string error = 2;
+  bytes negentropy = 3;   // the answer to a reconciliation round
 }
 ```
+
+A request with `negentropy` set is one round of [Negentropy](https://github.com/hoytech/negentropy) reconciliation (protocol version 1, as in NIP-77) over the (created_at, id) set of the events matching `filters`. The asker (initiator, frame size limit 256 KiB) sends rounds until it knows which ids it lacks and which the peer lacks, then fetches what it lacks with an `ids` filter, 200 at a time. The answering side keeps no state between rounds.
 
 A peer answers with what its store holds for the filters (at most 16 filters, 5000 events each, 200 for a search). A search with `hops` above zero and a search id it has not seen in the last minute is also forwarded to its other peers with one hop less, and their results are added to the answer.
 

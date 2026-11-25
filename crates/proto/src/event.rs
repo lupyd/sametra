@@ -216,6 +216,21 @@ impl Event {
         v.retain(|x| seen.insert(*x));
         v
     }
+    /// Where this post can be found on the network: the top of its tree, every
+    /// titled ancestor (a subtopic, marked "topic" in the tag's fifth field),
+    /// and itself if it is a top-level post or has a title. Nodes announce the
+    /// anchors they hold posts under; anyone looking for a subtree asks for the
+    /// nearest one. Root first, the post itself (if an anchor) last.
+    pub fn anchors(&self) -> Vec<H32> {
+        let mut v: Vec<H32> = self.root().into_iter().collect();
+        v.extend(self.tags.iter().filter(|t| t.len() >= 5 && t[0] == "e" && t[4] == "topic" && (t[3] == "path" || t[3] == "reply")).filter_map(|t| H32::from_hex(&t[1])));
+        if self.root().is_none() || self.tag("title").is_some_and(|t| !t.trim().is_empty()) {
+            v.push(self.id);
+        }
+        let mut seen = std::collections::HashSet::new();
+        v.retain(|x| seen.insert(*x));
+        v
+    }
     fn marked<'a>(&'a self, marker: &'a str) -> impl Iterator<Item = H32> + 'a {
         self.tags.iter().filter(move |t| t.len() >= 4 && t[0] == "e" && t[3] == marker).filter_map(|t| H32::from_hex(&t[1]))
     }
@@ -224,7 +239,24 @@ impl Event {
 /// Tags that place a post under `parent`, whose own ancestors are `parent_ancestors`
 /// (root first): the root, up to `MAX_PATH` nearest other ancestors, and the parent.
 pub fn ancestry_tags(parent: &H32, parent_ancestors: &[H32]) -> Vec<Vec<String>> {
-    let e = |id: &H32, m: &str| vec!["e".to_string(), id.hex(), String::new(), m.to_string()];
+    ancestry_tags_marked(parent, parent_ancestors, &[])
+}
+
+/// The tags that place a post directly under `parent`, marking which ancestors
+/// are titled subtopics (see [`Event::anchors`]).
+pub fn tags_under(parent: &Event) -> Vec<Vec<String>> {
+    let titled: Vec<H32> = parent.anchors().into_iter().filter(|a| Some(*a) != parent.root() || *a == parent.id).collect();
+    ancestry_tags_marked(&parent.id, &parent.ancestors(), &titled)
+}
+
+fn ancestry_tags_marked(parent: &H32, parent_ancestors: &[H32], titled: &[H32]) -> Vec<Vec<String>> {
+    let e = |id: &H32, m: &str| {
+        let mut t = vec!["e".to_string(), id.hex(), String::new(), m.to_string()];
+        if titled.contains(id) && m != "root" {
+            t.push("topic".into());
+        }
+        t
+    };
     let root = parent_ancestors.first().unwrap_or(parent);
     let mut tags = vec![e(root, "root")];
     let inner: Vec<&H32> = parent_ancestors.iter().skip(1).collect();
@@ -709,6 +741,27 @@ mod tests {
         assert_eq!((anc[0], anc[1], *anc.last().unwrap()), (chain[0], chain[100 - MAX_PATH], H32([200; 32])));
         let junk = k.sign(K_POST, tags(&[&["e", "nothex", "", "reply"]]), String::new());
         assert_eq!(junk.parent(), None);
+    }
+
+    #[test]
+    fn anchors_are_the_root_and_titled_subtopics() {
+        let k = Keys::generate();
+        let title = |t: &str| vec![vec!["title".to_string(), t.to_string()]];
+        let with = |mut a: Vec<Vec<String>>, b: Vec<Vec<String>>| {
+            a.extend(b);
+            a
+        };
+        let root = k.sign(K_POST, title("Classify X"), String::new());
+        assert_eq!(root.anchors(), [root.id], "a top-level post is its own anchor");
+        let answer = k.sign(K_POST, tags_under(&root), "an untitled answer".into());
+        assert_eq!(answer.anchors(), [root.id]);
+        let sub = k.sign(K_POST, with(tags_under(&answer), title("Case: X finite")), String::new());
+        assert_eq!(sub.anchors(), [root.id, sub.id], "a titled reply opens a subtopic");
+        let deeper = k.sign(K_POST, tags_under(&sub), "under the subtopic".into());
+        assert_eq!(deeper.anchors(), [root.id, sub.id]);
+        let deepest = k.sign(K_POST, tags_under(&deeper), "further down".into());
+        assert_eq!(deepest.anchors(), [root.id, sub.id], "titled ancestors stay marked all the way down");
+        assert_eq!(deepest.ancestors(), [root.id, answer.id, sub.id, deeper.id]);
     }
 
     #[test]

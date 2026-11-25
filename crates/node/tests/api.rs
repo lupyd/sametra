@@ -30,7 +30,7 @@ async fn follow_and_unfollow() {
     let n = spawn(|_| {}).await;
     let topic: pb::Ack = n.ok("post", &post("A topic", "x")).await;
     let a: pb::Ack = n.ok("follow", &pb::FollowRequest { id: topic.id.clone() }).await;
-    assert_eq!((a.id.as_str(), a.count), (topic.id.as_str(), 0));
+    assert_eq!((a.id.as_str(), a.count), (topic.id.as_str(), 1), "count: how much of it this node holds");
     let i: pb::InfoResponse = n.ok("info", &E).await;
     assert_eq!(i.following, std::slice::from_ref(&topic.id));
     n.ok::<_, pb::Ack>("unfollow", &pb::FollowRequest { id: topic.id.clone() }).await;
